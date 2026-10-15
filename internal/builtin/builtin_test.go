@@ -260,24 +260,36 @@ func TestKeychainAndOnePasswordVaults(t *testing.T) {
 	if _, err := kv.GetSecret(ctx, "cf"); err == nil {
 		t.Fatal("expected corrupt JSON error")
 	}
-	_ = os.WriteFile(kv.vaultFilePath(), []byte(`{"__aes256gcm__":"!!!not-base64!!!"}`), 0o600)
+	// An encrypted blob with no salt is rejected as unrecognized (audit C3).
+	_ = os.WriteFile(kv.vaultFilePath(), []byte(`{"__aes256gcm__":"YWJj"}`), 0o600)
+	if _, err := kv.GetSecret(ctx, "cf"); err == nil {
+		t.Fatal("expected missing-salt error")
+	}
+	// With a valid salt present, base64 / nonce / GCM-auth failures are still detected.
+	const salt = `,"__salt__":"AAAAAAAAAAAAAAAAAAAAAA=="`
+	_ = os.WriteFile(kv.vaultFilePath(), []byte(`{"__aes256gcm__":"!!!not-base64!!!"`+salt+`}`), 0o600)
 	if _, err := kv.GetSecret(ctx, "cf"); err == nil {
 		t.Fatal("expected invalid base64 error")
 	}
-	_ = os.WriteFile(kv.vaultFilePath(), []byte(`{"__aes256gcm__":"YWJj"}`), 0o600)
+	_ = os.WriteFile(kv.vaultFilePath(), []byte(`{"__aes256gcm__":"YWJj"`+salt+`}`), 0o600)
 	if _, err := kv.GetSecret(ctx, "cf"); err == nil {
 		t.Fatal("expected short nonce error")
 	}
-	_ = os.WriteFile(kv.vaultFilePath(), []byte(`{"__aes256gcm__":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}`), 0o600)
+	_ = os.WriteFile(kv.vaultFilePath(), []byte(`{"__aes256gcm__":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"`+salt+`}`), 0o600)
 	if _, err := kv.GetSecret(ctx, "cf"); err == nil {
 		t.Fatal("expected GCM authentication failure error")
 	}
-	// Legacy plaintext JSON map backward compatibility
+	// Legacy plaintext maps are now rejected, not silently trusted (audit C3).
 	_ = os.WriteFile(kv.vaultFilePath(), []byte(`{"mintrun:cf":"legacy_plain_val"}`), 0o600)
-	if got, err := kv.GetSecret(ctx, "cf"); err != nil || got != "legacy_plain_val" {
-		t.Fatalf("expected legacy_plain_val, got %q %v", got, err)
+	if _, err := kv.GetSecret(ctx, "cf"); err == nil {
+		t.Fatal("expected legacy-plaintext rejection")
 	}
-	_ = os.WriteFile(kv.vaultFilePath(), []byte(`null`), 0o600)
+	// An unrecognized vault file is fail-closed: SetSecret refuses to clobber it until
+	// it is removed, then writes a fresh encrypted vault cleanly.
+	if err := kv.SetSecret(ctx, "cf", "recovered"); err == nil {
+		t.Fatal("expected fail-closed SetSecret over unrecognized vault")
+	}
+	_ = os.Remove(kv.vaultFilePath())
 	if err := kv.SetSecret(ctx, "cf", "recovered"); err != nil {
 		t.Fatal(err)
 	}
@@ -490,4 +502,73 @@ func TestAWSProviderComprehensive(t *testing.T) {
 	}); err == nil {
 		t.Fatal("expected STS XML parse error")
 	}
+}
+func TestFileVaultPassphraseRequiredPhase45PRC(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	kv := &KeychainVault{HomeDir: home, ForceFile: true}
+	vaultFile := filepath.Join(home, "vault.json")
+
+	// C3: with no passphrase, the file vault refuses to write.
+	t.Setenv("MINTRUN_VAULT_KEY", "")
+	if err := kv.SetSecret(ctx, "cf", "s3cr3t"); err == nil {
+		t.Fatal("expected missing-passphrase error on SetSecret")
+	}
+
+	// With a passphrase, set+get round-trips, the secret is not stored in plaintext,
+	// and a per-vault random salt is persisted.
+	t.Setenv("MINTRUN_VAULT_KEY", "correct horse battery staple")
+	if err := kv.SetSecret(ctx, "cf", "s3cr3t"); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(vaultFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "s3cr3t") {
+		t.Fatal("plaintext secret leaked into vault.json")
+	}
+	var onDisk map[string]string
+	if err := json.Unmarshal(raw, &onDisk); err != nil {
+		t.Fatal(err)
+	}
+	if onDisk["__salt__"] == "" {
+		t.Fatal("expected a per-vault salt persisted")
+	}
+	if got, err := kv.GetSecret(ctx, "cf"); err != nil || got != "s3cr3t" {
+		t.Fatalf("round-trip failed: %q %v", got, err)
+	}
+
+	// C3: a wrong passphrase cannot decrypt the vault.
+	t.Setenv("MINTRUN_VAULT_KEY", "wrong passphrase")
+	if _, err := kv.GetSecret(ctx, "cf"); err == nil {
+		t.Fatal("expected decrypt failure under wrong passphrase")
+	}
+
+	// Each write re-salts: the salt on disk changes between writes.
+	t.Setenv("MINTRUN_VAULT_KEY", "correct horse battery staple")
+	if err := kv.SetSecret(ctx, "cf", "s3cr3t"); err != nil {
+		t.Fatal(err)
+	}
+	raw2, err := os.ReadFile(vaultFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var onDisk2 map[string]string
+	if err := json.Unmarshal(raw2, &onDisk2); err != nil {
+		t.Fatal(err)
+	}
+	if onDisk2["__salt__"] == onDisk["__salt__"] {
+		t.Fatal("expected a fresh salt on re-write")
+	}
+}
+
+// TestMain supplies a deterministic file-vault passphrase for the suite. The
+// AES-256-GCM fallback now mandates MINTRUN_VAULT_KEY (audit C3); tests that need
+// the "no passphrase" error path override it locally with t.Setenv.
+func TestMain(m *testing.M) {
+	if os.Getenv("MINTRUN_VAULT_KEY") == "" {
+		os.Setenv("MINTRUN_VAULT_KEY", "mintrun-unit-test-passphrase")
+	}
+	os.Exit(m.Run())
 }

@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -113,6 +115,18 @@ func (r *Registry) Register(p Plugin) error {
 	m := p.Manifest()
 	if m.Name == "" {
 		return errors.New("plugin manifest missing name")
+	}
+	// An external plugin must never shadow a built-in of the same name (audit H5).
+	if !m.Builtin {
+		if ex, ok := r.vaults[m.Name]; ok && ex.Manifest().Builtin {
+			return fmt.Errorf("plugin %q cannot override the built-in vault of the same name", m.Name)
+		}
+		if ex, ok := r.providers[m.Name]; ok && ex.Manifest().Builtin {
+			return fmt.Errorf("plugin %q cannot override the built-in provider of the same name", m.Name)
+		}
+		if ex, ok := r.bridges[m.Name]; ok && ex.Manifest().Builtin {
+			return fmt.Errorf("plugin %q cannot override the built-in bridge of the same name", m.Name)
+		}
 	}
 	registered := false
 	if v, ok := p.(VaultPlugin); ok && (m.Kind == "" || m.Kind == KindVault) {
@@ -311,6 +325,19 @@ func loadPluginDir(dir string) (*ExternalPlugin, error) {
 	return &ExternalPlugin{manifest: m, execPath: execPath}, nil
 }
 
+// safePluginName rejects a name that is not a single safe path segment, so a crafted
+// manifest cannot escape the plugins directory on install/remove (audit C1).
+func safePluginName(name string) (string, error) {
+	n := strings.TrimSpace(name)
+	if n == "" {
+		return "", errors.New("plugin name is empty")
+	}
+	if n == "." || n == ".." || n != filepath.Base(n) || strings.ContainsAny(n, `/\`) {
+		return "", fmt.Errorf("plugin name %q must be a single path segment", name)
+	}
+	return n, nil
+}
+
 // InstallPlugin installs an external plugin from either a local directory or an HTTP(S) manifest URL.
 func InstallPlugin(ctx context.Context, pluginsDir, source string) (Manifest, error) {
 	if err := os.MkdirAll(pluginsDir, 0o700); err != nil {
@@ -331,7 +358,11 @@ func InstallPlugin(ctx context.Context, pluginsDir, source string) (Manifest, er
 	if err != nil {
 		return Manifest{}, fmt.Errorf("invalid plugin in %q: %w", source, err)
 	}
-	destDir := filepath.Join(pluginsDir, ext.manifest.Name)
+	name, err := safePluginName(ext.manifest.Name)
+	if err != nil {
+		return Manifest{}, err
+	}
+	destDir := filepath.Join(pluginsDir, name)
 	if err := os.RemoveAll(destDir); err != nil {
 		return Manifest{}, err
 	}
@@ -367,16 +398,38 @@ type remoteBundle struct {
 	SHA256 string `json:"sha256,omitempty"` // Optional SHA-256 hex digest of Script for integrity verification
 }
 
+// isLoopbackURL reports whether raw points at the local host (localhost or a
+// loopback IP), the one case where a plaintext http:// fetch cannot be MITM'd.
+func isLoopbackURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func installRemotePlugin(ctx context.Context, pluginsDir, rawURL string) (Manifest, error) {
 	expectedHash := ""
 	if base, frag, ok := strings.Cut(rawURL, "#sha256="); ok {
 		rawURL, expectedHash = base, strings.ToLower(strings.TrimSpace(frag))
 	}
+	// Require https for any networked fetch (audit M6). Plaintext is tolerated only to
+	// loopback, which cannot be MITM'd across a network; the mandatory digest below
+	// still guarantees integrity in both cases.
+	if !strings.HasPrefix(rawURL, "https://") && !isLoopbackURL(rawURL) {
+		return Manifest{}, errors.New("remote plugin install requires an https:// URL")
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return Manifest{}, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		return Manifest{}, err
 	}
@@ -395,19 +448,24 @@ func installRemotePlugin(ctx context.Context, pluginsDir, rawURL string) (Manife
 	if bundle.Name == "" || bundle.Script == "" {
 		return Manifest{}, errors.New("remote plugin bundle requires name and script")
 	}
-	if expectedHash == "" && bundle.SHA256 != "" {
-		expectedHash = strings.ToLower(strings.TrimSpace(bundle.SHA256))
+	// The integrity digest must be supplied out-of-band via the URL (#sha256=<hex>); a digest
+	// the bundle declares about itself is attacker-controlled and proves nothing (audit M6).
+	if expectedHash == "" {
+		return Manifest{}, errors.New("remote plugin install requires an out-of-band digest: append #sha256=<hex> to the URL")
 	}
-	if expectedHash != "" {
-		sum := sha256.Sum256([]byte(bundle.Script))
-		if actual := hex.EncodeToString(sum[:]); actual != expectedHash {
-			return Manifest{}, fmt.Errorf("plugin %q SHA-256 mismatch: expected %s, got %s", bundle.Name, expectedHash, actual)
-		}
+	sum := sha256.Sum256([]byte(bundle.Script))
+	if actual := hex.EncodeToString(sum[:]); actual != expectedHash {
+		return Manifest{}, fmt.Errorf("plugin %q SHA-256 mismatch: expected %s, got %s", bundle.Name, expectedHash, actual)
 	}
 	if bundle.Entrypoint == "" {
 		bundle.Entrypoint = "run"
 	}
-	destDir := filepath.Join(pluginsDir, filepath.Base(bundle.Name))
+	name, err := safePluginName(bundle.Name)
+	if err != nil {
+		return Manifest{}, err
+	}
+	bundle.Builtin = false // a remote bundle cannot declare itself built-in
+	destDir := filepath.Join(pluginsDir, name)
 	if err := os.MkdirAll(destDir, 0o700); err != nil {
 		return Manifest{}, err
 	}
@@ -422,7 +480,11 @@ func installRemotePlugin(ctx context.Context, pluginsDir, rawURL string) (Manife
 }
 
 func RemovePlugin(pluginsDir, name string) error {
-	target := filepath.Join(pluginsDir, filepath.Base(name))
+	safe, err := safePluginName(name)
+	if err != nil {
+		return err
+	}
+	target := filepath.Join(pluginsDir, safe)
 	if _, err := os.Stat(target); err != nil {
 		return fmt.Errorf("external plugin %q is not installed", name)
 	}

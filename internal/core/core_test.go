@@ -487,6 +487,17 @@ func TestRegistryAndExternalVaultAndRemoteInstall(t *testing.T) {
 		t.Fatalf("expected 5 manifests, got %d", len(reg.Manifests()))
 	}
 
+	// H5: an external (non-builtin) plugin must never shadow a built-in of the same name.
+	if err := reg.Register(dummyPlugin{core.Manifest{Name: "keychain", Kind: core.KindVault}}); err == nil || !strings.Contains(err.Error(), "built-in vault") {
+		t.Fatalf("expected built-in vault shadow rejection, got %v", err)
+	}
+	if err := reg.Register(dummyPlugin{core.Manifest{Name: "cloudflare", Kind: core.KindProvider}}); err == nil || !strings.Contains(err.Error(), "built-in provider") {
+		t.Fatalf("expected built-in provider shadow rejection, got %v", err)
+	}
+	if err := reg.Register(dummyPlugin{core.Manifest{Name: "mcp", Kind: core.KindBridge}}); err == nil || !strings.Contains(err.Error(), "built-in bridge") {
+		t.Fatalf("expected built-in bridge shadow rejection, got %v", err)
+	}
+
 	// Test remote plugin install + external vault RPC (get/set/delete) + error cases + RemovePlugin
 	script := `#!/bin/sh
 read input
@@ -558,9 +569,32 @@ esac
 		t.Fatal("expected entrypoint escape error")
 	}
 
-	// Valid remote install using bundle.SHA256 (without URL #sha256 fragment)
-	if _, err := core.InstallPlugin(ctx, pluginsDir, srv.URL+"/ok.json"); err != nil {
+	// Valid remote install over loopback http with a mandatory out-of-band digest (audit M6).
+	if _, err := core.InstallPlugin(ctx, pluginsDir, srv.URL+"/ok.json#sha256="+hashHex); err != nil {
 		t.Fatalf("remote install failed: %v", err)
+	}
+	// Missing out-of-band digest must be rejected even when the bundle self-declares one (audit M6).
+	if _, err := core.InstallPlugin(ctx, pluginsDir, srv.URL+"/ok.json"); err == nil {
+		t.Fatal("expected missing-digest error")
+	}
+	// M6: a non-loopback plaintext URL is rejected even with a digest fragment.
+	if _, err := core.InstallPlugin(ctx, pluginsDir, "http://example.com/p.json#sha256="+hashHex); err == nil {
+		t.Fatal("expected https-required rejection for remote http")
+	}
+	// M6: a malformed http URL is rejected (isLoopbackURL parse-failure path).
+	if _, err := core.InstallPlugin(ctx, pluginsDir, "http://[::1/p.json#sha256="+hashHex); err == nil {
+		t.Fatal("expected rejection for malformed http URL")
+	}
+	// C1: a plugin whose manifest name escapes its directory is rejected on local install.
+	travDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(travDir, "plugin.json"), []byte(`{"name":"../evil","kind":"provider"}`), 0o600)
+	_ = os.WriteFile(filepath.Join(travDir, "run"), []byte("#!/bin/sh\necho '{}'\n"), 0o700)
+	if _, err := core.InstallPlugin(ctx, pluginsDir, travDir); err == nil {
+		t.Fatal("expected path-traversal name rejection on install")
+	}
+	// C1: RemovePlugin rejects traversal names too.
+	if err := core.RemovePlugin(pluginsDir, "../../etc"); err == nil {
+		t.Fatal("expected path-traversal name rejection on remove")
 	}
 	// Also test local plugin with empty entrypoint (defaults to "run")
 	defaultEpDir := t.TempDir()
@@ -748,4 +782,14 @@ func TestPolicyAndRunnerEdgeCases(t *testing.T) {
 		Command:     []string{"echo"},
 		Approve:     true,
 	})
+}
+
+// TestMain supplies a deterministic file-vault passphrase for the suite. The
+// AES-256-GCM fallback now mandates MINTRUN_VAULT_KEY (audit C3); tests that need
+// the "no passphrase" error path override it locally with t.Setenv.
+func TestMain(m *testing.M) {
+	if os.Getenv("MINTRUN_VAULT_KEY") == "" {
+		os.Setenv("MINTRUN_VAULT_KEY", "mintrun-unit-test-passphrase")
+	}
+	os.Exit(m.Run())
 }

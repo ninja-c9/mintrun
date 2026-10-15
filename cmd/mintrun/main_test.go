@@ -194,3 +194,13 @@ func TestCLISubcommandsEndToEnd(t *testing.T) {
 		t.Fatal("expected exit 1 on unknown mcp bridge")
 	}
 }
+
+// TestMain supplies a deterministic file-vault passphrase for the suite. The
+// AES-256-GCM fallback now mandates MINTRUN_VAULT_KEY (audit C3); tests that need
+// the "no passphrase" error path override it locally with t.Setenv.
+func TestMain(m *testing.M) {
+	if os.Getenv("MINTRUN_VAULT_KEY") == "" {
+		os.Setenv("MINTRUN_VAULT_KEY", "mintrun-unit-test-passphrase")
+	}
+	os.Exit(m.Run())
+}

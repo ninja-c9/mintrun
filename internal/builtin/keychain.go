@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -22,6 +23,14 @@ import (
 )
 
 const keychainAccount = "mintrun"
+
+// File-vault KDF parameters: the AES-256-GCM key is derived from the
+// MINTRUN_VAULT_KEY passphrase and a per-vault random salt via PBKDF2-HMAC-SHA256.
+const (
+	vaultKDFIters = 210000
+	vaultKDFName  = "pbkdf2-hmac-sha256"
+	vaultSaltLen  = 16
+)
 
 // KeychainVault stores master secrets in macOS Keychain (`/usr/bin/security`)
 // with a fallback to an AES-256-GCM encrypted 0600 file vault (`~/.mintrun/vault.json`).
@@ -104,8 +113,22 @@ func (k *KeychainVault) vaultFilePath() string {
 	return filepath.Join(k.HomeDir, "vault.json")
 }
 
-func (k *KeychainVault) vaultKey() [32]byte {
-	return sha256.Sum256([]byte("mintrun-aes256gcm-v1:" + os.Getenv("MINTRUN_VAULT_KEY") + ":" + k.HomeDir))
+// vaultKey derives the AES-256-GCM key from the MINTRUN_VAULT_KEY passphrase and a
+// per-vault random salt via PBKDF2-HMAC-SHA256. A passphrase is mandatory: the file
+// vault is the at-rest store on non-macOS hosts, so a path-derived key would leave
+// secrets decryptable by anyone who can read vault.json (audit C3).
+func (k *KeychainVault) vaultKey(salt []byte) ([32]byte, error) {
+	var out [32]byte
+	pass := os.Getenv("MINTRUN_VAULT_KEY")
+	if pass == "" {
+		return out, errors.New("file vault requires a passphrase: set MINTRUN_VAULT_KEY, then run `mintrun secret set` to (re-)encrypt")
+	}
+	dk, err := pbkdf2.Key(sha256.New, pass, salt, vaultKDFIters, 32)
+	if err != nil {
+		return out, err
+	}
+	copy(out[:], dk)
+	return out, nil
 }
 
 func (k *KeychainVault) readMap() (map[string]string, error) {
@@ -120,34 +143,46 @@ func (k *KeychainVault) readMap() (map[string]string, error) {
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, err
 	}
-	if m == nil {
-		return make(map[string]string), nil
+	encB64, encOK := m["__aes256gcm__"]
+	saltB64, saltOK := m["__salt__"]
+	if !encOK || !saltOK {
+		return nil, errors.New("unrecognized or legacy vault format; delete vault.json and re-run `mintrun secret set` to re-encrypt under MINTRUN_VAULT_KEY")
 	}
-	if encB64, ok := m["__aes256gcm__"]; ok && len(m) == 1 {
-		blob, err := base64.StdEncoding.DecodeString(encB64)
-		if err != nil {
-			return nil, fmt.Errorf("decode encrypted vault: %w", err)
-		}
-		key := k.vaultKey()
-		block, _ := aes.NewCipher(key[:])
-		gcm, _ := cipher.NewGCM(block)
-		if len(blob) < gcm.NonceSize() {
-			return nil, errors.New("corrupted encrypted vault nonce")
-		}
-		plain, err := gcm.Open(nil, blob[:gcm.NonceSize()], blob[gcm.NonceSize():], nil)
-		if err != nil {
-			return nil, fmt.Errorf("decrypt vault: %w", err)
-		}
-		var dec map[string]string
-		if err := json.Unmarshal(plain, &dec); err != nil {
-			return nil, err
-		}
-		if dec == nil {
-			dec = make(map[string]string)
-		}
-		return dec, nil
+	salt, err := base64.StdEncoding.DecodeString(saltB64)
+	if err != nil {
+		return nil, fmt.Errorf("decode vault salt: %w", err)
 	}
-	return m, nil
+	blob, err := base64.StdEncoding.DecodeString(encB64)
+	if err != nil {
+		return nil, fmt.Errorf("decode encrypted vault: %w", err)
+	}
+	key, err := k.vaultKey(salt)
+	if err != nil {
+		return nil, err
+	}
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	if len(blob) < gcm.NonceSize() {
+		return nil, errors.New("corrupted encrypted vault nonce")
+	}
+	plain, err := gcm.Open(nil, blob[:gcm.NonceSize()], blob[gcm.NonceSize():], nil)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt vault (wrong MINTRUN_VAULT_KEY?): %w", err)
+	}
+	var dec map[string]string
+	if err := json.Unmarshal(plain, &dec); err != nil {
+		return nil, err
+	}
+	if dec == nil {
+		dec = make(map[string]string)
+	}
+	return dec, nil
 }
 
 func (k *KeychainVault) writeMap(m map[string]string) error {
@@ -158,16 +193,63 @@ func (k *KeychainVault) writeMap(m map[string]string) error {
 	if err != nil {
 		return err
 	}
-	key := k.vaultKey()
-	block, _ := aes.NewCipher(key[:])
-	gcm, _ := cipher.NewGCM(block)
+	salt := make([]byte, vaultSaltLen)
+	if _, err := rand.Read(salt); err != nil {
+		return fmt.Errorf("generate vault salt: %w", err)
+	}
+	key, err := k.vaultKey(salt)
+	if err != nil {
+		return err
+	}
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return err
+	}
 	nonce := make([]byte, gcm.NonceSize())
-	_, _ = rand.Read(nonce)
+	if _, err := rand.Read(nonce); err != nil {
+		return fmt.Errorf("generate vault nonce: %w", err)
+	}
 	sealed := gcm.Seal(nonce, nonce, plain, nil)
-	raw, _ := json.MarshalIndent(map[string]string{
+	raw, err := json.MarshalIndent(map[string]string{
 		"__aes256gcm__": base64.StdEncoding.EncodeToString(sealed),
+		"__salt__":      base64.StdEncoding.EncodeToString(salt),
+		"__kdf__":       fmt.Sprintf("%s:%d", vaultKDFName, vaultKDFIters),
 	}, "", "  ")
-	return os.WriteFile(k.vaultFilePath(), raw, 0o600)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(k.vaultFilePath(), raw, 0o600)
+}
+
+// writeFileAtomic writes to a temp file in the same directory, fsyncs it, then
+// renames over path, so a crash mid-write never leaves a truncated vault (audit L3).
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".vault-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op once the rename succeeds
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 func (k *KeychainVault) getFileSecret(key string) (string, error) {
