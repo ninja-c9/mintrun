@@ -298,8 +298,8 @@ func containsPerm(list []string, target string) bool {
 }
 
 // GitHubProvider mints and revokes short-lived, repository-scoped GitHub App Installation tokens
-// (`POST /app/installations/{id}/access_tokens` and `DELETE /installation/token`), or wraps PATs
-// in zero-knowledge static mode.
+// (`POST /app/installations/{id}/access_tokens` and `DELETE /installation/token`), or wraps a PAT
+// in explicitly requested static mode.
 type GitHubProvider struct {
 	BaseURL string
 	Client  *http.Client
@@ -317,7 +317,7 @@ func (g *GitHubProvider) Manifest() core.Manifest {
 		Name:        "github",
 		Version:     "0.2.0",
 		Kind:        core.KindProvider,
-		Description: "GitHub JIT Installation Token Minter & Zero-Knowledge PAT Wrapper (auto-revokes on exit)",
+		Description: "GitHub App Installation Token JIT Minter (auto-revokes on exit); explicit static mode wraps a PAT",
 		Scopes:      []string{"contents:read", "contents:write", "pull_requests:write", "issues:write", "actions:write", "metadata:read", "static"},
 		Builtin:     true,
 	}
@@ -327,7 +327,26 @@ func (g *GitHubProvider) Mint(ctx context.Context, masterSecret string, req core
 	if masterSecret == "" {
 		return nil, errors.New("empty GitHub master secret")
 	}
-	expiresAt := time.Now().UTC().Add(10 * time.Minute)
+
+	// Static mode is explicit (so the policy allow_static gate applies) and only wraps a token
+	// such as a PAT: a GitHub App private key is long-lived and is never injected into the child.
+	if req.Params["mode"] == "static" || containsPerm(req.Permissions, "static") {
+		if strings.Contains(masterSecret, "PRIVATE KEY") {
+			return nil, errors.New("github static mode wraps a token; refusing to inject a GitHub App private key")
+		}
+		return &core.Lease{
+			ID:       "gh-static",
+			Provider: "github",
+			Scope:    req.Scope,
+			Env: map[string]string{
+				"GITHUB_TOKEN": masterSecret,
+				"GH_TOKEN":     masterSecret,
+			},
+			Redact:    []string{masterSecret},
+			ExpiresAt: time.Now().UTC().Add(10 * time.Minute),
+			Ephemeral: false,
+		}, nil
+	}
 
 	// Format for JIT Installation Token minting:
 	// 1. "<app_id>:<installation_id>:<rsa_private_key_pem>" (auto-signs RS256 JWT)
@@ -350,19 +369,8 @@ func (g *GitHubProvider) Mint(ctx context.Context, masterSecret string, req core
 		}
 	}
 
-	if instID == "" || req.Params["mode"] == "static" || containsPerm(req.Permissions, "static") {
-		return &core.Lease{
-			ID:       "gh-static",
-			Provider: "github",
-			Scope:    req.Scope,
-			Env: map[string]string{
-				"GITHUB_TOKEN": masterSecret,
-				"GH_TOKEN":     masterSecret,
-			},
-			Redact:    []string{masterSecret},
-			ExpiresAt: expiresAt,
-			Ephemeral: false,
-		}, nil
+	if instID == "" {
+		return nil, errors.New(`github JIT mode needs a GitHub App credential (<app_id>:<installation_id>:<private_key_pem> or <installation_id>:<app_jwt>); to inject a PAT, request the "static" permission and set "allow_static": true for github in policy.json`)
 	}
 
 	body := map[string]any{}
@@ -493,7 +501,8 @@ func (g *GitHubProvider) doGitHubJSON(ctx context.Context, token, method, path s
 }
 
 // AWSProvider mints short-lived AWS STS credentials via `AssumeRole` signed with 100% stdlib
-// AWS Signature Version 4 (including optional inline session policy narrowing), or wraps static IAM keys.
+// AWS Signature Version 4 (including optional inline session policy narrowing), or wraps the stored
+// IAM keys in explicitly requested static mode.
 type AWSProvider struct {
 	Endpoint string
 	Region   string
@@ -513,7 +522,7 @@ func (a *AWSProvider) Manifest() core.Manifest {
 		Name:        "aws",
 		Version:     "0.4.0",
 		Kind:        core.KindProvider,
-		Description: "AWS STS AssumeRole JIT Minter & Zero-Knowledge IAM Wrapper (100% stdlib SigV4)",
+		Description: "AWS STS AssumeRole JIT Minter (100% stdlib SigV4); explicit static mode wraps IAM keys",
 		Scopes:      []string{"s3:*", "ec2:*", "lambda:*", "dynamodb:*", "cloudformation:*", "static"},
 		Builtin:     true,
 	}
@@ -529,8 +538,9 @@ func (a *AWSProvider) Mint(ctx context.Context, masterSecret string, req core.Mi
 	}
 	accessKey, secretKey := parts[0], parts[1]
 
-	// Static mode if no Role ARN is given in scope or 'static' permission is requested.
-	if req.Scope == "" || !strings.HasPrefix(req.Scope, "arn:aws:") || req.Params["mode"] == "static" || containsPerm(req.Permissions, "static") {
+	// Static mode is explicit (so the policy allow_static gate applies): it injects the stored
+	// IAM keys as-is, whatever the scope.
+	if req.Params["mode"] == "static" || containsPerm(req.Permissions, "static") {
 		env := map[string]string{
 			"AWS_ACCESS_KEY_ID":     accessKey,
 			"AWS_SECRET_ACCESS_KEY": secretKey,
@@ -549,6 +559,9 @@ func (a *AWSProvider) Mint(ctx context.Context, masterSecret string, req core.Mi
 			ExpiresAt: time.Now().UTC().Add(15 * time.Minute),
 			Ephemeral: false,
 		}, nil
+	}
+	if !strings.HasPrefix(req.Scope, "arn:aws:") {
+		return nil, errors.New(`aws JIT mode needs an IAM role ARN scope (arn:aws:iam::<account_id>:role/<name>); to inject the stored IAM keys, request the "static" permission and set "allow_static": true for aws in policy.json`)
 	}
 
 	dur := req.TTLSeconds

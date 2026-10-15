@@ -146,13 +146,24 @@ func TestGitHubProviderAndJWTSigningComprehensive(t *testing.T) {
 		t.Fatal("expected empty secret error")
 	}
 
-	// Static PAT mode
-	staticLease, err := gh.Mint(ctx, "ghp_static_pat_token_123", core.MintRequest{Scope: "owner/repo"})
-	if err != nil || staticLease.Ephemeral || staticLease.ID != "gh-static" {
-		t.Fatalf("expected static lease, got %+v err=%v", staticLease, err)
+	// Static mode is explicit only (H2 residual): a PAT without it fails instead of reaching the
+	// child past the policy's allow_static gate, and the error names the opt-in, not the PAT.
+	const pat = "ghp_static_pat_token_123"
+	_, err := gh.Mint(ctx, pat, core.MintRequest{Scope: "owner/repo"})
+	if err == nil || strings.Contains(err.Error(), pat) || !strings.Contains(err.Error(), `"static"`) || !strings.Contains(err.Error(), "allow_static") {
+		t.Fatalf("expected an error naming the static opt-in, got %v", err)
 	}
-	if err := gh.Revoke(ctx, "", staticLease); err != nil {
-		t.Fatal(err)
+	for _, req := range []core.MintRequest{
+		{Scope: "owner/repo", Permissions: []string{" Static "}},
+		{Scope: "owner/repo", Params: map[string]string{"mode": "static"}},
+	} {
+		staticLease, err := gh.Mint(ctx, pat, req)
+		if err != nil || staticLease.Ephemeral || staticLease.ID != "gh-static" || staticLease.Env["GH_TOKEN"] != pat {
+			t.Fatalf("expected static lease for %+v, got %+v err=%v", req, staticLease, err)
+		}
+		if err := gh.Revoke(ctx, "", staticLease); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// Generate RSA key for PKCS#1 and PKCS#8 JWT signing tests
@@ -220,6 +231,15 @@ func TestGitHubProviderAndJWTSigningComprehensive(t *testing.T) {
 	}
 	if err := gh.Revoke(ctx, "", &core.Lease{ID: dynLease.ID, Ephemeral: true}); err == nil {
 		t.Fatal("expected revoke error without RevokeSecret")
+	}
+
+	// Static mode wraps a token only: a GitHub App private key never reaches the child, and a
+	// key without an installation ID no longer falls back to static mode.
+	if _, err := gh.Mint(ctx, compositeSecret, core.MintRequest{Permissions: []string{"static"}}); err == nil || strings.Contains(err.Error(), "-----BEGIN") {
+		t.Fatalf("expected static mode to refuse an App private key, got %v", err)
+	}
+	if _, err := gh.Mint(ctx, "555:"+pkcs1PEM, core.MintRequest{}); err == nil || strings.Contains(err.Error(), "-----BEGIN") {
+		t.Fatalf("expected a JIT error for a key without an installation ID, got %v", err)
 	}
 
 	// Error cases in Mint
@@ -435,15 +455,26 @@ func TestAWSProviderComprehensive(t *testing.T) {
 		t.Fatal("expected invalid master secret format error")
 	}
 
-	// Static mode (2-part and 3-part with session token)
-	staticLease, err := aws.Mint(ctx, "AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY:sess_tok_1", core.MintRequest{
-		Scope: "my-bucket",
-	})
-	if err != nil || staticLease.Ephemeral || staticLease.Env["AWS_SESSION_TOKEN"] != "sess_tok_1" {
-		t.Fatalf("unexpected static lease: %+v err=%v", staticLease, err)
+	// Static mode is explicit only (H2 residual): a scope that is not a role ARN fails instead of
+	// injecting the IAM keys past allow_static, and the error quotes neither the keys nor the scope.
+	const staticKeys = "AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY:sess_tok_1"
+	for _, scope := range []string{"", "my-bucket"} {
+		_, err := aws.Mint(ctx, staticKeys, core.MintRequest{Scope: scope})
+		if err == nil || strings.Contains(err.Error(), "AKIA") || strings.Contains(err.Error(), "EXAMPLEKEY") || strings.Contains(err.Error(), "my-bucket") || !strings.Contains(err.Error(), "allow_static") {
+			t.Fatalf("expected an error naming the static opt-in for scope %q, got %v", scope, err)
+		}
 	}
-	if err := aws.Revoke(ctx, "", staticLease); err != nil {
-		t.Fatal(err)
+	for _, req := range []core.MintRequest{
+		{Scope: "my-bucket", Permissions: []string{"static"}},
+		{Scope: "arn:aws:iam::123456789012:role/DeployRole", Params: map[string]string{"mode": "static"}},
+	} {
+		staticLease, err := aws.Mint(ctx, staticKeys, req)
+		if err != nil || staticLease.Ephemeral || staticLease.ID != "aws-static" || staticLease.Env["AWS_SESSION_TOKEN"] != "sess_tok_1" {
+			t.Fatalf("unexpected static lease for %+v: %+v err=%v", req, staticLease, err)
+		}
+		if err := aws.Revoke(ctx, "", staticLease); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// Mock AWS STS server verifying SigV4 header & inline session policy. A session token is
