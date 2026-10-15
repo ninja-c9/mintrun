@@ -830,6 +830,92 @@ func TestExecBlindCleanEnv(t *testing.T) {
 	}
 }
 
+// ttlProbe is a provider that records the TTL ExecBlind mints with.
+type ttlProbe struct{ ttl *int }
+
+func (p ttlProbe) Manifest() core.Manifest {
+	return core.Manifest{Name: "probe", Kind: core.KindProvider}
+}
+func (p ttlProbe) Mint(_ context.Context, _ string, req core.MintRequest) (*core.Lease, error) {
+	*p.ttl = req.TTLSeconds
+	return &core.Lease{ID: "probe-lease"}, nil
+}
+func (p ttlProbe) Revoke(context.Context, string, *core.Lease) error { return nil }
+
+// TestCheckPolicyMatchesExecBlind pins the dry run (MCP mintrun_policy_check) to the real gate:
+// every denial is the exact error ExecBlind returns, CheckPolicy never calls ApprovalFunc, and
+// ExecBlind mints with the decision's TTL and asks for approval exactly when it says so.
+func TestCheckPolicyMatchesExecBlind(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("MINTRUN_APPROVE", "")
+	home, badHome := t.TempDir(), t.TempDir()
+	policy := `{"probe":{"allowed_scopes":["ok.com"],"allowed_permissions":["dns:*"],"blocked_commands":["rm -rf"],"max_ttl_seconds":120,"allowed_env":["MINTRUN_TEST_*"]},"gated":{"require_approval":true}}`
+	if err := os.WriteFile(filepath.Join(home, "policy.json"), []byte(policy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(badHome, "policy.json"), []byte("{oops"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var minted int
+	reg := core.NewRegistry()
+	vault := &builtin.KeychainVault{HomeDir: home, ForceFile: true}
+	_ = reg.Register(vault)
+	_ = reg.Register(ttlProbe{&minted})
+	if err := vault.SetSecret(ctx, "probe", "probe_master_secret"); err != nil {
+		t.Fatal(err)
+	}
+	rt, badRT := core.NewRuntime(home, "keychain", reg), core.NewRuntime(badHome, "keychain", reg)
+	approvals := 0
+	rt.ApprovalFunc = func(context.Context, core.ExecRequest) (bool, error) { approvals++; return false, nil }
+	probe := func(scope string, perms []string, cmd ...string) core.ExecRequest {
+		return core.ExecRequest{MintRequest: core.MintRequest{Provider: "probe", Scope: scope, Permissions: perms}, Command: cmd}
+	}
+
+	for _, c := range []struct {
+		rt  *core.Runtime
+		req core.ExecRequest
+	}{
+		{rt, core.ExecRequest{}},
+		{rt, core.ExecRequest{Command: []string{"true"}}},
+		{badRT, probe("ok.com", []string{"dns:read"}, "true")},
+		{rt, probe("ok.com", []string{"dns:read"}, "printenv")},
+		{rt, probe("evil.com", []string{"dns:read"}, "true")},
+		{rt, probe("ok.com", nil, "true")},
+		{rt, probe("ok.com", []string{"workers:write"}, "true")},
+		{rt, probe("ok.com", []string{"static"}, "true")},
+		{rt, probe("ok.com", []string{"dns:read"}, "sh", "-c", "RM -RF /tmp/x")},
+	} {
+		d := c.rt.CheckPolicy(c.req)
+		if _, err := c.rt.ExecBlind(ctx, c.req); d.Allowed || d.Reason == "" || err == nil || err.Error() != d.Reason {
+			t.Fatalf("dry run drifted from ExecBlind for %+v: decision %+v, exec error %v", c.req, d, err)
+		}
+	}
+
+	// Allowed: max_ttl_seconds caps the TTL (also an unset one), allowed_env forces clean mode.
+	for _, tc := range []struct{ ttl, want int }{{0, 120}, {300, 120}, {60, 60}} {
+		req := probe("ok.com", []string{"dns:read"}, "true")
+		req.TTLSeconds = tc.ttl
+		d := rt.CheckPolicy(req)
+		res, err := rt.ExecBlind(ctx, req)
+		if !d.Allowed || d.ApprovalRequired || !d.CleanEnv || d.TTLSeconds != tc.want || err != nil || res.ExitCode != 0 || minted != tc.want {
+			t.Fatalf("ttl %d: decision %+v, minted %d, res=%+v err=%v", tc.ttl, d, minted, res, err)
+		}
+	}
+
+	// Approval: reported by the dry run without prompting; ExecBlind then asks exactly once.
+	gated := core.ExecRequest{MintRequest: core.MintRequest{Provider: "gated"}, Command: []string{"true"}, CleanEnv: true}
+	if d := rt.CheckPolicy(gated); !d.Allowed || !d.ApprovalRequired || d.TTLSeconds != 600 || !d.CleanEnv || approvals != 0 {
+		t.Fatalf("gated decision %+v, approvals during dry runs: %d", d, approvals)
+	}
+	if _, err := rt.ExecBlind(ctx, gated); err == nil || !strings.Contains(err.Error(), "human-in-the-loop approval rejected") || approvals != 1 {
+		t.Fatalf("expected one rejected approval, got err=%v approvals=%d", err, approvals)
+	}
+	t.Setenv("MINTRUN_APPROVE", "1")
+	if d := rt.CheckPolicy(probe("ok.com", []string{"dns:read"}, "true")); !d.ApprovalRequired || approvals != 1 {
+		t.Fatalf("MINTRUN_APPROVE=1 must require approval without prompting: %+v approvals=%d", d, approvals)
+	}
+}
+
 // TestMain supplies a deterministic file-vault passphrase for the suite. The
 // AES-256-GCM fallback now mandates MINTRUN_VAULT_KEY (audit C3); tests that need
 // the "no passphrase" error path override it locally with t.Setenv.

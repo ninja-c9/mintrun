@@ -43,7 +43,8 @@ type ExecResult struct {
 }
 
 // AuditEntry is written to `~/.mintrun/audit.jsonl` for every mint/exec action.
-// Never contains raw secret values.
+// Secrets the runner holds are scrubbed; a policy-denied entry keeps the raw command (no secret
+// is loaded yet to scrub against), so MCP mintrun_audit hands agents argv[0] only.
 type AuditEntry struct {
 	Timestamp   string   `json:"ts"`
 	Provider    string   `json:"provider"`
@@ -138,10 +139,33 @@ func (rt *Runtime) loadPolicyFile() {
 	}
 }
 
-func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest) error {
+// PolicyDecision is the static verdict of the exec gate for one ExecRequest (MCP mintrun_policy_check).
+type PolicyDecision struct {
+	Allowed          bool   `json:"allowed"`
+	Reason           string `json:"reason,omitempty"`  // Denial reason: the exact error ExecBlind returns
+	ApprovalRequired bool   `json:"approval_required"` // ExecBlind would ask a human (approve, require_approval, MINTRUN_APPROVE=1)
+	TTLSeconds       int    `json:"ttl_seconds"`       // Lease TTL requested from the provider after max_ttl_seconds and the 600s default
+	CleanEnv         bool   `json:"clean_env"`         // Child gets the clean env (request, policy clean_env, or allowed_env)
+}
+
+// CheckPolicy runs every static rule of the exec gate: request validation, the fail-closed
+// policy.json load, the anti-exfiltration guard, and the provider's policy rule. It never opens
+// a vault, mints, executes, or prompts a human. ExecBlind enforces this same verdict, so a dry
+// run and a real exec cannot drift.
+func (rt *Runtime) CheckPolicy(req ExecRequest) PolicyDecision {
+	deny := func(format string, a ...any) PolicyDecision {
+		return PolicyDecision{Reason: fmt.Sprintf(format, a...)}
+	}
+	if len(req.Command) == 0 {
+		return deny("exec requires a non-empty command")
+	}
+	if req.Provider == "" {
+		return deny("exec requires a provider name")
+	}
+
 	// Fail closed: a policy.json that exists but failed to parse denies everything.
 	if rt.policyErr != nil {
-		return fmt.Errorf("policy denied: policy.json failed to load (%v)", rt.policyErr)
+		return deny("policy denied: policy.json failed to load (%v)", rt.policyErr)
 	}
 
 	// Built-in guardrail: block trivial secret-dumping shell commands in blind runner.
@@ -150,7 +174,7 @@ func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest) error {
 		joined := strings.ToLower(strings.Join(req.Command, " "))
 		if bin == "env" || bin == "printenv" || bin == "export" ||
 			strings.Contains(joined, "printenv") || strings.Contains(joined, "/proc/self/environ") {
-			return fmt.Errorf("policy denied: command %q attempts to dump environment variables", req.Command[0])
+			return deny("policy denied: command %q attempts to dump environment variables", req.Command[0])
 		}
 	}
 
@@ -160,7 +184,7 @@ func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest) error {
 	// explicitly opted into via policy; an agent cannot silently downgrade by requesting it.
 	if req.Params["mode"] == "static" || hasToken(req.Permissions, "static") {
 		if !(hasRule && rule.AllowStatic) {
-			return fmt.Errorf("policy denied: static (non-JIT) mode for provider %q requires \"allow_static\": true in policy.json", req.Provider)
+			return deny("policy denied: static (non-JIT) mode for provider %q requires \"allow_static\": true in policy.json", req.Provider)
 		}
 	}
 
@@ -175,13 +199,13 @@ func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest) error {
 				}
 			}
 			if !allowed {
-				return fmt.Errorf("policy denied: scope %q is not in allowed_scopes for provider %q", req.Scope, req.Provider)
+				return deny("policy denied: scope %q is not in allowed_scopes for provider %q", req.Scope, req.Provider)
 			}
 		}
 		if len(rule.AllowedPermissions) > 0 {
 			// Fail closed: a request declaring no permissions is denied unless '*' is allowed.
 			if len(req.Permissions) == 0 && !hasToken(rule.AllowedPermissions, "*") {
-				return fmt.Errorf("policy denied: provider %q requires declared permissions within allowed_permissions", req.Provider)
+				return deny("policy denied: provider %q requires declared permissions within allowed_permissions", req.Provider)
 			}
 			for _, perm := range req.Permissions {
 				allowed := false
@@ -192,7 +216,7 @@ func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest) error {
 					}
 				}
 				if !allowed {
-					return fmt.Errorf("policy denied: permission %q is not in allowed_permissions for provider %q", perm, req.Provider)
+					return deny("policy denied: permission %q is not in allowed_permissions for provider %q", perm, req.Provider)
 				}
 			}
 		}
@@ -200,7 +224,7 @@ func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest) error {
 			cmdLine := strings.ToLower(strings.Join(req.Command, " "))
 			for _, blocked := range rule.BlockedCommands {
 				if blocked != "" && strings.Contains(cmdLine, strings.ToLower(blocked)) {
-					return fmt.Errorf("policy denied: command matches blocked pattern %q", blocked)
+					return deny("policy denied: command matches blocked pattern %q", blocked)
 				}
 			}
 		}
@@ -208,8 +232,28 @@ func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest) error {
 			req.TTLSeconds = rule.MaxTTLSeconds
 		}
 	}
+	if req.TTLSeconds <= 0 {
+		req.TTLSeconds = 600
+	}
 
-	if req.Approve || (hasRule && rule.RequireApproval) || os.Getenv("MINTRUN_APPROVE") == "1" {
+	return PolicyDecision{
+		Allowed:          true,
+		ApprovalRequired: req.Approve || (hasRule && rule.RequireApproval) || os.Getenv("MINTRUN_APPROVE") == "1",
+		TTLSeconds:       req.TTLSeconds,
+		CleanEnv:         req.CleanEnv || rule.CleanEnv || len(rule.AllowedEnv) > 0,
+	}
+}
+
+// checkPolicy enforces CheckPolicy's verdict on req (effective TTL, clean mode) and asks a
+// human through ApprovalFunc when the verdict requires approval.
+func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest) error {
+	d := rt.CheckPolicy(*req)
+	if !d.Allowed {
+		return errors.New(d.Reason)
+	}
+	req.TTLSeconds, req.CleanEnv = d.TTLSeconds, d.CleanEnv
+
+	if d.ApprovalRequired {
 		approveFn := rt.ApprovalFunc
 		if approveFn == nil {
 			approveFn = defaultOSApproval
@@ -238,12 +282,6 @@ func defaultOSApproval(ctx context.Context, req ExecRequest) (bool, error) {
 // and immediately revokes the ephemeral lease before returning.
 func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult, error) {
 	start := time.Now()
-	if len(req.Command) == 0 {
-		return nil, errors.New("exec requires a non-empty command")
-	}
-	if req.Provider == "" {
-		return nil, errors.New("exec requires a provider name")
-	}
 	if err := rt.checkPolicy(ctx, &req); err != nil {
 		rt.writeAudit(AuditEntry{
 			Timestamp: start.UTC().Format(time.RFC3339),
@@ -274,9 +312,6 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 		return nil, fmt.Errorf("vault %q could not load master secret for %q: %w (run `mintrun secret set %s` first)", vaultName, req.Provider, err, req.Provider)
 	}
 
-	if req.TTLSeconds <= 0 {
-		req.TTLSeconds = 600
-	}
 	lease, err := provider.Mint(ctx, masterSecret, req.MintRequest)
 	if err != nil {
 		// Mint errors may echo the master secret (plugin stderr, API response bodies).
@@ -319,10 +354,10 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 		cmd.Dir = req.WorkingDir
 	}
 
-	// Build child environment (audit M1): clean-env keeps only the base set plus policy
-	// allowed_env names; otherwise the host env is inherited. Lease.Env always wins.
-	rule := rt.Policies[req.Provider]
-	cmd.Env = childEnv(req.CleanEnv || rule.CleanEnv || len(rule.AllowedEnv) > 0, rule.AllowedEnv, lease.Env)
+	// Build child environment (audit M1): clean-env (req.CleanEnv already folds in policy
+	// clean_env/allowed_env via CheckPolicy) keeps only the base set plus policy allowed_env
+	// names; otherwise the host env is inherited. Lease.Env always wins.
+	cmd.Env = childEnv(req.CleanEnv, rt.Policies[req.Provider].AllowedEnv, lease.Env)
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
