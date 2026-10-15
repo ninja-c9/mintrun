@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"net/http"
@@ -299,22 +300,8 @@ func TestKeychainAndOnePasswordVaults(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Test native macOS Keychain path (ForceFile = false) with ephemeral test key
-	kv.ForceFile = false
-	testKey := "unit_test_ephemeral_key_999"
-	defer func() { _ = kv.DeleteSecret(ctx, testKey) }()
-	if err := kv.SetSecret(ctx, testKey, "keychain_val_999"); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := kv.GetSecret(ctx, testKey); err != nil || got != "keychain_val_999" {
-		t.Fatalf("expected keychain_val_999, got %q %v", got, err)
-	}
-	if err := kv.DeleteSecret(ctx, testKey); err != nil {
-		t.Fatal(err)
-	}
-	// Fallback to file secret when key is not in macOS Keychain
 	if got, err := kv.GetSecret(ctx, "cf"); err != nil || got != "recovered" {
-		t.Fatalf("expected fallback to file secret 'recovered', got %q %v", got, err)
+		t.Fatalf("expected re-created vault to hold 'recovered', got %q %v", got, err)
 	}
 
 	// Test OnePasswordVault using a mock `op` CLI binary in PATH
@@ -745,7 +732,7 @@ func TestKeychainVaultLinuxSecretTool(t *testing.T) {
 echo "$*" >> "$MOCK_SECRET_LOG"
 action=$1; shift
 case "$1" in --label=*) shift ;; esac
-case "$2" in *fail*) exit 1 ;; esac
+case "$2" in *fail*) echo "secret-tool: cannot connect to the secret service" >&2; exit 1 ;; esac
 f="$MOCK_SECRET_STORE/$2"
 case "$action" in
   store) cat > "$f" ;;
@@ -784,7 +771,12 @@ esac
 		t.Fatalf("libsecret-only usage must not create vault.json: %v", err)
 	}
 
-	// A failing secret-tool (no D-Bus session, locked keyring) falls back to the file vault.
+	// A failing secret-tool (no D-Bus session, locked keyring) falls back to the file vault, and
+	// says so on stderr without the secret (audit M7); a plain miss above stayed quiet.
+	var warn bytes.Buffer
+	oldWarn := warnOut
+	warnOut = &warn
+	defer func() { warnOut = oldWarn }()
 	t.Setenv("MINTRUN_VAULT_KEY", "mintrun-unit-test-passphrase")
 	if err := kv.SetSecret(ctx, "fail-key", "file_fallback_val"); err != nil {
 		t.Fatal(err)
@@ -792,11 +784,150 @@ esac
 	if got, err := kv.GetSecret(ctx, "fail-key"); err != nil || got != "file_fallback_val" {
 		t.Fatalf("expected file-vault fallback, got %q %v", got, err)
 	}
-	if err := kv.DeleteSecret(ctx, "fail-key"); err != nil {
-		t.Fatal(err)
+	if w := warn.String(); !strings.Contains(w, `libsecret store for "fail-key" failed`) || !strings.Contains(w, "libsecret lookup") || strings.Contains(w, "file_fallback_val") {
+		t.Fatalf("unexpected fallback warnings:\n%s", w)
+	}
+	// A delete that cannot reach libsecret is reported, but the file-vault copy is still removed.
+	if err := kv.DeleteSecret(ctx, "fail-key"); err == nil || !strings.Contains(err.Error(), "libsecret clear") {
+		t.Fatalf("expected a reported libsecret clear failure, got %v", err)
 	}
 	if _, err := kv.GetSecret(ctx, "fail-key"); err == nil {
 		t.Fatal("expected fallback secret to be gone after delete")
+	}
+}
+
+// TestKeychainVaultMacOSSecurity drives the macOS Keychain path through a mock security(1): the
+// secret travels hex-encoded on `security -i` stdin, so argv is only `-i` (audit M5); reads parse
+// both `-g` forms byte-exactly; a miss falls back to the file vault quietly, and a real failure
+// falls back with a warning that never carries the secret (audit M7).
+func TestKeychainVaultMacOSSecurity(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, argLog := filepath.Join(dir, "store"), filepath.Join(dir, "argv.log")
+	if err := os.Mkdir(store, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Mock CLI: security -i (one command on stdin) | {find,delete}-generic-password -a mintrun -s <svc> [-g]
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$MOCK_SEC_LOG"
+if [ "$1" = "-i" ]; then
+  IFS= read -r line
+  svc=${line#*-s \"}; svc=${svc%%\"*}
+  case "$svc" in *fail*) echo "add-generic-password failed" >&2; exit 45 ;; esac
+  printf '%s' "${line##*-X }" > "$MOCK_SEC_STORE/$svc"
+  exit 0
+fi
+case "$5" in
+  *fail*) echo "$1 failed" >&2; exit 1 ;;
+  *noline*) exit 0 ;;
+  *badhex*) echo 'password: 0xZZ  "x"' >&2; exit 0 ;;
+esac
+f="$MOCK_SEC_STORE/$5"
+[ -f "$f" ] || exit 44
+case "$1" in
+  find-generic-password)
+    v=$(cat "$f")
+    case "$v" in
+      \"*) printf 'password: %s\n' "$v" >&2 ;;
+      *) printf 'password: 0x%s  "escaped"\n' "$(printf '%s' "$v" | tr a-f A-F)" >&2 ;;
+    esac ;;
+  delete-generic-password) rm -f "$f" ;;
+esac
+`
+	mock := filepath.Join(dir, "security")
+	if err := os.WriteFile(mock, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MOCK_SEC_STORE", store)
+	t.Setenv("MOCK_SEC_LOG", argLog)
+	var warn bytes.Buffer
+	oldPath, oldWarn := securityPath, warnOut
+	securityPath, warnOut = mock, &warn
+	defer func() { securityPath, warnOut = oldPath, oldWarn }()
+
+	kv := &KeychainVault{HomeDir: filepath.Join(dir, "home")}
+	secret := "{\n  \"key\": \"multi \\\\ line\",\n  \"utf8\": \"\u00fcn\u00efcode $HOME; # 'x'\"\n}"
+	if err := kv.SetSecret(ctx, "GCP", secret); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := kv.GetSecret(ctx, "gcp"); err != nil || got != secret {
+		t.Fatalf("Keychain round trip failed: %q %v", got, err)
+	}
+	// A printable value (stored by an older mintrun or another tool) comes back in -g's raw form.
+	if err := os.WriteFile(filepath.Join(store, "mintrun:legacy"), []byte(`"legacy "quoted" value"`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := kv.GetSecret(ctx, "legacy"); err != nil || got != `legacy "quoted" value` {
+		t.Fatalf("raw -g form: %q %v", got, err)
+	}
+	logged, _ := os.ReadFile(argLog)
+	if strings.Contains(string(logged), "multi") || strings.Contains(string(logged), hex.EncodeToString([]byte(secret))) ||
+		!strings.HasPrefix(string(logged), "-i\n") || !strings.Contains(string(logged), "find-generic-password -a mintrun -s mintrun:gcp -g") {
+		t.Fatalf("unexpected security argv (secret must go via stdin):\n%s", logged)
+	}
+	// A miss (exit 44) falls back to the file vault quietly.
+	if _, err := kv.GetSecret(ctx, "absent"); err == nil || warn.Len() != 0 {
+		t.Fatalf("expected a quiet miss, got %v, warnings %q", err, warn.String())
+	}
+
+	// A real Keychain failure falls back with a warning naming the store and key, never the secret.
+	if err := kv.SetSecret(ctx, "fail-key", "fallback_val_777"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := kv.GetSecret(ctx, "fail-key"); err != nil || got != "fallback_val_777" {
+		t.Fatalf("expected file-vault fallback, got %q %v", got, err)
+	}
+	if w := warn.String(); !strings.Contains(w, `macOS Keychain store for "fail-key" failed`) || !strings.Contains(w, "macOS Keychain lookup") || strings.Contains(w, "fallback_val_777") {
+		t.Fatalf("unexpected fallback warnings:\n%s", w)
+	}
+	// Unparseable -g output is a real failure too.
+	for _, key := range []string{"noline", "badhex"} {
+		warn.Reset()
+		if _, err := kv.GetSecret(ctx, key); err == nil || !strings.Contains(warn.String(), "macOS Keychain lookup") {
+			t.Fatalf("%s: expected a warning and a file-vault miss, got %v, warnings %q", key, err, warn.String())
+		}
+	}
+
+	// `security -i` reads 4095-byte lines: a secret that fits is sent; one byte more is refused
+	// before anything is sent (a split line stores a corrupted item) and lands in the file vault.
+	edge, big := strings.Repeat("e", 2019), strings.Repeat("b", 2020)
+	for key, val := range map[string]string{"edge": edge, "big": big} {
+		if err := kv.SetSecret(ctx, key, val); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := kv.GetSecret(ctx, key); err != nil || got != val {
+			t.Fatalf("%s: round trip failed: %v", key, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(store, "mintrun:edge")); err != nil {
+		t.Fatalf("a 4095-byte line must reach security: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(store, "mintrun:big")); !os.IsNotExist(err) || !strings.Contains(warn.String(), "too long for `security -i`") {
+		t.Fatalf("an oversize line must never reach security: %v, warnings %q", err, warn.String())
+	}
+	// A service name `security -i` cannot quote is refused the same way.
+	if err := kv.SetSecret(ctx, `bad"key`, "quoted_val"); err != nil || !strings.Contains(warn.String(), "cannot be quoted") {
+		t.Fatalf("expected refusal of an unquotable service name: %v, warnings %q", err, warn.String())
+	}
+	if strings.Contains(warn.String(), "bbbb") || strings.Contains(warn.String(), "quoted_val") {
+		t.Fatalf("warnings must never carry a secret:\n%s", warn.String())
+	}
+
+	// Delete: a Keychain miss is fine; a real failure is reported, and the file vault still cleared.
+	if err := kv.DeleteSecret(ctx, "gcp"); err != nil {
+		t.Fatal(err)
+	}
+	if err := kv.DeleteSecret(ctx, "gcp"); err != nil {
+		t.Fatalf("deleting an absent key must succeed: %v", err)
+	}
+	if _, err := kv.GetSecret(ctx, "gcp"); err == nil {
+		t.Fatal("expected secret to be gone after delete")
+	}
+	if err := kv.DeleteSecret(ctx, "fail-key"); err == nil || !strings.Contains(err.Error(), "macOS Keychain delete") {
+		t.Fatalf("expected a reported Keychain delete failure, got %v", err)
+	}
+	if _, err := kv.getFileSecret("fail-key"); err == nil {
+		t.Fatal("the file-vault copy must be deleted even when the Keychain delete fails")
 	}
 }
 

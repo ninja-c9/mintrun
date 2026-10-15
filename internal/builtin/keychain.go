@@ -9,9 +9,11 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +25,20 @@ import (
 )
 
 const keychainAccount = "mintrun"
+
+// Swapped by tests: the macOS security(1) binary, and where keystore fallback warnings go.
+var (
+	securityPath           = "/usr/bin/security"
+	warnOut      io.Writer = os.Stderr
+)
+
+// errNotFound marks a plain keystore miss, which falls back to the file vault quietly.
+var errNotFound = errors.New("not found")
+
+// maxSecurityLine is the longest command line `security -i` reads intact (a 4 KiB fgets buffer,
+// newline included). Measured on macOS: a 4095-byte line stores the secret, while a 4097-byte
+// line is split, stores a corrupted item, and exits 1.
+const maxSecurityLine = 4095
 
 // File-vault KDF parameters: the AES-256-GCM key is derived from the
 // MINTRUN_VAULT_KEY passphrase and a per-vault random salt via PBKDF2-HMAC-SHA256.
@@ -76,32 +92,103 @@ func (k *KeychainVault) secretTool(ctx context.Context, stdin, action, key strin
 	args := append(append([]string{action}, extra...), "service", k.serviceName(key), "account", keychainAccount)
 	cmd := exec.CommandContext(ctx, k.SecretTool, args...)
 	cmd.Stdin = strings.NewReader(stdin)
-	var out bytes.Buffer
+	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
+	cmd.Stderr = &errOut
 	err := cmd.Run()
+	var exitErr *exec.ExitError
+	if action != "store" && errors.As(err, &exitErr) && errOut.Len() == 0 {
+		err = errNotFound // secret-tool reports a miss as a bare exit 1; real failures print a reason
+	}
 	return strings.TrimSpace(out.String()), err
+}
+
+// security runs macOS security(1); exit 44 (errSecItemNotFound) is a plain miss. Its stderr is
+// returned for `-g` parsing only, never put in an error: it can hold the secret.
+func (k *KeychainVault) security(ctx context.Context, stdin string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, securityPath, args...)
+	cmd.Stdin = strings.NewReader(stdin)
+	var errOut bytes.Buffer
+	cmd.Stderr = &errOut
+	err := cmd.Run()
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 44 {
+		err = errNotFound
+	}
+	return errOut.String(), err
+}
+
+// keychainGet reads with -g, not -w: -w hex-dumps any value holding a newline or a non-ASCII
+// byte. -g prints `password: "<raw>"`, or `password: 0x<HEX>  "<escaped>"` for such values.
+func (k *KeychainVault) keychainGet(ctx context.Context, key string) (string, error) {
+	errOut, err := k.security(ctx, "", "find-generic-password", "-a", keychainAccount, "-s", k.serviceName(key), "-g")
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(errOut, "\n") {
+		rest, ok := strings.CutPrefix(line, "password: ")
+		if !ok {
+			continue
+		}
+		var val string
+		if h, ok := strings.CutPrefix(rest, "0x"); ok {
+			h, _, _ = strings.Cut(h, " ")
+			b, err := hex.DecodeString(h)
+			if err != nil {
+				return "", errors.New("unparseable Keychain password line") // never wrap: the hex error quotes secret bytes
+			}
+			val = string(b)
+		} else if len(rest) >= 2 && rest[0] == '"' && rest[len(rest)-1] == '"' {
+			val = rest[1 : len(rest)-1]
+		}
+		if val = strings.TrimSpace(val); val == "" {
+			return "", errNotFound
+		}
+		return val, nil
+	}
+	return "", errors.New("security printed no password line")
+}
+
+// keychainSet stores via `security -i` so argv is only `-i` (audit M5): the command, with the
+// secret hex-encoded for -X, travels on stdin. A line `security -i` would split is refused
+// before anything is sent, since a split line stores a corrupted item.
+func (k *KeychainVault) keychainSet(ctx context.Context, key, value string) error {
+	svc := k.serviceName(key)
+	if strings.ContainsFunc(svc, func(r rune) bool { return r < 0x20 || r == 0x7f || r == '"' || r == '\\' }) {
+		return fmt.Errorf("service name %q cannot be quoted for `security -i`", svc)
+	}
+	line := fmt.Sprintf("add-generic-password -U -a %s -s \"%s\" -X %s\n", keychainAccount, svc, hex.EncodeToString([]byte(value)))
+	if len(line) > maxSecurityLine {
+		// ponytail: hex doubles the size, so the ceiling is ~2 KB and a GCP service-account JSON
+		// lands in the file vault. Split the secret over several items if it must stay in Keychain.
+		return fmt.Errorf("secret is %d bytes, too long for `security -i` (max ~2 KB)", len(value))
+	}
+	_, err := k.security(ctx, line, "-i")
+	return err
+}
+
+// warnFallback reports a keystore failure before the file vault takes over (audit M7). A plain
+// miss stays quiet, and only the error is printed, never the secret or the helper's stderr.
+func warnFallback(store, op, key string, err error) {
+	if err != nil && !errors.Is(err, errNotFound) {
+		fmt.Fprintf(warnOut, "mintrun: warning: %s %s for %q failed (%v); using the encrypted file vault\n", store, op, key, err)
+	}
 }
 
 func (k *KeychainVault) GetSecret(ctx context.Context, key string) (string, error) {
 	if k.SecretTool != "" {
-		if val, err := k.secretTool(ctx, "", "lookup", key); err == nil && val != "" {
+		val, err := k.secretTool(ctx, "", "lookup", key)
+		if err == nil && val != "" {
 			return val, nil
 		}
+		warnFallback("libsecret", "lookup", key, err)
 	}
 	if !k.ForceFile {
-		cmd := exec.CommandContext(ctx, "/usr/bin/security", "find-generic-password",
-			"-a", keychainAccount,
-			"-s", k.serviceName(key),
-			"-w",
-		)
-		var out bytes.Buffer
-		cmd.Stdout = &out
-		if err := cmd.Run(); err == nil {
-			val := strings.TrimSpace(out.String())
-			if val != "" {
-				return val, nil
-			}
+		val, err := k.keychainGet(ctx, key)
+		if err == nil {
+			return val, nil
 		}
+		warnFallback("macOS Keychain", "lookup", key, err)
 	}
 	return k.getFileSecret(key)
 }
@@ -112,35 +199,37 @@ func (k *KeychainVault) SetSecret(ctx context.Context, key, value string) error 
 		return errors.New("secret value cannot be empty")
 	}
 	if k.SecretTool != "" {
-		if _, err := k.secretTool(ctx, value, "store", key, "--label="+k.serviceName(key)); err == nil {
+		_, err := k.secretTool(ctx, value, "store", key, "--label="+k.serviceName(key))
+		if err == nil {
 			return nil
 		}
+		warnFallback("libsecret", "store", key, err)
 	}
 	if !k.ForceFile {
-		cmd := exec.CommandContext(ctx, "/usr/bin/security", "add-generic-password",
-			"-U",
-			"-a", keychainAccount,
-			"-s", k.serviceName(key),
-			"-w", value,
-		)
-		if err := cmd.Run(); err == nil {
+		err := k.keychainSet(ctx, key, value)
+		if err == nil {
 			return nil
 		}
+		warnFallback("macOS Keychain", "store", key, err)
 	}
 	return k.setFileSecret(key, value)
 }
 
+// DeleteSecret removes the key from every store. A store that does not hold it is fine; any
+// other failure is reported, so a secret is never silently left behind.
 func (k *KeychainVault) DeleteSecret(ctx context.Context, key string) error {
+	var errs []error
 	if k.SecretTool != "" {
-		_, _ = k.secretTool(ctx, "", "clear", key)
+		if _, err := k.secretTool(ctx, "", "clear", key); err != nil && !errors.Is(err, errNotFound) {
+			errs = append(errs, fmt.Errorf("libsecret clear: %w", err))
+		}
 	}
 	if !k.ForceFile {
-		_ = exec.CommandContext(ctx, "/usr/bin/security", "delete-generic-password",
-			"-a", keychainAccount,
-			"-s", k.serviceName(key),
-		).Run()
+		if _, err := k.security(ctx, "", "delete-generic-password", "-a", keychainAccount, "-s", k.serviceName(key)); err != nil && !errors.Is(err, errNotFound) {
+			errs = append(errs, fmt.Errorf("macOS Keychain delete: %w", err))
+		}
 	}
-	return k.deleteFileSecret(key)
+	return errors.Join(append(errs, k.deleteFileSecret(key))...)
 }
 
 func (k *KeychainVault) vaultFilePath() string {
