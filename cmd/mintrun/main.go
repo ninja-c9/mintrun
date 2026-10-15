@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -39,6 +40,7 @@ func bootRuntime() (*core.Runtime, error) {
 	_ = reg.Register(builtin.NewCloudflareProvider())
 	_ = reg.Register(builtin.NewGitHubProvider())
 	_ = reg.Register(builtin.NewAWSProvider())
+	_ = reg.Register(builtin.NewGCPProvider())
 	_ = reg.Register(builtin.NewMCPBridge())
 
 	// Discover and register all externally installed plugins from ~/.mintrun/plugins.
@@ -91,6 +93,7 @@ func cmdExec(ctx context.Context, rt *core.Runtime, args []string) {
 	ttl := fs.Int("ttl", 600, "Ephemeral token TTL in seconds")
 	cwd := fs.String("cwd", "", "Working directory for command")
 	approve := fs.Bool("approve", false, "Prompt for interactive macOS HITL approval before minting")
+	cleanEnv := fs.Bool("clean-env", false, "Run the command with only PATH/HOME/TMPDIR/USER/LANG/TERM/SSL_CERT_FILE, policy allowed_env, and the lease env")
 
 	var cmdArgs []string
 	var flagArgs []string
@@ -130,6 +133,7 @@ func cmdExec(ctx context.Context, rt *core.Runtime, args []string) {
 		Command:    cmdArgs,
 		WorkingDir: *cwd,
 		Approve:    *approve,
+		CleanEnv:   *cleanEnv,
 	})
 	if err != nil {
 		fatal("%v", err)
@@ -158,6 +162,14 @@ func cmdSecret(ctx context.Context, rt *core.Runtime, args []string) {
 		var val string
 		if len(args) >= 3 {
 			val = args[2]
+		} else if fi, err := os.Stdin.Stat(); err == nil && fi.Mode()&os.ModeCharDevice == 0 {
+			// Piped or redirected (`< sa-key.json`): read it whole so multi-line secrets such as a
+			// GCP service-account key or a PEM survive intact (and stay off argv, audit M5).
+			b, err := io.ReadAll(io.LimitReader(os.Stdin, 1<<20))
+			if err != nil {
+				fatal("read secret from stdin: %v", err) // never overwrite a stored secret with a partial read
+			}
+			val = string(b)
 		} else {
 			fmt.Fprintf(os.Stderr, "Enter master secret for %q: ", key)
 			sc := bufio.NewScanner(os.Stdin)

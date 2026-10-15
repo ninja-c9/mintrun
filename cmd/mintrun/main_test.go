@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -112,6 +113,35 @@ func TestCLISubcommandsEndToEnd(t *testing.T) {
 	if _, exited := runMainWithArgs(t, "", "secret", "check", "cloudflare"); exited {
 		t.Fatal("secret check failed")
 	}
+	// A piped multi-line secret (a pretty-printed GCP service-account key) is stored whole.
+	saKey := "{\n  \"type\": \"service_account\",\n  \"client_email\": \"ci@example.iam.gserviceaccount.com\"\n}"
+	if _, exited := runMainWithArgs(t, saKey+"\n", "secret", "set", "gcp"); exited {
+		t.Fatal("secret set gcp via piped stdin failed")
+	}
+	rt, err := bootRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.Registry.Provider("gcp"); err != nil {
+		t.Fatalf("gcp provider not registered: %v", err)
+	}
+	kv, _ := rt.Registry.Vault("keychain")
+	if got, err := kv.GetSecret(context.Background(), "gcp"); err != nil || got != saKey {
+		t.Fatalf("multi-line secret truncated: %q %v", got, err)
+	}
+	// A failed stdin read (read(2) on a directory fd) is fatal and keeps the stored secret intact.
+	dirIn, err := os.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origStdin := os.Stdin
+	os.Stdin = dirIn
+	code, exited := runMainWithArgs(t, "", "secret", "set", "gcp")
+	os.Stdin = origStdin
+	_ = dirIn.Close()
+	if got, _ := kv.GetSecret(context.Background(), "gcp"); !exited || code != 1 || got != saKey {
+		t.Fatalf("unreadable stdin: exit %d (exited=%v), stored secret intact=%v", code, exited, got == saKey)
+	}
 	if _, exited := runMainWithArgs(t, "", "secret", "delete", "github"); exited {
 		t.Fatal("secret delete failed")
 	}
@@ -139,6 +169,14 @@ func TestCLISubcommandsEndToEnd(t *testing.T) {
 	}
 	if code, exited := runMainWithArgs(t, "", "exec", "-provider", "unknown_prov", "--", "echo", "fail"); !exited || code != 1 {
 		t.Fatal("expected exit 1 on unknown provider")
+	}
+	// -clean-env strips ambient host variables but keeps PATH and the lease credential.
+	t.Setenv("MINTRUN_TEST_AMBIENT", "ambient_host_value")
+	if code, exited := runMainWithArgs(t, "", "exec", "-provider", "cloudflare", "-perms", "static", "--", "sh", "-c", `test -n "$MINTRUN_TEST_AMBIENT"`); !exited || code != 0 {
+		t.Fatalf("expected the ambient var to be inherited by default, got code=%d", code)
+	}
+	if code, exited := runMainWithArgs(t, "", "exec", "-clean-env", "-provider", "cloudflare", "-perms", "static", "--", "sh", "-c", `test -z "$MINTRUN_TEST_AMBIENT" && test -n "$PATH" && test -n "$CF_API_TOKEN"`); !exited || code != 0 {
+		t.Fatalf("expected -clean-env to strip ambient vars only, got code=%d", code)
 	}
 
 	// 7. Audit after executions -> prints audit.jsonl & supports filtering flags

@@ -96,8 +96,8 @@ sequenceDiagram
 
 | Plugin Kind | Go Interface | Responsibility | Built-in Implementation |
 | :--- | :--- | :--- | :--- |
-| **`vault`** | `core.VaultPlugin` | Stores and retrieves long-lived master credentials outside agent context | • **`keychain`** — macOS Keychain (`/usr/bin/security`) with **AES-256-GCM** encrypted `0600` local fallback (`~/.mintrun/vault.json`); the fallback requires a **`MINTRUN_VAULT_KEY`** passphrase (PBKDF2-HMAC-SHA256 key, per-vault random salt)<br />• **`1password`** — 1Password CLI (`op`) biometric TouchID vault (`op://` URIs & `mintrun:<provider>` items) |
-| **`provider`** | `core.ProviderPlugin` | Mints short-lived, resource-scoped sub-tokens from a master secret and revokes them on exit | • **`cloudflare`** — Resolves domain names to Zone IDs, maps permissions (`dns:write`, `workers:write`), mints via `POST /client/v4/user/tokens`, and revokes via `DELETE /client/v4/user/tokens/{id}`<br />• **`github`** — Signs RS256 App JWTs (PKCS#1/PKCS#8), mints repo-scoped Installation Tokens, and revokes via `DELETE /installation/token`<br />• **`aws`** — 100% stdlib SigV4 `STS AssumeRole` JIT minter with inline session policy narrowing (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) |
+| **`vault`** | `core.VaultPlugin` | Stores and retrieves long-lived master credentials outside agent context | • **`keychain`** — macOS Keychain (`/usr/bin/security`) or Linux libsecret (`secret-tool`, secret passed on `stdin` only) with **AES-256-GCM** encrypted `0600` local fallback (`~/.mintrun/vault.json`); the fallback requires a **`MINTRUN_VAULT_KEY`** passphrase (PBKDF2-HMAC-SHA256 key, per-vault random salt)<br />• **`1password`** — 1Password CLI (`op`) biometric TouchID vault (`op://` URIs & `mintrun:<provider>` items) |
+| **`provider`** | `core.ProviderPlugin` | Mints short-lived, resource-scoped sub-tokens from a master secret and revokes them on exit | • **`cloudflare`** — Resolves domain names to Zone IDs, maps permissions (`dns:write`, `workers:write`), mints via `POST /client/v4/user/tokens`, and revokes via `DELETE /client/v4/user/tokens/{id}`<br />• **`github`** — Signs RS256 App JWTs (PKCS#1/PKCS#8), mints repo-scoped Installation Tokens, and revokes via `DELETE /installation/token`<br />• **`aws`** — 100% stdlib SigV4 `STS AssumeRole` JIT minter with inline session policy narrowing (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`)<br />• **`gcp`** — Signs an RS256 JWT bearer assertion (RFC 7523) from a service-account JSON key, exchanges it for an OAuth2 access token limited to the requested scopes (`cloud-platform.read-only`, `devstorage.read_only`, …), and injects `CLOUDSDK_AUTH_ACCESS_TOKEN` + `GOOGLE_OAUTH_ACCESS_TOKEN`. Revocation on exit is best-effort: Google does not revoke service-account tokens server-side, so they live until their fixed ≤1h expiry |
 | **`bridge`** | `core.BridgePlugin` | Exposes `mintrun` capabilities to external AI agent harnesses | • **`mcp`** — Full Model Context Protocol (JSON-RPC 2.0 over `stdio`) server exposing `mintrun_exec` and `mintrun_plugins` |
 
 ### Repository Layout
@@ -113,8 +113,8 @@ mintrun/
 │   │   ├── runner.go           # ExecBlind lifecycle, Policy Engine, Encoding Scrubber, Audit Logger
 │   │   └── core_test.go        # Core JIT mint, scrub, revoke, policy & MCP test suite
 │   └── builtin/
-│       ├── keychain.go         # Native macOS Keychain + AES-256-GCM fallback & 1Password vault
-│       ├── cloudflare.go       # Built-in Cloudflare, GitHub (RS256 JWT), and AWS STS (SigV4) providers
+│       ├── keychain.go         # macOS Keychain / Linux libsecret + AES-256-GCM fallback & 1Password vault
+│       ├── cloudflare.go       # Built-in Cloudflare, GitHub (RS256 JWT), AWS STS (SigV4) & GCP (JWT bearer) providers
 │       ├── mcp.go              # MCP JSON-RPC 2.0 stdio bridge server
 │       └── builtin_test.go     # Comprehensive provider, vault, and MCP unit test suite
 └── docs/assets/                # Architectural diagrams & visual assets
@@ -147,6 +147,10 @@ Create a Cloudflare API Token that includes the **`User -> API Tokens -> Edit`**
 # Verify existence without ever printing the secret value:
 ./mintrun secret check cloudflare
 # -> Secret "cloudflare" is configured in vault "keychain" (length=40 chars, value hidden).
+
+# Piped or redirected input is read whole, so multi-line secrets such as a GCP
+# service-account JSON key survive intact (and never touch argv or shell history):
+./mintrun secret set gcp < sa-key.json
 ```
 
 ### 3. Run Commands Blindly with JIT Scoped Tokens
@@ -160,6 +164,12 @@ Create a Cloudflare API Token that includes the **`User -> API Tokens -> Edit`**
   -perms dns:write,workers:write \
   -ttl 300 \
   -- npx wrangler deploy
+```
+
+For Google Cloud, permissions are OAuth2 scopes (short names expand under `https://www.googleapis.com/auth/`). Add `-clean-env` so the child only sees `PATH`, `HOME`, `TMPDIR`, `USER`, `LANG`, `TERM`, `SSL_CERT_FILE`, your policy's `allowed_env`, and the lease credential:
+
+```bash
+./mintrun exec -provider gcp -perms cloud-platform.read-only -clean-env -- gcloud storage ls gs://my-bucket
 ```
 
 > **Static Wrapper Mode:** Already have a pre-scoped token and just want zero-knowledge injection + stream scrubbing without calling `/user/tokens`? Pass `-perms static`:
@@ -199,7 +209,7 @@ Add `mintrun` to **Google Antigravity**, **Claude Code**, or **Cursor** so your 
 
 | Tool Name | Description | Key Parameters |
 | :--- | :--- | :--- |
-| **`mintrun_exec`** | Mints a scoped JIT credential, runs the target CLI command in a blind subprocess, scrubs all secret strings from `stdout`/`stderr`, and revokes the credential before returning. | `provider` (`"cloudflare"`), `scope` (`"example.com"`), `permissions` (`["dns:write","workers:write"]`), `command` (`["wrangler","deploy"]`), `cwd`, `ttl_seconds` |
+| **`mintrun_exec`** | Mints a scoped JIT credential, runs the target CLI command in a blind subprocess, scrubs all secret strings from `stdout`/`stderr`, and revokes the credential before returning. | `provider` (`"cloudflare"`), `scope` (`"example.com"`), `permissions` (`["dns:write","workers:write"]`), `command` (`["wrangler","deploy"]`), `cwd`, `ttl_seconds`, `clean_env` |
 | **`mintrun_plugins`** | Lists all registered built-in and external plugins (`vault`, `provider`, `bridge`) along with their supported permission scopes. | *(none)* |
 
 ---
@@ -221,9 +231,16 @@ You can restrict which domains/scopes an AI agent is allowed to touch, cap maxim
     "allowed_scopes": ["ninja-c9/*"],
     "blocked_commands": ["repo delete", "secret"],
     "max_ttl_seconds": 600
+  },
+  "gcp": {
+    "allowed_permissions": ["cloud-platform.read-only", "devstorage.read_only"],
+    "clean_env": true,
+    "allowed_env": ["CLOUDSDK_CORE_PROJECT"]
   }
 }
 ```
+
+**Child environment isolation:** `clean_env: true` (or any non-empty `allowed_env`) runs the command with only `PATH`, `HOME`, `TMPDIR`, `USER`, `LANG`, `TERM`, `SSL_CERT_FILE`, the `allowed_env` globs, and the lease env, so ambient host secrets such as `SSH_AUTH_SOCK` or other cloud keys never reach the child. A caller can request the same per run with `-clean-env` (CLI) or `clean_env` (MCP), but cannot switch off a policy that enables it. `MINTRUN_VAULT_KEY` is never passed to a child, even when allowlisted.
 
 ### 2. Anti-Exfiltration Command Filter
 
@@ -321,12 +338,13 @@ Place a `plugin.json` manifest and an executable entrypoint inside `~/.mintrun/p
 | **`v0.2.0` — Multi-Cloud JIT Providers & Vaults** | ✅ **Done** | • **Built-in GitHub App & PAT Provider (`github`)**: RS256 JWT signing + repo/permission-scoped installation token minting & instant `DELETE /installation/token` revocation<br />• **Built-in 1Password CLI (`op`) Vault (`1password`)**: Biometric TouchID unlock & `op://` URI support |
 | **`v0.3.0` — Enclave Hardening & HITL Approval** | ✅ **Done** | • **Encoding-Aware Scrubber**: Redacts raw, Base64, RawBase64, Hex, and URL-encoded secret leaks<br />• **Human-in-the-Loop (HITL) Prompt (`-approve` / `require_approval`)**: Native macOS `osascript` Security Enclave confirmation gate<br />• **SHA-256 Remote Plugin Integrity**: Cryptographic digest pinning (`#sha256=...`) for remote plugin bundles |
 | **`v0.4.0` — AWS STS, AES-256-GCM Vault & Governance** | ✅ **Done** | • **Built-in AWS STS (`AssumeRole`) Provider (`aws`)**: 100% stdlib SigV4 signing & inline IAM session policy narrowing<br />• **AES-256-GCM Encrypted Local Vault**: Authenticated encryption at rest for `~/.mintrun/vault.json`<br />• **Wildcard Policy & Audit Filtering**: `allowed_permissions` / `allowed_scopes` globs and `mintrun audit -provider -failed -limit` |
+| **`v0.5.0` — Env Isolation, GCP & Linux Vault** | 🚧 **In Progress** | • ✅ **Child Environment Isolation**: `-clean-env` / MCP `clean_env` and policy `clean_env` / `allowed_env` globs; `MINTRUN_VAULT_KEY` is never inherited<br />• ✅ **Built-in GCP Provider (`gcp`)**: 100% stdlib RS256 JWT bearer grant from a service-account key, scoped OAuth2 access token, best-effort revoke<br />• ✅ **Linux libsecret Vault**: `secret-tool` backend for `keychain` (secret on `stdin`, encrypted file fallback)<br />• ⏳ **MCP Governance Tools**: `mintrun_policy_check` & `mintrun_audit` |
 
 ---
 
 ## Verification & Testing
 
-`mintrun` ships with a deterministic, offline unit and integration test suite (>94% statement coverage) that mocks Cloudflare, GitHub App RS256, and AWS STS SigV4 APIs, verifies AES-256-GCM encryption at rest, tests multi-encoding leak scrubbing, enforces policy guardrails, and validates external plugin execution over MCP:
+`mintrun` ships with a deterministic, offline unit and integration test suite (92.9% total statement coverage, measured) that mocks Cloudflare, GitHub App RS256, AWS STS SigV4, and Google OAuth2 JWT-bearer APIs plus the Linux `secret-tool` CLI, checks child environment isolation, verifies AES-256-GCM encryption at rest, tests multi-encoding leak scrubbing, enforces policy guardrails, and validates external plugin execution over MCP:
 
 ```bash
 go test -v -cover ./...
