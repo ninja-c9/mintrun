@@ -191,3 +191,77 @@ esac
 		t.Fatalf("expected MCP tool call success, got error: %s", outStr)
 	}
 }
+
+func TestBuiltinGitHubJITEncodingScrubAndHITLApproval(t *testing.T) {
+	const ghAppSecret = "998877:gh_app_jwt_secret_token"
+	const ghMintedToken = "ghs_ephemeral_jit_token_abcdef123"
+	var ghRevoked atomic.Int32
+
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/998877/access_tokens":
+			if r.Header.Get("Authorization") != "Bearer gh_app_jwt_secret_token" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			_, _ = w.Write([]byte(`{"token":"` + ghMintedToken + `","expires_at":"2026-10-15T12:00:00Z"}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/installation/token":
+			if r.Header.Get("Authorization") == "Bearer "+ghMintedToken {
+				ghRevoked.Add(1)
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ghServer.Close()
+
+	home := t.TempDir()
+	reg := core.NewRegistry()
+	vault := &builtin.KeychainVault{HomeDir: home, ForceFile: true}
+	gh := &builtin.GitHubProvider{BaseURL: ghServer.URL, Client: ghServer.Client()}
+	_ = reg.Register(vault)
+	_ = reg.Register(gh)
+
+	ctx := context.Background()
+	if err := vault.SetSecret(ctx, "github", ghAppSecret); err != nil {
+		t.Fatal(err)
+	}
+
+	rt := core.NewRuntime(home, "keychain", reg)
+
+	// 1. Verify Encoding-Aware Scrubber catches Base64 and Hex exfiltration attempts.
+	res, err := rt.ExecBlind(ctx, core.ExecRequest{
+		MintRequest: core.MintRequest{
+			Provider:    "github",
+			Scope:       "ninja-c9/mintrun",
+			Permissions: []string{"contents:write"},
+		},
+		Command: []string{"sh", "-c", `printf "b64=%s hex=%s" "$(printf '%s' "$GITHUB_TOKEN" | base64)" "$(printf '%s' "$GITHUB_TOKEN" | xxd -p | tr -d '\n')"`},
+	})
+	if err != nil {
+		t.Fatalf("GitHub ExecBlind failed: %v", err)
+	}
+	if strings.Count(res.Stdout, core.RedactedPlaceholder) < 2 {
+		t.Fatalf("expected both base64 and hex secret encodings to be redacted, got: %q", res.Stdout)
+	}
+	if !res.Revoked || ghRevoked.Load() != 1 {
+		t.Fatalf("expected GitHub installation token to be revoked once, got revoked=%v count=%d", res.Revoked, ghRevoked.Load())
+	}
+
+	// 2. Verify HITL Approval Gate blocks execution when rejected by user.
+	rt.ApprovalFunc = func(_ context.Context, _ core.ExecRequest) (bool, error) {
+		return false, nil
+	}
+	_, err = rt.ExecBlind(ctx, core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "github", Scope: "ninja-c9/mintrun"},
+		Command:     []string{"echo", "should-not-run"},
+		Approve:     true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "human-in-the-loop approval rejected") {
+		t.Fatalf("expected HITL rejection error, got: %v", err)
+	}
+}
+

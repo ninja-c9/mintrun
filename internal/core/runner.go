@@ -3,12 +3,16 @@ package core
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -22,6 +26,7 @@ type ExecRequest struct {
 	Command    []string `json:"command"`           // e.g. ["wrangler", "deploy"]
 	WorkingDir string   `json:"cwd,omitempty"`     // Optional working directory
 	TimeoutSec int      `json:"timeout_seconds,omitempty"`
+	Approve    bool     `json:"approve,omitempty"` // Require interactive human-in-the-loop approval
 }
 
 // ExecResult contains the scrubbed output of a blind command execution.
@@ -56,6 +61,7 @@ type PolicyRule struct {
 	AllowedScopes   []string `json:"allowed_scopes,omitempty"`   // Empty = allow all scopes
 	BlockedCommands []string `json:"blocked_commands,omitempty"` // Substrings or binary names to reject
 	MaxTTLSeconds   int      `json:"max_ttl_seconds,omitempty"`  // Caps requested TTL
+	RequireApproval bool     `json:"require_approval,omitempty"` // Prompt human via native OS dialog before minting
 }
 
 // Runtime coordinates Vaults, Providers, Bridges, Policy enforcement, Blind Execution, and Audit Logging.
@@ -64,6 +70,7 @@ type Runtime struct {
 	DefaultVault string
 	Registry     *Registry
 	Policies     map[string]PolicyRule
+	ApprovalFunc func(ctx context.Context, req ExecRequest) (bool, error)
 }
 
 func NewRuntime(homeDir, defaultVault string, reg *Registry) *Runtime {
@@ -75,6 +82,7 @@ func NewRuntime(homeDir, defaultVault string, reg *Registry) *Runtime {
 		DefaultVault: defaultVault,
 		Registry:     reg,
 		Policies:     make(map[string]PolicyRule),
+		ApprovalFunc: defaultOSApproval,
 	}
 	rt.loadPolicyFile()
 	return rt
@@ -93,7 +101,7 @@ func (rt *Runtime) loadPolicyFile() {
 	_ = json.Unmarshal(raw, &rt.Policies)
 }
 
-func (rt *Runtime) checkPolicy(req *ExecRequest) error {
+func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest) error {
 	// Built-in guardrail: block trivial secret-dumping shell commands in blind runner.
 	if len(req.Command) > 0 {
 		bin := filepath.Base(req.Command[0])
@@ -104,34 +112,55 @@ func (rt *Runtime) checkPolicy(req *ExecRequest) error {
 		}
 	}
 
-	rule, ok := rt.Policies[req.Provider]
-	if !ok {
-		return nil
-	}
-	if len(rule.AllowedScopes) > 0 && req.Scope != "" {
-		allowed := false
-		for _, s := range rule.AllowedScopes {
-			if s == "*" || strings.EqualFold(s, req.Scope) {
-				allowed = true
-				break
+	rule, hasRule := rt.Policies[req.Provider]
+	if hasRule {
+		if len(rule.AllowedScopes) > 0 && req.Scope != "" {
+			allowed := false
+			for _, s := range rule.AllowedScopes {
+				if s == "*" || strings.EqualFold(s, req.Scope) {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				return fmt.Errorf("policy denied: scope %q is not in allowed_scopes for provider %q", req.Scope, req.Provider)
 			}
 		}
-		if !allowed {
-			return fmt.Errorf("policy denied: scope %q is not in allowed_scopes for provider %q", req.Scope, req.Provider)
-		}
-	}
-	if len(rule.BlockedCommands) > 0 && len(req.Command) > 0 {
-		cmdLine := strings.Join(req.Command, " ")
-		for _, blocked := range rule.BlockedCommands {
-			if blocked != "" && strings.Contains(cmdLine, blocked) {
-				return fmt.Errorf("policy denied: command matches blocked pattern %q", blocked)
+		if len(rule.BlockedCommands) > 0 && len(req.Command) > 0 {
+			cmdLine := strings.Join(req.Command, " ")
+			for _, blocked := range rule.BlockedCommands {
+				if blocked != "" && strings.Contains(cmdLine, blocked) {
+					return fmt.Errorf("policy denied: command matches blocked pattern %q", blocked)
+				}
 			}
 		}
+		if rule.MaxTTLSeconds > 0 && (req.TTLSeconds <= 0 || req.TTLSeconds > rule.MaxTTLSeconds) {
+			req.TTLSeconds = rule.MaxTTLSeconds
+		}
 	}
-	if rule.MaxTTLSeconds > 0 && (req.TTLSeconds <= 0 || req.TTLSeconds > rule.MaxTTLSeconds) {
-		req.TTLSeconds = rule.MaxTTLSeconds
+
+	if req.Approve || (hasRule && rule.RequireApproval) || os.Getenv("MINTRUN_APPROVE") == "1" {
+		approveFn := rt.ApprovalFunc
+		if approveFn == nil {
+			approveFn = defaultOSApproval
+		}
+		ok, err := approveFn(ctx, *req)
+		if err != nil || !ok {
+			return fmt.Errorf("policy denied: human-in-the-loop approval rejected (%v)", err)
+		}
 	}
 	return nil
+}
+
+func defaultOSApproval(ctx context.Context, req ExecRequest) (bool, error) {
+	if runtime.GOOS != "darwin" {
+		return false, errors.New("interactive approval requires macOS osascript or custom ApprovalFunc")
+	}
+	msg := fmt.Sprintf("mintrun HITL Security Gate\\n\\nAllow AI agent to execute command?\\n• Provider: %s\\n• Scope: %s\\n• Command: %s",
+		req.Provider, req.Scope, strings.Join(req.Command, " "))
+	script := fmt.Sprintf(`display dialog %q with title "mintrun Security Enclave" buttons {"Deny", "Allow"} default button "Allow" cancel button "Deny" with icon caution`, msg)
+	err := exec.CommandContext(ctx, "/usr/bin/osascript", "-e", script).Run()
+	return err == nil, err
 }
 
 // ExecBlind resolves the master credential from Vault, mints a scoped JIT lease from the Provider,
@@ -145,7 +174,7 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 	if req.Provider == "" {
 		return nil, errors.New("exec requires a provider name")
 	}
-	if err := rt.checkPolicy(&req); err != nil {
+	if err := rt.checkPolicy(ctx, &req); err != nil {
 		rt.writeAudit(AuditEntry{
 			Timestamp: start.UTC().Format(time.RFC3339),
 			Provider:  req.Provider,
@@ -294,7 +323,8 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 	return res, nil
 }
 
-// Scrub replaces every non-trivial secret occurrence in text with RedactedPlaceholder.
+// Scrub replaces every non-trivial secret occurrence (including Base64, RawBase64, Hex,
+// and URL-encoded representations) in text with RedactedPlaceholder.
 func Scrub(text string, secrets []string) string {
 	if text == "" {
 		return ""
@@ -305,7 +335,18 @@ func Scrub(text string, secrets []string) string {
 		if len(trimmed) < 4 {
 			continue
 		}
-		out = strings.ReplaceAll(out, trimmed, RedactedPlaceholder)
+		variants := []string{
+			trimmed,
+			base64.StdEncoding.EncodeToString([]byte(trimmed)),
+			base64.RawStdEncoding.EncodeToString([]byte(trimmed)),
+			hex.EncodeToString([]byte(trimmed)),
+			url.QueryEscape(trimmed),
+		}
+		for _, v := range variants {
+			if len(v) >= 4 {
+				out = strings.ReplaceAll(out, v, RedactedPlaceholder)
+			}
+		}
 	}
 	return out
 }

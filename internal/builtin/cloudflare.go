@@ -285,3 +285,144 @@ func containsPerm(list []string, target string) bool {
 	}
 	return false
 }
+
+// GitHubProvider mints and revokes short-lived, repository-scoped GitHub App Installation tokens
+// (`POST /app/installations/{id}/access_tokens` and `DELETE /installation/token`), or wraps PATs
+// in zero-knowledge static mode.
+type GitHubProvider struct {
+	BaseURL string
+	Client  *http.Client
+}
+
+func NewGitHubProvider() *GitHubProvider {
+	return &GitHubProvider{
+		BaseURL: "https://api.github.com",
+		Client:  &http.Client{Timeout: 15 * time.Second},
+	}
+}
+
+func (g *GitHubProvider) Manifest() core.Manifest {
+	return core.Manifest{
+		Name:        "github",
+		Version:     "0.2.0",
+		Kind:        core.KindProvider,
+		Description: "GitHub JIT Installation Token Minter & Zero-Knowledge PAT Wrapper (auto-revokes on exit)",
+		Scopes:      []string{"contents:read", "contents:write", "pull_requests:write", "issues:write", "actions:write", "metadata:read", "static"},
+		Builtin:     true,
+	}
+}
+
+func (g *GitHubProvider) Mint(ctx context.Context, masterSecret string, req core.MintRequest) (*core.Lease, error) {
+	if masterSecret == "" {
+		return nil, errors.New("empty GitHub master secret")
+	}
+	expiresAt := time.Now().UTC().Add(10 * time.Minute)
+
+	// Format for JIT Installation Token minting: "<installation_id>:<app_jwt>" or Params["installation_id"].
+	instID := req.Params["installation_id"]
+	bearer := masterSecret
+	if instID == "" && strings.Contains(masterSecret, ":") && !strings.HasPrefix(masterSecret, "gh") {
+		parts := strings.SplitN(masterSecret, ":", 2)
+		instID, bearer = parts[0], parts[1]
+	}
+
+	if instID == "" || req.Params["mode"] == "static" || containsPerm(req.Permissions, "static") {
+		return &core.Lease{
+			ID:       "gh-static",
+			Provider: "github",
+			Scope:    req.Scope,
+			Env: map[string]string{
+				"GITHUB_TOKEN": masterSecret,
+				"GH_TOKEN":     masterSecret,
+			},
+			Redact:    []string{masterSecret},
+			ExpiresAt: expiresAt,
+			Ephemeral: false,
+		}, nil
+	}
+
+	body := map[string]any{}
+	if req.Scope != "" && req.Scope != "*" {
+		repo := req.Scope
+		if _, after, ok := strings.Cut(repo, "/"); ok {
+			repo = after
+		}
+		body["repositories"] = []string{repo}
+	}
+	if len(req.Permissions) > 0 {
+		perms := make(map[string]string)
+		for _, p := range req.Permissions {
+			if k, v, ok := strings.Cut(strings.TrimSpace(p), ":"); ok && k != "" && v != "" {
+				perms[k] = v
+			}
+		}
+		if len(perms) > 0 {
+			body["permissions"] = perms
+		}
+	}
+
+	var resp struct {
+		Token     string    `json:"token"`
+		ExpiresAt time.Time `json:"expires_at"`
+	}
+	path := "/app/installations/" + url.PathEscape(instID) + "/access_tokens"
+	if err := g.doGitHubJSON(ctx, bearer, http.MethodPost, path, body, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Token == "" {
+		return nil, errors.New("github API returned empty installation token")
+	}
+	return &core.Lease{
+		ID:       resp.Token, // GitHub revokes installation tokens using the token itself as Bearer
+		Provider: "github",
+		Scope:    req.Scope,
+		Env: map[string]string{
+			"GITHUB_TOKEN": resp.Token,
+			"GH_TOKEN":     resp.Token,
+		},
+		Redact:    []string{resp.Token, bearer, masterSecret},
+		ExpiresAt: resp.ExpiresAt,
+		Ephemeral: true,
+	}, nil
+}
+
+func (g *GitHubProvider) Revoke(ctx context.Context, _ string, lease *core.Lease) error {
+	if lease == nil || !lease.Ephemeral || lease.ID == "" || lease.ID == "gh-static" {
+		return nil
+	}
+	return g.doGitHubJSON(ctx, lease.ID, http.MethodDelete, "/installation/token", nil, nil)
+}
+
+func (g *GitHubProvider) doGitHubJSON(ctx context.Context, token, method, path string, body any, out any) error {
+	var bodyReader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		bodyReader = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(g.BaseURL, "/")+path, bodyReader)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := g.Client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("github API %s %s failed (HTTP %d): %s", method, path, resp.StatusCode, strings.TrimSpace(string(respBytes)))
+	}
+	if out != nil && len(respBytes) > 0 {
+		return json.Unmarshal(respBytes, out)
+	}
+	return nil
+}
+

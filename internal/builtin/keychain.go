@@ -163,3 +163,73 @@ func (k *KeychainVault) deleteFileSecret(key string) error {
 	delete(m, k.serviceName(key))
 	return k.writeMap(m)
 }
+
+// OnePasswordVault stores and reads master secrets via the official 1Password CLI (`op`),
+// supporting TouchID / biometric unlock out of the box.
+type OnePasswordVault struct {
+	VaultName string // Optional 1Password vault name (defaults to $MINTRUN_OP_VAULT or "Private")
+}
+
+func NewOnePasswordVault() *OnePasswordVault {
+	return &OnePasswordVault{VaultName: os.Getenv("MINTRUN_OP_VAULT")}
+}
+
+func (o *OnePasswordVault) Manifest() core.Manifest {
+	return core.Manifest{
+		Name:        "1password",
+		Version:     "0.2.0",
+		Kind:        core.KindVault,
+		Description: "1Password CLI (op) biometric vault (supports op:// URIs and mintrun:<provider> items)",
+		Builtin:     true,
+	}
+}
+
+func (o *OnePasswordVault) GetSecret(ctx context.Context, key string) (string, error) {
+	if strings.HasPrefix(key, "op://") {
+		out, err := exec.CommandContext(ctx, "op", "read", key).CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("op read %q: %w (%s)", key, err, strings.TrimSpace(string(out)))
+		}
+		return strings.TrimSpace(string(out)), nil
+	}
+	args := []string{"item", "get", "mintrun:" + strings.ToLower(strings.TrimSpace(key)), "--fields", "label=credential", "--reveal"}
+	if o.VaultName != "" {
+		args = append(args, "--vault", o.VaultName)
+	}
+	out, err := exec.CommandContext(ctx, "op", args...).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("op item get %q: %w (%s)", key, err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func (o *OnePasswordVault) SetSecret(ctx context.Context, key, value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return errors.New("secret value cannot be empty")
+	}
+	title := "mintrun:" + strings.ToLower(strings.TrimSpace(key))
+	args := []string{"item", "create", "--category", "Password", "--title", title, "credential=" + value}
+	if o.VaultName != "" {
+		args = append(args, "--vault", o.VaultName)
+	}
+	out, err := exec.CommandContext(ctx, "op", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("op item create %q: %w (%s)", title, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func (o *OnePasswordVault) DeleteSecret(ctx context.Context, key string) error {
+	title := "mintrun:" + strings.ToLower(strings.TrimSpace(key))
+	args := []string{"item", "delete", title}
+	if o.VaultName != "" {
+		args = append(args, "--vault", o.VaultName)
+	}
+	out, err := exec.CommandContext(ctx, "op", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("op item delete %q: %w (%s)", title, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+

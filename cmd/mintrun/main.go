@@ -33,7 +33,9 @@ func bootRuntime() (*core.Runtime, error) {
 
 	// Register built-in core plugins.
 	_ = reg.Register(builtin.NewKeychainVault(home))
+	_ = reg.Register(builtin.NewOnePasswordVault())
 	_ = reg.Register(builtin.NewCloudflareProvider())
+	_ = reg.Register(builtin.NewGitHubProvider())
 	_ = reg.Register(builtin.NewMCPBridge())
 
 	// Discover and register all externally installed plugins from ~/.mintrun/plugins.
@@ -79,11 +81,12 @@ func main() {
 func cmdExec(ctx context.Context, rt *core.Runtime, args []string) {
 	fs := flag.NewFlagSet("exec", flag.ExitOnError)
 	provider := fs.String("provider", "cloudflare", "Provider plugin name (e.g. cloudflare, github)")
-	scope := fs.String("scope", "", "Target resource scope (e.g. domain 'example.com' or zone ID)")
+	scope := fs.String("scope", "", "Target resource scope (e.g. domain 'example.com' or repo 'owner/repo')")
 	perms := fs.String("perms", "dns:write,workers:write", "Comma-separated permissions (or 'static')")
-	vault := fs.String("vault", "", "Vault plugin override (default: keychain)")
+	vault := fs.String("vault", "", "Vault plugin override (default: keychain, or 1password)")
 	ttl := fs.Int("ttl", 600, "Ephemeral token TTL in seconds")
 	cwd := fs.String("cwd", "", "Working directory for command")
+	approve := fs.Bool("approve", false, "Prompt for interactive macOS HITL approval before minting")
 
 	var cmdArgs []string
 	var flagArgs []string
@@ -122,6 +125,7 @@ func cmdExec(ctx context.Context, rt *core.Runtime, args []string) {
 		Vault:      *vault,
 		Command:    cmdArgs,
 		WorkingDir: *cwd,
+		Approve:    *approve,
 	})
 	if err != nil {
 		fatal("%v", err)
