@@ -16,6 +16,8 @@ import (
 	"github.com/ninja-c9/mintrun/internal/core"
 )
 
+var exitFunc = os.Exit
+
 func defaultHomeDir() string {
 	if env := os.Getenv("MINTRUN_HOME"); env != "" {
 		return env
@@ -36,6 +38,7 @@ func bootRuntime() (*core.Runtime, error) {
 	_ = reg.Register(builtin.NewOnePasswordVault())
 	_ = reg.Register(builtin.NewCloudflareProvider())
 	_ = reg.Register(builtin.NewGitHubProvider())
+	_ = reg.Register(builtin.NewAWSProvider())
 	_ = reg.Register(builtin.NewMCPBridge())
 
 	// Discover and register all externally installed plugins from ~/.mintrun/plugins.
@@ -52,7 +55,8 @@ func main() {
 
 	if len(os.Args) < 2 {
 		printUsage()
-		os.Exit(1)
+		exitFunc(1)
+		return
 	}
 
 	rt, err := bootRuntime()
@@ -70,7 +74,7 @@ func main() {
 	case "mcp":
 		cmdMCP(ctx, rt, os.Args[2:])
 	case "audit":
-		cmdAudit(rt)
+		cmdAudit(rt, os.Args[2:])
 	case "-h", "--help", "help":
 		printUsage()
 	default:
@@ -136,7 +140,7 @@ func cmdExec(ctx context.Context, rt *core.Runtime, args []string) {
 	if res.Stderr != "" {
 		fmt.Fprint(os.Stderr, res.Stderr)
 	}
-	os.Exit(res.ExitCode)
+	exitFunc(res.ExitCode)
 }
 
 func cmdSecret(ctx context.Context, rt *core.Runtime, args []string) {
@@ -239,7 +243,13 @@ func cmdMCP(ctx context.Context, rt *core.Runtime, args []string) {
 	}
 }
 
-func cmdAudit(rt *core.Runtime) {
+func cmdAudit(rt *core.Runtime, args []string) {
+	fs := flag.NewFlagSet("audit", flag.ExitOnError)
+	provider := fs.String("provider", "", "Filter audit entries by provider name")
+	failedOnly := fs.Bool("failed", false, "Show only failed executions (exit_code != 0 or error != '')")
+	limit := fs.Int("limit", 0, "Show only the last N matching entries")
+	_ = fs.Parse(args)
+
 	p := filepath.Join(rt.HomeDir, "audit.jsonl")
 	raw, err := os.ReadFile(p)
 	if err != nil {
@@ -249,7 +259,33 @@ func cmdAudit(rt *core.Runtime) {
 		}
 		fatal("read audit log: %v", err)
 	}
-	fmt.Print(string(raw))
+	if *provider == "" && !*failedOnly && *limit <= 0 {
+		fmt.Print(string(raw))
+		return
+	}
+	var matched []string
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if line == "" {
+			continue
+		}
+		var e core.AuditEntry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			continue
+		}
+		if *provider != "" && !strings.EqualFold(e.Provider, *provider) {
+			continue
+		}
+		if *failedOnly && e.ExitCode == 0 && e.Error == "" {
+			continue
+		}
+		matched = append(matched, line)
+	}
+	if *limit > 0 && len(matched) > *limit {
+		matched = matched[len(matched)-*limit:]
+	}
+	for _, line := range matched {
+		fmt.Println(line)
+	}
 }
 
 func printUsage() {
@@ -270,5 +306,5 @@ Usage:
 func fatal(format string, a ...any) {
 	out, _ := json.Marshal(map[string]string{"error": fmt.Sprintf(format, a...)})
 	fmt.Fprintf(os.Stderr, "%s\n", out)
-	os.Exit(1)
+	exitFunc(1)
 }

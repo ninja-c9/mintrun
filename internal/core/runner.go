@@ -56,12 +56,28 @@ type AuditEntry struct {
 	Error       string   `json:"error,omitempty"`
 }
 
-// PolicyRule controls which scopes and commands are permitted for a provider.
+// PolicyRule controls which scopes, permissions, and commands are permitted for a provider.
 type PolicyRule struct {
-	AllowedScopes   []string `json:"allowed_scopes,omitempty"`   // Empty = allow all scopes
-	BlockedCommands []string `json:"blocked_commands,omitempty"` // Substrings or binary names to reject
-	MaxTTLSeconds   int      `json:"max_ttl_seconds,omitempty"`  // Caps requested TTL
-	RequireApproval bool     `json:"require_approval,omitempty"` // Prompt human via native OS dialog before minting
+	AllowedScopes      []string `json:"allowed_scopes,omitempty"`      // Empty = allow all scopes (supports '*' wildcard)
+	AllowedPermissions []string `json:"allowed_permissions,omitempty"` // Empty = allow all permissions (supports '*' wildcard)
+	BlockedCommands    []string `json:"blocked_commands,omitempty"`    // Substrings or binary names to reject
+	MaxTTLSeconds      int      `json:"max_ttl_seconds,omitempty"`     // Caps requested TTL
+	RequireApproval    bool     `json:"require_approval,omitempty"`    // Prompt human via native OS dialog before minting
+}
+
+func matchPattern(pattern, value string) bool {
+	p := strings.ToLower(strings.TrimSpace(pattern))
+	v := strings.ToLower(strings.TrimSpace(value))
+	if p == "*" || p == v {
+		return true
+	}
+	if strings.HasSuffix(p, "*") && strings.HasPrefix(v, strings.TrimSuffix(p, "*")) {
+		return true
+	}
+	if strings.HasPrefix(p, "*") && strings.HasSuffix(v, strings.TrimPrefix(p, "*")) {
+		return true
+	}
+	return false
 }
 
 // Runtime coordinates Vaults, Providers, Bridges, Policy enforcement, Blind Execution, and Audit Logging.
@@ -117,13 +133,27 @@ func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest) error {
 		if len(rule.AllowedScopes) > 0 && req.Scope != "" {
 			allowed := false
 			for _, s := range rule.AllowedScopes {
-				if s == "*" || strings.EqualFold(s, req.Scope) {
+				if matchPattern(s, req.Scope) {
 					allowed = true
 					break
 				}
 			}
 			if !allowed {
 				return fmt.Errorf("policy denied: scope %q is not in allowed_scopes for provider %q", req.Scope, req.Provider)
+			}
+		}
+		if len(rule.AllowedPermissions) > 0 && len(req.Permissions) > 0 {
+			for _, perm := range req.Permissions {
+				allowed := false
+				for _, ap := range rule.AllowedPermissions {
+					if matchPattern(ap, perm) {
+						allowed = true
+						break
+					}
+				}
+				if !allowed {
+					return fmt.Errorf("policy denied: permission %q is not in allowed_permissions for provider %q", perm, req.Provider)
+				}
 			}
 		}
 		if len(rule.BlockedCommands) > 0 && len(req.Command) > 0 {

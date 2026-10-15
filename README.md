@@ -96,25 +96,27 @@ sequenceDiagram
 
 | Plugin Kind | Go Interface | Responsibility | Built-in Implementation |
 | :--- | :--- | :--- | :--- |
-| **`vault`** | `core.VaultPlugin` | Stores and retrieves long-lived master credentials outside agent context | **`keychain`** — macOS Keychain (`/usr/bin/security`) with `0600` local encrypted-path fallback (`~/.mintrun/vault.json`) |
-| **`provider`** | `core.ProviderPlugin` | Mints short-lived, resource-scoped sub-tokens from a master secret and revokes them on exit | **`cloudflare`** — Resolves domain names to Zone IDs, maps human permissions (`dns:write`, `workers:write`), mints via `POST /client/v4/user/tokens`, and revokes via `DELETE /client/v4/user/tokens/{id}` |
-| **`bridge`** | `core.BridgePlugin` | Exposes `mintrun` capabilities to external AI agent harnesses | **`mcp`** — Full Model Context Protocol (JSON-RPC 2.0 over `stdio`) server exposing `mintrun_exec` and `mintrun_plugins` |
+| **`vault`** | `core.VaultPlugin` | Stores and retrieves long-lived master credentials outside agent context | • **`keychain`** — macOS Keychain (`/usr/bin/security`) with **AES-256-GCM** encrypted `0600` local fallback (`~/.mintrun/vault.json`)<br />• **`1password`** — 1Password CLI (`op`) biometric TouchID vault (`op://` URIs & `mintrun:<provider>` items) |
+| **`provider`** | `core.ProviderPlugin` | Mints short-lived, resource-scoped sub-tokens from a master secret and revokes them on exit | • **`cloudflare`** — Resolves domain names to Zone IDs, maps permissions (`dns:write`, `workers:write`), mints via `POST /client/v4/user/tokens`, and revokes via `DELETE /client/v4/user/tokens/{id}`<br />• **`github`** — Signs RS256 App JWTs (PKCS#1/PKCS#8), mints repo-scoped Installation Tokens, and revokes via `DELETE /installation/token`<br />• **`aws`** — 100% stdlib SigV4 `STS AssumeRole` JIT minter with inline session policy narrowing (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) |
+| **`bridge`** | `core.BridgePlugin` | Exposes `mintrun` capabilities to external AI agent harnesses | • **`mcp`** — Full Model Context Protocol (JSON-RPC 2.0 over `stdio`) server exposing `mintrun_exec` and `mintrun_plugins` |
 
 ### Repository Layout
 
 ```text
 mintrun/
 ├── cmd/mintrun/
-│   └── main.go                 # CLI entrypoint (exec, secret, plugin, mcp, audit)
+│   ├── main.go                 # CLI entrypoint (exec, secret, plugin, mcp, audit)
+│   └── main_test.go            # End-to-end CLI & subcommand test suite
 ├── internal/
 │   ├── core/
-│   │   ├── plugin.go           # Plugin ABI, Registry, and JSON-over-stdio ExternalPlugin SDK
-│   │   ├── runner.go           # ExecBlind lifecycle, Policy Engine, Stream Scrubber, Audit Logger
-│   │   └── core_test.go        # End-to-end JIT mint, scrub, revoke, policy & MCP test suite
+│   │   ├── plugin.go           # Plugin ABI, Registry, SHA-256 pinning & ExternalPlugin SDK
+│   │   ├── runner.go           # ExecBlind lifecycle, Policy Engine, Encoding Scrubber, Audit Logger
+│   │   └── core_test.go        # Core JIT mint, scrub, revoke, policy & MCP test suite
 │   └── builtin/
-│       ├── keychain.go         # Native macOS Keychain vault + 0600 file fallback
-│       ├── cloudflare.go       # Cloudflare JIT Sub-Token minter & zone resolver
-│       └── mcp.go              # MCP JSON-RPC 2.0 stdio bridge server
+│       ├── keychain.go         # Native macOS Keychain + AES-256-GCM fallback & 1Password vault
+│       ├── cloudflare.go       # Built-in Cloudflare, GitHub (RS256 JWT), and AWS STS (SigV4) providers
+│       ├── mcp.go              # MCP JSON-RPC 2.0 stdio bridge server
+│       └── builtin_test.go     # Comprehensive provider, vault, and MCP unit test suite
 └── docs/assets/                # Architectural diagrams & visual assets
 ```
 
@@ -318,16 +320,16 @@ Place a `plugin.json` manifest and an executable entrypoint inside `~/.mintrun/p
 | **`v0.1.0` — Core Runtime & Enclave ABI** | ✅ **Done** | • Zero-dependency Go core runtime & `Vault` / `Provider` / `Bridge` ABI<br />• Native macOS Keychain vault + `0600` local fallback<br />• Cloudflare JIT Sub-Token provider (auto zone resolution + instant `DELETE` revoke)<br />• MCP JSON-RPC 2.0 `stdio` bridge (`mintrun_exec`, `mintrun_plugins`)<br />• Stream Scrubber, Policy Engine (`policy.json`), and JSONL Audit Logger |
 | **`v0.2.0` — Multi-Cloud JIT Providers & Vaults** | ✅ **Done** | • **Built-in GitHub App & PAT Provider (`github`)**: RS256 JWT signing + repo/permission-scoped installation token minting & instant `DELETE /installation/token` revocation<br />• **Built-in 1Password CLI (`op`) Vault (`1password`)**: Biometric TouchID unlock & `op://` URI support |
 | **`v0.3.0` — Enclave Hardening & HITL Approval** | ✅ **Done** | • **Encoding-Aware Scrubber**: Redacts raw, Base64, RawBase64, Hex, and URL-encoded secret leaks<br />• **Human-in-the-Loop (HITL) Prompt (`-approve` / `require_approval`)**: Native macOS `osascript` Security Enclave confirmation gate<br />• **SHA-256 Remote Plugin Integrity**: Cryptographic digest pinning (`#sha256=...`) for remote plugin bundles |
-| **Phase 4 — Ecosystem & Enterprise Telemetry (`v0.4`)** | 🔭 **Next** | • **AWS STS (`AssumeRole`) & Supabase/Vercel Built-in Providers**<br />• **Community Plugin Index**: Curated discovery registry<br />• **Team Audit Telemetry**: Optional OpenTelemetry / webhook streaming for enterprise agent governance |
+| **`v0.4.0` — AWS STS, AES-256-GCM Vault & Governance** | ✅ **Done** | • **Built-in AWS STS (`AssumeRole`) Provider (`aws`)**: 100% stdlib SigV4 signing & inline IAM session policy narrowing<br />• **AES-256-GCM Encrypted Local Vault**: Authenticated encryption at rest for `~/.mintrun/vault.json`<br />• **Wildcard Policy & Audit Filtering**: `allowed_permissions` / `allowed_scopes` globs and `mintrun audit -provider -failed -limit` |
 
 ---
 
 ## Verification & Testing
 
-`mintrun` ships with a deterministic, offline unit and integration test suite that mocks the Cloudflare Token API, verifies secret injection, tests accidental leak scrubbing, enforces `printenv` policy denials, and validates external plugin execution over MCP:
+`mintrun` ships with a deterministic, offline unit and integration test suite (>94% statement coverage) that mocks Cloudflare, GitHub App RS256, and AWS STS SigV4 APIs, verifies AES-256-GCM encryption at rest, tests multi-encoding leak scrubbing, enforces policy guardrails, and validates external plugin execution over MCP:
 
 ```bash
-go test -v ./...
+go test -v -cover ./...
 ```
 
 ---

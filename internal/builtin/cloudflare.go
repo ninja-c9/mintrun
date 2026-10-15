@@ -4,19 +4,23 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -473,5 +477,192 @@ func (g *GitHubProvider) doGitHubJSON(ctx context.Context, token, method, path s
 	}
 	return nil
 }
+
+// AWSProvider mints short-lived AWS STS credentials via `AssumeRole` signed with 100% stdlib
+// AWS Signature Version 4 (including optional inline session policy narrowing), or wraps static IAM keys.
+type AWSProvider struct {
+	Endpoint string
+	Region   string
+	Client   *http.Client
+}
+
+func NewAWSProvider() *AWSProvider {
+	return &AWSProvider{
+		Endpoint: "https://sts.amazonaws.com",
+		Region:   "us-east-1",
+		Client:   &http.Client{Timeout: 15 * time.Second},
+	}
+}
+
+func (a *AWSProvider) Manifest() core.Manifest {
+	return core.Manifest{
+		Name:        "aws",
+		Version:     "0.4.0",
+		Kind:        core.KindProvider,
+		Description: "AWS STS AssumeRole JIT Minter & Zero-Knowledge IAM Wrapper (100% stdlib SigV4)",
+		Scopes:      []string{"s3:*", "ec2:*", "lambda:*", "dynamodb:*", "cloudformation:*", "static"},
+		Builtin:     true,
+	}
+}
+
+func (a *AWSProvider) Mint(ctx context.Context, masterSecret string, req core.MintRequest) (*core.Lease, error) {
+	if masterSecret == "" {
+		return nil, errors.New("empty AWS master secret")
+	}
+	parts := strings.SplitN(strings.TrimSpace(masterSecret), ":", 3)
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return nil, errors.New("AWS master secret must be formatted as <access_key_id>:<secret_access_key>[:<session_token>]")
+	}
+	accessKey, secretKey := parts[0], parts[1]
+
+	// Static mode if no Role ARN is given in scope or 'static' permission is requested.
+	if req.Scope == "" || !strings.HasPrefix(req.Scope, "arn:aws:") || req.Params["mode"] == "static" || containsPerm(req.Permissions, "static") {
+		env := map[string]string{
+			"AWS_ACCESS_KEY_ID":     accessKey,
+			"AWS_SECRET_ACCESS_KEY": secretKey,
+		}
+		redact := []string{masterSecret, accessKey, secretKey}
+		if len(parts) == 3 && parts[2] != "" {
+			env["AWS_SESSION_TOKEN"] = parts[2]
+			redact = append(redact, parts[2])
+		}
+		return &core.Lease{
+			ID:        "aws-static",
+			Provider:  "aws",
+			Scope:     req.Scope,
+			Env:       env,
+			Redact:    redact,
+			ExpiresAt: time.Now().UTC().Add(15 * time.Minute),
+			Ephemeral: false,
+		}, nil
+	}
+
+	dur := req.TTLSeconds
+	if dur < 900 {
+		dur = 900
+	} else if dur > 43200 {
+		dur = 43200
+	}
+
+	form := url.Values{}
+	form.Set("Action", "AssumeRole")
+	form.Set("Version", "2011-06-15")
+	form.Set("RoleArn", req.Scope)
+	form.Set("RoleSessionName", fmt.Sprintf("mintrun-jit-%d", time.Now().Unix()))
+	form.Set("DurationSeconds", strconv.Itoa(dur))
+
+	if len(req.Permissions) > 0 {
+		policyDoc, _ := json.Marshal(map[string]any{
+			"Version": "2012-10-17",
+			"Statement": []map[string]any{
+				{
+					"Effect":   "Allow",
+					"Action":   req.Permissions,
+					"Resource": "*",
+				},
+			},
+		})
+		form.Set("Policy", string(policyDoc))
+	}
+
+	body := []byte(form.Encode())
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(a.Endpoint, "/")+"/", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if len(parts) == 3 && parts[2] != "" {
+		httpReq.Header.Set("X-Amz-Security-Token", parts[2])
+	}
+	signAWSSigV4(httpReq, accessKey, secretKey, a.Region, "sts", body, time.Now().UTC())
+
+	resp, err := a.Client.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	respBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("aws STS AssumeRole failed (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(respBytes)))
+	}
+
+	var parsed struct {
+		AccessKeyID     string `xml:"AssumeRoleResult>Credentials>AccessKeyId"`
+		SecretAccessKey string `xml:"AssumeRoleResult>Credentials>SecretAccessKey"`
+		SessionToken    string `xml:"AssumeRoleResult>Credentials>SessionToken"`
+		Expiration      string `xml:"AssumeRoleResult>Credentials>Expiration"`
+		AssumedRoleID   string `xml:"AssumeRoleResult>AssumedRoleUser>AssumedRoleId"`
+	}
+	if err := xml.Unmarshal(respBytes, &parsed); err != nil || parsed.SecretAccessKey == "" {
+		return nil, fmt.Errorf("parse AWS STS AssumeRole response: %w", err)
+	}
+	expTime, _ := time.Parse(time.RFC3339, parsed.Expiration)
+	return &core.Lease{
+		ID:       parsed.AssumedRoleID,
+		Provider: "aws",
+		Scope:    req.Scope,
+		Env: map[string]string{
+			"AWS_ACCESS_KEY_ID":     parsed.AccessKeyID,
+			"AWS_SECRET_ACCESS_KEY": parsed.SecretAccessKey,
+			"AWS_SESSION_TOKEN":     parsed.SessionToken,
+		},
+		Redact:    []string{parsed.AccessKeyID, parsed.SecretAccessKey, parsed.SessionToken, accessKey, secretKey, masterSecret},
+		ExpiresAt: expTime,
+		Ephemeral: true,
+	}, nil
+}
+
+func (a *AWSProvider) Revoke(_ context.Context, _ string, _ *core.Lease) error {
+	// AWS STS temporary credentials expire automatically when DurationSeconds elapses.
+	return nil
+}
+
+func hmacSHA256(key []byte, data string) []byte {
+	h := hmac.New(sha256.New, key)
+	_, _ = h.Write([]byte(data))
+	return h.Sum(nil)
+}
+
+func signAWSSigV4(req *http.Request, accessKey, secretKey, region, service string, payload []byte, now time.Time) {
+	amzDate := now.Format("20060102T150405Z")
+	dateStamp := now.Format("20060102")
+	payloadHash := sha256.Sum256(payload)
+	payloadHex := hex.EncodeToString(payloadHash[:])
+
+	req.Header.Set("X-Amz-Date", amzDate)
+	host := req.URL.Host
+	canonicalHeaders := "content-type:" + req.Header.Get("Content-Type") + "\nhost:" + host + "\nx-amz-date:" + amzDate + "\n"
+	signedHeaders := "content-type;host;x-amz-date"
+
+	canonicalReq := strings.Join([]string{
+		req.Method,
+		req.URL.Path,
+		req.URL.RawQuery,
+		canonicalHeaders,
+		signedHeaders,
+		payloadHex,
+	}, "\n")
+
+	credScope := dateStamp + "/" + region + "/" + service + "/aws4_request"
+	canonHash := sha256.Sum256([]byte(canonicalReq))
+	stringToSign := strings.Join([]string{
+		"AWS4-HMAC-SHA256",
+		amzDate,
+		credScope,
+		hex.EncodeToString(canonHash[:]),
+	}, "\n")
+
+	kDate := hmacSHA256([]byte("AWS4"+secretKey), dateStamp)
+	kRegion := hmacSHA256(kDate, region)
+	kService := hmacSHA256(kRegion, service)
+	kSigning := hmacSHA256(kService, "aws4_request")
+	signature := hex.EncodeToString(hmacSHA256(kSigning, stringToSign))
+
+	req.Header.Set("Authorization", fmt.Sprintf(
+		"AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
+		accessKey, credScope, signedHeaders, signature,
+	))
+}
+
 
 

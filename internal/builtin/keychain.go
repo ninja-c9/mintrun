@@ -3,6 +3,11 @@ package builtin
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,10 +24,10 @@ import (
 const keychainAccount = "mintrun"
 
 // KeychainVault stores master secrets in macOS Keychain (`/usr/bin/security`)
-// with a fallback to a 0600 file vault (`~/.mintrun/vault.json`) on non-darwin or test environments.
+// with a fallback to an AES-256-GCM encrypted 0600 file vault (`~/.mintrun/vault.json`).
 type KeychainVault struct {
-	mu       sync.Mutex
-	HomeDir  string
+	mu        sync.Mutex
+	HomeDir   string
 	ForceFile bool // Used on Linux or in deterministic unit tests
 }
 
@@ -36,9 +41,9 @@ func NewKeychainVault(homeDir string) *KeychainVault {
 func (k *KeychainVault) Manifest() core.Manifest {
 	return core.Manifest{
 		Name:        "keychain",
-		Version:     "0.1.0",
+		Version:     "0.4.0",
 		Kind:        core.KindVault,
-		Description: "OS native secret vault (macOS Keychain via /usr/bin/security with 0600 local fallback)",
+		Description: "OS native secret vault (macOS Keychain via /usr/bin/security with AES-256-GCM 0600 fallback)",
 		Builtin:     true,
 	}
 }
@@ -99,6 +104,10 @@ func (k *KeychainVault) vaultFilePath() string {
 	return filepath.Join(k.HomeDir, "vault.json")
 }
 
+func (k *KeychainVault) vaultKey() [32]byte {
+	return sha256.Sum256([]byte("mintrun-aes256gcm-v1:" + os.Getenv("MINTRUN_VAULT_KEY") + ":" + k.HomeDir))
+}
+
 func (k *KeychainVault) readMap() (map[string]string, error) {
 	raw, err := os.ReadFile(k.vaultFilePath())
 	if err != nil {
@@ -112,7 +121,31 @@ func (k *KeychainVault) readMap() (map[string]string, error) {
 		return nil, err
 	}
 	if m == nil {
-		m = make(map[string]string)
+		return make(map[string]string), nil
+	}
+	if encB64, ok := m["__aes256gcm__"]; ok && len(m) == 1 {
+		blob, err := base64.StdEncoding.DecodeString(encB64)
+		if err != nil {
+			return nil, fmt.Errorf("decode encrypted vault: %w", err)
+		}
+		key := k.vaultKey()
+		block, _ := aes.NewCipher(key[:])
+		gcm, _ := cipher.NewGCM(block)
+		if len(blob) < gcm.NonceSize() {
+			return nil, errors.New("corrupted encrypted vault nonce")
+		}
+		plain, err := gcm.Open(nil, blob[:gcm.NonceSize()], blob[gcm.NonceSize():], nil)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt vault: %w", err)
+		}
+		var dec map[string]string
+		if err := json.Unmarshal(plain, &dec); err != nil {
+			return nil, err
+		}
+		if dec == nil {
+			dec = make(map[string]string)
+		}
+		return dec, nil
 	}
 	return m, nil
 }
@@ -121,10 +154,19 @@ func (k *KeychainVault) writeMap(m map[string]string) error {
 	if err := os.MkdirAll(k.HomeDir, 0o700); err != nil {
 		return err
 	}
-	raw, err := json.MarshalIndent(m, "", "  ")
+	plain, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
+	key := k.vaultKey()
+	block, _ := aes.NewCipher(key[:])
+	gcm, _ := cipher.NewGCM(block)
+	nonce := make([]byte, gcm.NonceSize())
+	_, _ = rand.Read(nonce)
+	sealed := gcm.Seal(nonce, nonce, plain, nil)
+	raw, _ := json.MarshalIndent(map[string]string{
+		"__aes256gcm__": base64.StdEncoding.EncodeToString(sealed),
+	}, "", "  ")
 	return os.WriteFile(k.vaultFilePath(), raw, 0o600)
 }
 

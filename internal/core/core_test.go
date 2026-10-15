@@ -3,7 +3,10 @@ package core_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,7 +24,6 @@ func TestCloudflareJITMintBlindExecAndAutoRevoke(t *testing.T) {
 	const mintedToken = "cf_jit_ephemeral_subtoken_123456"
 	var revokedCount atomic.Int32
 
-	// Mock Cloudflare API server verifying Zone resolution, Permission Groups, JIT Mint, and Auto-Revoke.
 	cfServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+masterSecret {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -66,9 +68,8 @@ func TestCloudflareJITMintBlindExecAndAutoRevoke(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rt := core.NewRuntime(home, "keychain", reg)
+	rt := core.NewRuntime(home, "", reg) // test empty defaultVault fallback to "keychain"
 
-	// 1. Run a child command that uses $CLOUDFLARE_API_TOKEN and tries to leak it to stdout.
 	res, err := rt.ExecBlind(ctx, core.ExecRequest{
 		MintRequest: core.MintRequest{
 			Provider:    "cloudflare",
@@ -76,25 +77,24 @@ func TestCloudflareJITMintBlindExecAndAutoRevoke(t *testing.T) {
 			Permissions: []string{"dns:write", "workers:write"},
 			TTLSeconds:  300,
 		},
-		Command: []string{"sh", "-c", `echo "Deploying with token=$CLOUDFLARE_API_TOKEN"`},
+		WorkingDir: home,
+		TimeoutSec: 10,
+		Command:    []string{"sh", "-c", `echo "Deploying with token=$CLOUDFLARE_API_TOKEN"`},
 	})
 	if err != nil {
 		t.Fatalf("ExecBlind failed: %v", err)
 	}
 
-	// Verify secret was injected into child process AND scrubbed from output!
 	if strings.Contains(res.Stdout, mintedToken) || strings.Contains(res.Stdout, masterSecret) {
 		t.Fatalf("SECURITY LEAK: output still contained secret: %q", res.Stdout)
 	}
 	if !strings.Contains(res.Stdout, core.RedactedPlaceholder) {
 		t.Fatalf("expected scrubbed placeholder in output, got: %q", res.Stdout)
 	}
-	// Verify ephemeral token was automatically revoked immediately after execution.
 	if !res.Revoked || revokedCount.Load() != 1 {
 		t.Fatalf("expected ephemeral token to be revoked once, got revoked=%v count=%d", res.Revoked, revokedCount.Load())
 	}
 
-	// 2. Verify policy blocks direct `printenv` exfiltration attempts.
 	_, err = rt.ExecBlind(ctx, core.ExecRequest{
 		MintRequest: core.MintRequest{Provider: "cloudflare"},
 		Command:     []string{"printenv"},
@@ -108,7 +108,6 @@ func TestExternalPluginInstallAndExecution(t *testing.T) {
 	home := t.TempDir()
 	pluginSrcDir := t.TempDir()
 
-	// Create an external provider plugin (e.g. GitHub App token minter) using JSON-over-stdio protocol.
 	manifest := `{
   "name": "github",
   "version": "0.1.0",
@@ -137,6 +136,8 @@ esac
 	if err := os.WriteFile(filepath.Join(pluginSrcDir, "run"), []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// Subdir in plugin source should be skipped gracefully.
+	_ = os.MkdirAll(filepath.Join(pluginSrcDir, "subdir"), 0o700)
 
 	reg := core.NewRegistry()
 	vault := &builtin.KeychainVault{HomeDir: home, ForceFile: true}
@@ -160,7 +161,6 @@ esac
 		t.Fatal(err)
 	}
 
-	// Test calling external plugin via MCP Bridge JSON-RPC 2.0 stdio!
 	mcpBridge, err := reg.Bridge("mcp")
 	if err != nil {
 		t.Fatal(err)
@@ -232,7 +232,6 @@ func TestBuiltinGitHubJITEncodingScrubAndHITLApproval(t *testing.T) {
 
 	rt := core.NewRuntime(home, "keychain", reg)
 
-	// 1. Verify Encoding-Aware Scrubber catches Base64 and Hex exfiltration attempts.
 	res, err := rt.ExecBlind(ctx, core.ExecRequest{
 		MintRequest: core.MintRequest{
 			Provider:    "github",
@@ -251,7 +250,6 @@ func TestBuiltinGitHubJITEncodingScrubAndHITLApproval(t *testing.T) {
 		t.Fatalf("expected GitHub installation token to be revoked once, got revoked=%v count=%d", res.Revoked, ghRevoked.Load())
 	}
 
-	// 2. Verify HITL Approval Gate blocks execution when rejected by user.
 	rt.ApprovalFunc = func(_ context.Context, _ core.ExecRequest) (bool, error) {
 		return false, nil
 	}
@@ -265,3 +263,295 @@ func TestBuiltinGitHubJITEncodingScrubAndHITLApproval(t *testing.T) {
 	}
 }
 
+type dummyPlugin struct{ m core.Manifest }
+
+func (d dummyPlugin) Manifest() core.Manifest { return d.m }
+
+func TestRegistryAndExternalVaultAndRemoteInstall(t *testing.T) {
+	reg := core.NewRegistry()
+	if err := reg.Register(dummyPlugin{core.Manifest{}}); err == nil {
+		t.Fatal("expected missing name error")
+	}
+	if err := reg.Register(dummyPlugin{core.Manifest{Name: "bad", Kind: core.KindVault}}); err == nil {
+		t.Fatal("expected unimplemented kind error")
+	}
+	if _, err := reg.Vault("missing"); err == nil {
+		t.Fatal("expected missing vault error")
+	}
+	if _, err := reg.Provider("missing"); err == nil {
+		t.Fatal("expected missing provider error")
+	}
+	if _, err := reg.Bridge("missing"); err == nil {
+		t.Fatal("expected missing bridge error")
+	}
+
+	_ = reg.Register(builtin.NewKeychainVault(t.TempDir()))
+	_ = reg.Register(builtin.NewOnePasswordVault())
+	_ = reg.Register(builtin.NewCloudflareProvider())
+	_ = reg.Register(builtin.NewGitHubProvider())
+	_ = reg.Register(builtin.NewMCPBridge())
+	if len(reg.Manifests()) != 5 {
+		t.Fatalf("expected 5 manifests, got %d", len(reg.Manifests()))
+	}
+
+	// Test remote plugin install + external vault RPC (get/set/delete) + error cases + RemovePlugin
+	script := `#!/bin/sh
+read input
+case "$input" in
+  *'"op":"set_secret"'*) echo '{}' ;;
+  *'"op":"get_secret"'*) echo '{"value":"ext_vault_secret_123"}' ;;
+  *'"op":"delete_secret"'*) echo '{}' ;;
+  *'"op":"mint"'*)
+    case "$input" in
+      *'"scope":"nil"'*) echo '{}' ;;
+      *'"scope":"badjson"'*) echo 'not-json' ;;
+      *'"scope":"exit1"'*) echo 'boom' >&2; exit 1 ;;
+      *) echo '{"error":"mint failed"}' ;;
+    esac
+    ;;
+esac
+`
+	sum := sha256.Sum256([]byte(script))
+	hashHex := hex.EncodeToString(sum[:])
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/ok.json":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name":   "extplugin",
+				"kind":   "", // registers as both Vault and Provider
+				"script": script,
+				"sha256": hashHex,
+			})
+		case "/empty.json":
+			_, _ = w.Write([]byte(`{"name":""}`))
+		case "/badjson.json":
+			_, _ = w.Write([]byte(`{invalid`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	pluginsDir := filepath.Join(t.TempDir(), "plugins")
+	ctx := context.Background()
+
+	// LoadExternalPlugins on non-existent dir
+	if err := core.LoadExternalPlugins(pluginsDir, reg); err != nil {
+		t.Fatal(err)
+	}
+
+	// Remote install errors
+	if _, err := core.InstallPlugin(ctx, pluginsDir, srv.URL+"/404"); err == nil {
+		t.Fatal("expected 404 error")
+	}
+	if _, err := core.InstallPlugin(ctx, pluginsDir, srv.URL+"/empty.json"); err == nil {
+		t.Fatal("expected missing script error")
+	}
+	if _, err := core.InstallPlugin(ctx, pluginsDir, srv.URL+"/badjson.json"); err == nil {
+		t.Fatal("expected bad json error")
+	}
+	if _, err := core.InstallPlugin(ctx, pluginsDir, srv.URL+"/ok.json#sha256=deadbeef"); err == nil {
+		t.Fatal("expected sha256 mismatch error")
+	}
+	if _, err := core.InstallPlugin(ctx, pluginsDir, filepath.Join(pluginsDir, "not-a-dir")); err == nil {
+		t.Fatal("expected local dir error")
+	}
+
+	// Escape entrypoint check in local dir
+	escapeDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(escapeDir, "plugin.json"), []byte(`{"name":"esc","entrypoint":"../escape"}`), 0o600)
+	if _, err := core.InstallPlugin(ctx, pluginsDir, escapeDir); err == nil {
+		t.Fatal("expected entrypoint escape error")
+	}
+
+	// Valid remote install using bundle.SHA256 (without URL #sha256 fragment)
+	if _, err := core.InstallPlugin(ctx, pluginsDir, srv.URL+"/ok.json"); err != nil {
+		t.Fatalf("remote install failed: %v", err)
+	}
+	// Also test local plugin with empty entrypoint (defaults to "run")
+	defaultEpDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(defaultEpDir, "plugin.json"), []byte(`{"name":"defep","kind":"provider"}`), 0o600)
+	_ = os.WriteFile(filepath.Join(defaultEpDir, "run"), []byte("#!/bin/sh\necho '{\"error\":\"fail\"}'\n"), 0o700)
+	if _, err := core.InstallPlugin(ctx, pluginsDir, defaultEpDir); err != nil {
+		t.Fatalf("default entrypoint install failed: %v", err)
+	}
+
+	// Add a stray file and invalid plugin dir to test LoadExternalPlugins resilience
+	_ = os.WriteFile(filepath.Join(pluginsDir, "stray.txt"), []byte("hi"), 0o600)
+	_ = os.MkdirAll(filepath.Join(pluginsDir, "broken"), 0o700)
+	_ = os.WriteFile(filepath.Join(pluginsDir, "broken", "plugin.json"), []byte(`{bad`), 0o600)
+
+	if err := core.LoadExternalPlugins(pluginsDir, reg); err != nil {
+		t.Fatal(err)
+	}
+
+	extV, err := reg.Vault("extplugin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := extV.SetSecret(ctx, "k", "v"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := extV.GetSecret(ctx, "k"); err != nil || got != "ext_vault_secret_123" {
+		t.Fatalf("unexpected GetSecret: %q %v", got, err)
+	}
+	if err := extV.DeleteSecret(ctx, "k"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Test ExternalPlugin.GetSecret error path via defep
+	defP, err := reg.Provider("defep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if extDef, ok := defP.(*core.ExternalPlugin); ok {
+		if _, err := extDef.GetSecret(ctx, "k"); err == nil {
+			t.Fatal("expected GetSecret error from defep")
+		}
+	}
+
+	extP, err := reg.Provider("extplugin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sc := range []string{"nil", "badjson", "exit1", "err"} {
+		if _, err := extP.Mint(ctx, "sec", core.MintRequest{Scope: sc}); err == nil {
+			t.Fatalf("expected error for scope %s", sc)
+		}
+	}
+
+	// Test ExecBlind when provider.Mint fails (writes error audit entry)
+	rt := core.NewRuntime(t.TempDir(), "extplugin", reg)
+	if _, err := rt.ExecBlind(ctx, core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "extplugin", Scope: "err"},
+		Command:     []string{"echo", "hi"},
+	}); err == nil || !strings.Contains(err.Error(), "mint failed") {
+		t.Fatalf("expected ExecBlind provider mint failure, got %v", err)
+	}
+
+	if err := core.RemovePlugin(pluginsDir, "extplugin"); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.RemovePlugin(pluginsDir, "extplugin"); err == nil {
+		t.Fatal("expected error removing non-existent plugin")
+	}
+}
+
+func TestPolicyAndRunnerEdgeCases(t *testing.T) {
+	home := t.TempDir()
+	policyJSON := `{
+  "cloudflare": {
+    "allowed_scopes": ["allowed.com", "*.allowed.com", "prefix/*"],
+    "allowed_permissions": ["dns:*", "static"],
+    "blocked_commands": ["rm -rf"],
+    "max_ttl_seconds": 120,
+    "require_approval": false
+  }
+}`
+	_ = os.WriteFile(filepath.Join(home, "policy.json"), []byte(policyJSON), 0o600)
+
+	reg := core.NewRegistry()
+	vault := &builtin.KeychainVault{HomeDir: home, ForceFile: true}
+	cf := builtin.NewCloudflareProvider()
+	_ = reg.Register(vault)
+	_ = reg.Register(cf)
+
+	rt := core.NewRuntime(home, "keychain", reg)
+	ctx := context.Background()
+
+	// Validation errors
+	if _, err := rt.ExecBlind(ctx, core.ExecRequest{}); err == nil {
+		t.Fatal("expected empty command error")
+	}
+	if _, err := rt.ExecBlind(ctx, core.ExecRequest{Command: []string{"echo"}}); err == nil {
+		t.Fatal("expected empty provider error")
+	}
+	// Policy: disallowed scope
+	if _, err := rt.ExecBlind(ctx, core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "cloudflare", Scope: "forbidden.com"},
+		Command:     []string{"echo", "hi"},
+	}); err == nil || !strings.Contains(err.Error(), "not in allowed_scopes") {
+		t.Fatalf("expected scope policy denial, got %v", err)
+	}
+	// Policy: disallowed permission
+	if _, err := rt.ExecBlind(ctx, core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "cloudflare", Scope: "sub.allowed.com", Permissions: []string{"workers:write"}},
+		Command:     []string{"echo", "hi"},
+	}); err == nil || !strings.Contains(err.Error(), "not in allowed_permissions") {
+		t.Fatalf("expected permission policy denial, got %v", err)
+	}
+	// Policy: blocked command
+	if _, err := rt.ExecBlind(ctx, core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "cloudflare", Scope: "prefix/zone1", Permissions: []string{"dns:read"}},
+		Command:     []string{"sh", "-c", "rm -rf /tmp/x"},
+	}); err == nil || !strings.Contains(err.Error(), "blocked pattern") {
+		t.Fatalf("expected blocked command denial, got %v", err)
+	}
+
+	// Missing vault / missing provider / missing secret
+	if _, err := rt.ExecBlind(ctx, core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "cloudflare", Scope: "allowed.com"},
+		Vault:       "no_such_vault",
+		Command:     []string{"echo"},
+	}); err == nil {
+		t.Fatal("expected missing vault error")
+	}
+	if _, err := rt.ExecBlind(ctx, core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "no_such_provider"},
+		Command:     []string{"echo"},
+	}); err == nil {
+		t.Fatal("expected missing provider error")
+	}
+	if _, err := rt.ExecBlind(ctx, core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "cloudflare", Scope: "allowed.com"},
+		Command:     []string{"echo"},
+	}); err == nil {
+		t.Fatal("expected missing secret error")
+	}
+
+	_ = vault.SetSecret(ctx, "cloudflare", "cf_static_secret_12345")
+
+	// Non-zero exit code & non-existent command binary
+	res, err := rt.ExecBlind(ctx, core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "cloudflare", Scope: "allowed.com", Permissions: []string{"static"}},
+		Command:     []string{"sh", "-c", "exit 42"},
+	})
+	if err != nil || res.ExitCode != 42 {
+		t.Fatalf("expected exit code 42, got res=%+v err=%v", res, err)
+	}
+	res2, err := rt.ExecBlind(ctx, core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "cloudflare", Scope: "allowed.com", Permissions: []string{"static"}},
+		Command:     []string{"/nonexistent_binary_xyz_999"},
+	})
+	if err != nil || res2.ExitCode == 0 {
+		t.Fatalf("expected non-zero exit code for bad binary, got res=%+v err=%v", res2, err)
+	}
+
+	// Test defaultOSApproval with already-canceled context so osascript never blocks or pops UI
+	rt.ApprovalFunc = nil
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := rt.ExecBlind(canceledCtx, core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "cloudflare", Scope: "allowed.com", Permissions: []string{"static"}},
+		Command:     []string{"echo"},
+		Approve:     true,
+	}); err == nil {
+		t.Fatal("expected canceled approval error")
+	}
+
+	// Scrub edge cases & empty HomeDir audit
+	if got := core.Scrub("", []string{"secret"}); got != "" {
+		t.Fatalf("expected empty scrub, got %q", got)
+	}
+	if got := core.Scrub("abc", []string{"ab"}); got != "abc" {
+		t.Fatalf("expected short secret ignored, got %q", got)
+	}
+	rtNoHome := core.NewRuntime("", "keychain", reg)
+	rtNoHome.ApprovalFunc = func(context.Context, core.ExecRequest) (bool, error) { return false, errors.New("denied") }
+	_, _ = rtNoHome.ExecBlind(ctx, core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "cloudflare"},
+		Command:     []string{"echo"},
+		Approve:     true,
+	})
+}
