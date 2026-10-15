@@ -413,6 +413,8 @@ func TestPolicyFailClosedPhase45PRB(t *testing.T) {
 		reg := core.NewRegistry()
 		_ = reg.Register(&builtin.KeychainVault{HomeDir: home, ForceFile: true})
 		_ = reg.Register(builtin.NewCloudflareProvider())
+		_ = reg.Register(builtin.NewGitHubProvider())
+		_ = reg.Register(builtin.NewAWSProvider())
 		return core.NewRuntime(home, "keychain", reg), home
 	}
 	deny := func(t *testing.T, rt *core.Runtime, req core.ExecRequest, want string) {
@@ -455,6 +457,36 @@ func TestPolicyFailClosedPhase45PRB(t *testing.T) {
 	})
 	if err != nil || res.ExitCode != 7 {
 		t.Fatalf("expected static mode allowed with exit 7, got res=%+v err=%v", res, err)
+	}
+
+	// H2 residual: a github PAT and an aws request without a role ARN scope fail at mint instead
+	// of falling back to static mode, so their long-lived keys reach a child only via allow_static.
+	for _, c := range []struct{ provider, master, scope, env string }{
+		{"github", "ghp_h2_residual_pat_0001", "owner/repo", "GH_TOKEN"},
+		{"aws", "AKIAH2RESIDUAL0001:h2_residual_secret_0001", "my-bucket", "AWS_SECRET_ACCESS_KEY"},
+	} {
+		for _, policy := range []string{"", `{"` + c.provider + `":{"allow_static":true}}`} {
+			rt, home := newRT(t, policy)
+			if err := (&builtin.KeychainVault{HomeDir: home, ForceFile: true}).SetSecret(ctx, c.provider, c.master); err != nil {
+				t.Fatal(err)
+			}
+			req := core.ExecRequest{
+				MintRequest: core.MintRequest{Provider: c.provider, Scope: c.scope},
+				Command:     []string{"sh", "-c", `test -n "$` + c.env + `"`},
+			}
+			if _, err := rt.ExecBlind(ctx, req); err == nil || !strings.Contains(err.Error(), "mint failed") || strings.Contains(err.Error(), c.master) {
+				t.Fatalf("%s policy %q: expected an implicit static request to fail at mint, got %v", c.provider, policy, err)
+			}
+			req.Permissions = []string{"static"}
+			res, err := rt.ExecBlind(ctx, req)
+			if policy == "" {
+				if err == nil || !strings.Contains(err.Error(), "allow_static") {
+					t.Fatalf("%s: expected explicit static mode denied without allow_static, got %v", c.provider, err)
+				}
+			} else if err != nil || res.ExitCode != 0 {
+				t.Fatalf("%s: expected explicit static mode to inject %s, got res=%+v err=%v", c.provider, c.env, res, err)
+			}
+		}
 	}
 }
 
