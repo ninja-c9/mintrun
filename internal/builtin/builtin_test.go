@@ -16,6 +16,7 @@ import (
 	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -200,10 +201,19 @@ func TestGitHubProviderAndJWTSigningComprehensive(t *testing.T) {
 		t.Fatal("expected unsupported non-RSA key error")
 	}
 
+	// The mock records every request, so a test can prove what reached GitHub.
+	type sentReq struct{ path, auth, dump string }
+	var sent []sentReq
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dump, _ := httputil.DumpRequest(r, true)
+		sent = append(sent, sentReq{r.URL.Path, r.Header.Get("Authorization"), string(dump)})
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/555/access_tokens":
 			_, _ = w.Write([]byte(`{"token":"ghs_minted_555"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/777/access_tokens":
+			_, _ = w.Write([]byte(`{"token":"ghs_minted_777"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/echo/access_tokens": // a buggy endpoint echoing the credential back
+			http.Error(w, "Bad credentials: "+r.Header.Get("Authorization"), http.StatusUnauthorized)
 		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/empty/access_tokens":
 			_, _ = w.Write([]byte(`{"token":""}`))
 		case r.Method == http.MethodDelete && r.URL.Path == "/installation/token" && r.Header.Get("Authorization") == "Bearer ghs_minted_555":
@@ -218,7 +228,8 @@ func TestGitHubProviderAndJWTSigningComprehensive(t *testing.T) {
 	gh.Client = srv.Client()
 
 	// Mint using full "<app_id>:<inst_id>:<pem>" composite secret
-	compositeSecret := "12345:555:" + strings.ReplaceAll(pkcs1PEM, "\n", `\n`)
+	escapedPEM := strings.ReplaceAll(pkcs1PEM, "\n", `\n`)
+	compositeSecret := "12345:555:" + escapedPEM
 	dynLease, err := gh.Mint(ctx, compositeSecret, core.MintRequest{
 		Scope:       "org/repo",
 		Permissions: []string{"contents:write", "pull_requests:read"},
@@ -251,6 +262,104 @@ func TestGitHubProviderAndJWTSigningComprehensive(t *testing.T) {
 	}
 	if _, err := gh.Mint(ctx, "400:jwt_tok", core.MintRequest{}); err == nil {
 		t.Fatal("expected HTTP 400 error")
+	}
+
+	// params.installation_id overrides only the installation ID: the master is parsed the same way
+	// with or without it, so a composite key is still signed into a JWT, and key material that was
+	// not signed never reaches the Authorization header.
+	const appJWT = "mock.app.jwt"
+	const jwtHeader = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9" // base64url {"alg":"RS256","typ":"JWT"}
+	checkAppJWT := func(auth string) string {
+		tok, ok := strings.CutPrefix(auth, "Bearer ")
+		parts := strings.Split(tok, ".")
+		if !ok || len(parts) != 3 {
+			return "not a Bearer JWT"
+		}
+		sig, _ := base64.RawURLEncoding.DecodeString(parts[2])
+		digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+		if rsa.VerifyPKCS1v15(&privKey.PublicKey, crypto.SHA256, digest[:], sig) != nil {
+			return "bad RS256 signature"
+		}
+		var c struct{ Iss string }
+		claims, _ := base64.RawURLEncoding.DecodeString(parts[1])
+		if json.Unmarshal(claims, &c) != nil || c.Iss != "12345" {
+			return "bad iss " + c.Iss
+		}
+		return ""
+	}
+	inst777 := map[string]string{"installation_id": "777"}
+	for _, tc := range []struct{ name, master, bearer string }{
+		{"composite escaped PEM", "12345:555:" + escapedPEM, ""}, // "" expects a JWT signed by privKey
+		{"composite multi-line PEM", "12345:555:" + pkcs1PEM, ""},
+		{"installation_id:jwt master", "555:" + appJWT, appJWT},
+		{"bare jwt master", appJWT, appJWT},
+	} {
+		t.Run("installation_id param with "+tc.name, func(t *testing.T) {
+			sent = nil
+			lease, err := gh.Mint(ctx, tc.master, core.MintRequest{Scope: "org/repo", Params: inst777})
+			if err != nil {
+				t.Fatalf("mint failed: %v", err)
+			}
+			if !strings.HasPrefix(lease.ID, "gh-inst-777-") || lease.RevokeSecret != "ghs_minted_777" {
+				t.Fatalf("expected a lease for installation 777, got %s", lease.ID)
+			}
+			if len(sent) != 1 || sent[0].path != "/app/installations/777/access_tokens" {
+				t.Fatalf("expected one request to installation 777, got %d", len(sent))
+			}
+			if strings.Contains(sent[0].dump, "-----BEGIN") {
+				t.Fatal("the request to GitHub carried PEM key material")
+			}
+			if tc.bearer == "" {
+				if msg := checkAppJWT(sent[0].auth); msg != "" {
+					t.Fatalf("expected a GitHub App JWT bearer: %s", msg)
+				}
+			} else if sent[0].auth != "Bearer "+tc.bearer {
+				t.Fatalf("expected %q, got %q", "Bearer "+tc.bearer, sent[0].auth)
+			}
+		})
+	}
+	for _, tc := range []struct{ name, master string }{
+		{"key without app_id, escaped", "555:" + escapedPEM},
+		{"key without app_id, multi-line", "555:" + pkcs1PEM},
+		{"bare key, escaped", escapedPEM},
+		{"bare key, multi-line", pkcs1PEM},
+	} {
+		t.Run("installation_id param refuses "+tc.name, func(t *testing.T) {
+			sent = nil
+			_, err := gh.Mint(ctx, tc.master, core.MintRequest{Params: inst777})
+			if err == nil || strings.Contains(err.Error(), "-----BEGIN") {
+				t.Fatalf("expected an error free of key material (err=%t)", err != nil)
+			}
+			if !strings.Contains(err.Error(), "github JIT mode needs") || len(sent) != 0 {
+				t.Fatalf("expected the JIT format error before any request, got %v (%d requests)", err, len(sent))
+			}
+		})
+	}
+
+	// An error body that echoes the bearer is scrubbed by the provider: the runner knows only the
+	// whole master, not a JWT signed from it or cut out of it.
+	for _, tc := range []struct {
+		name, master string
+		params       map[string]string
+	}{
+		{"signed JWT", "12345:echo:" + escapedPEM, nil},
+		{"signed JWT with installation_id param", "12345:555:" + escapedPEM, map[string]string{"installation_id": "echo"}},
+		{"JWT from installation_id:jwt master", "echo:" + appJWT, nil},
+	} {
+		t.Run("error echo scrubs "+tc.name, func(t *testing.T) {
+			_, err := gh.Mint(ctx, tc.master, core.MintRequest{Params: tc.params})
+			if err == nil {
+				t.Fatal("expected an HTTP 401 error")
+			}
+			for _, leak := range []string{"-----BEGIN", jwtHeader, appJWT} {
+				if strings.Contains(err.Error(), leak) {
+					t.Fatalf("the error text leaks the credential (%s)", leak)
+				}
+			}
+			if !strings.Contains(err.Error(), "HTTP 401") || !strings.Contains(err.Error(), "Bearer "+core.RedactedPlaceholder) {
+				t.Fatalf("expected a scrubbed HTTP 401 error, got %v", err)
+			}
+		})
 	}
 }
 

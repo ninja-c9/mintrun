@@ -348,12 +348,14 @@ func (g *GitHubProvider) Mint(ctx context.Context, masterSecret string, req core
 		}, nil
 	}
 
-	// Format for JIT Installation Token minting:
+	// Format for JIT Installation Token minting, parsed the same way whether or not
+	// Params["installation_id"] is set (the param overrides only the installation ID):
 	// 1. "<app_id>:<installation_id>:<rsa_private_key_pem>" (auto-signs RS256 JWT)
-	// 2. "<installation_id>:<app_jwt>" or Params["installation_id"]
-	instID := req.Params["installation_id"]
+	// 2. "<installation_id>:<app_jwt>"
+	// 3. "<app_jwt>" with Params["installation_id"]
+	var instID string
 	bearer := masterSecret
-	if instID == "" && strings.Contains(masterSecret, ":") && !strings.HasPrefix(masterSecret, "gh") {
+	if strings.Contains(masterSecret, ":") && !strings.HasPrefix(masterSecret, "gh") {
 		if strings.Contains(masterSecret, "-----BEGIN") {
 			parts := strings.SplitN(masterSecret, ":", 3)
 			if len(parts) == 3 {
@@ -368,8 +370,12 @@ func (g *GitHubProvider) Mint(ctx context.Context, masterSecret string, req core
 			instID, bearer = parts[0], parts[1]
 		}
 	}
+	if id := req.Params["installation_id"]; id != "" {
+		instID = id
+	}
 
-	if instID == "" {
+	// A key that was not signed into a JWT never goes into the Authorization header.
+	if instID == "" || strings.Contains(bearer, "-----BEGIN") {
 		return nil, errors.New(`github JIT mode needs a GitHub App credential (<app_id>:<installation_id>:<private_key_pem> or <installation_id>:<app_jwt>); to inject a PAT, request the "static" permission and set "allow_static": true for github in policy.json`)
 	}
 
@@ -492,7 +498,9 @@ func (g *GitHubProvider) doGitHubJSON(ctx context.Context, token, method, path s
 	defer resp.Body.Close()
 	respBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("github API %s %s failed (HTTP %d): %s", method, path, resp.StatusCode, strings.TrimSpace(string(respBytes)))
+		// The bearer can be a JWT signed from or cut out of the master, which the runner cannot
+		// scrub, so an error body that echoes it is scrubbed here.
+		return fmt.Errorf("github API %s %s failed (HTTP %d): %s", method, path, resp.StatusCode, core.Scrub(strings.TrimSpace(string(respBytes)), []string{token}))
 	}
 	if out != nil && len(respBytes) > 0 {
 		return json.Unmarshal(respBytes, out)
