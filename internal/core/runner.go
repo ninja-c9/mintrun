@@ -239,17 +239,21 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 	}
 	lease, err := provider.Mint(ctx, masterSecret, req.MintRequest)
 	if err != nil {
+		// Mint errors may echo the master secret (plugin stderr, API response bodies).
+		// Return a scrubbed string, not %w: the raw error must never reach the caller.
+		secrets := leaseSecrets(masterSecret, lease)
+		errMsg := Scrub(err.Error(), secrets)
 		rt.writeAudit(AuditEntry{
 			Timestamp:   start.UTC().Format(time.RFC3339),
 			Provider:    req.Provider,
 			Scope:       req.Scope,
 			Permissions: req.Permissions,
-			Command:     req.Command,
+			Command:     scrubAll(req.Command, secrets),
 			ExitCode:    1,
 			DurationMs:  time.Since(start).Milliseconds(),
-			Error:       err.Error(),
+			Error:       errMsg,
 		})
-		return nil, fmt.Errorf("provider %q mint failed: %w", req.Provider, err)
+		return nil, fmt.Errorf("provider %q mint failed: %s", req.Provider, errMsg)
 	}
 
 	revoked := false
@@ -315,18 +319,16 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 		cancelRevoke()
 	}
 
-	// Build redaction set: master secret + all leased env values + explicit Redact list.
-	redactSet := []string{masterSecret}
-	for _, v := range lease.Env {
-		redactSet = append(redactSet, v)
-	}
-	redactSet = append(redactSet, lease.Redact...)
+	// A plugin may (wrongly) use a secret as lease.ID: report it scrubbed, and redact the raw ID everywhere else.
+	secrets := leaseSecrets(masterSecret, lease)
+	leaseID := Scrub(lease.ID, secrets)
+	redactSet := append(secrets, lease.ID)
 
 	res := &ExecResult{
 		ExitCode:   exitCode,
 		Stdout:     Scrub(stdoutBuf.String(), redactSet),
 		Stderr:     Scrub(stderrBuf.String(), redactSet),
-		LeaseID:    lease.ID,
+		LeaseID:    leaseID,
 		Ephemeral:  lease.Ephemeral || revoked,
 		Revoked:    revoked,
 		DurationMs: time.Since(start).Milliseconds(),
@@ -341,8 +343,8 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 		Provider:    req.Provider,
 		Scope:       req.Scope,
 		Permissions: req.Permissions,
-		Command:     req.Command,
-		LeaseID:     lease.ID,
+		Command:     scrubAll(req.Command, redactSet),
+		LeaseID:     leaseID,
 		Ephemeral:   res.Ephemeral,
 		Revoked:     revoked,
 		ExitCode:    exitCode,
@@ -377,6 +379,29 @@ func Scrub(text string, secrets []string) string {
 				out = strings.ReplaceAll(out, v, RedactedPlaceholder)
 			}
 		}
+	}
+	return out
+}
+
+// leaseSecrets lists every value that must never leave the enclave: the master secret plus
+// the lease's env values, explicit Redact list, and RevokeSecret. lease may be nil.
+func leaseSecrets(masterSecret string, lease *Lease) []string {
+	secrets := []string{masterSecret}
+	if lease == nil {
+		return secrets
+	}
+	for _, v := range lease.Env {
+		secrets = append(secrets, v)
+	}
+	secrets = append(secrets, lease.Redact...)
+	return append(secrets, lease.RevokeSecret)
+}
+
+// scrubAll returns a scrubbed copy of args (e.g. argv for the audit log).
+func scrubAll(args, secrets []string) []string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		out[i] = Scrub(a, secrets)
 	}
 	return out
 }

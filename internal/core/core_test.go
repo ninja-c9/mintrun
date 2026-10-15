@@ -263,6 +263,142 @@ func TestBuiltinGitHubJITEncodingScrubAndHITLApproval(t *testing.T) {
 	}
 }
 
+func TestGitHubLeaseIDIsOpaqueAndTokenNeverReachesAuditOrMCP(t *testing.T) {
+	const ghAppSecret = "424242:gh_app_jwt_master_secret"
+	const ghMintedToken = "ghs_installation_token_must_not_leak"
+	var ghRevoked atomic.Int32
+
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/424242/access_tokens":
+			_, _ = w.Write([]byte(`{"token":"` + ghMintedToken + `"}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/installation/token" && r.Header.Get("Authorization") == "Bearer "+ghMintedToken:
+			ghRevoked.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	}))
+	defer ghServer.Close()
+
+	home := t.TempDir()
+	reg := core.NewRegistry()
+	vault := &builtin.KeychainVault{HomeDir: home, ForceFile: true}
+	_ = reg.Register(vault)
+	_ = reg.Register(&builtin.GitHubProvider{BaseURL: ghServer.URL, Client: ghServer.Client()})
+	_ = reg.Register(builtin.NewMCPBridge())
+	ctx := context.Background()
+	if err := vault.SetSecret(ctx, "github", ghAppSecret); err != nil {
+		t.Fatal(err)
+	}
+	rt := core.NewRuntime(home, "keychain", reg)
+	bridge, err := reg.Bridge("mcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mcpInput := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mintrun_exec","arguments":{"provider":"github","scope":"ninja-c9/mintrun","permissions":["contents:read"],"command":["echo","hi"]}}}` + "\n"
+	var mcpOutput bytes.Buffer
+	if err := bridge.Serve(ctx, rt, strings.NewReader(mcpInput), &mcpOutput); err != nil {
+		t.Fatalf("MCP Serve failed: %v", err)
+	}
+	audit, err := os.ReadFile(filepath.Join(home, "audit.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, out := range map[string]string{"MCP output": mcpOutput.String(), "audit.jsonl": string(audit)} {
+		if strings.Contains(out, ghMintedToken) || strings.Contains(out, "gh_app_jwt_master_secret") {
+			t.Fatalf("SECURITY LEAK: %s contains a secret: %s", name, out)
+		}
+		if !strings.Contains(out, "gh-inst-424242-") {
+			t.Fatalf("expected opaque gh-inst lease handle in %s, got: %s", name, out)
+		}
+	}
+	if ghRevoked.Load() != 1 {
+		t.Fatalf("expected revoke using the real installation token, got count=%d", ghRevoked.Load())
+	}
+	if b, _ := json.Marshal(core.Lease{RevokeSecret: ghMintedToken}); strings.Contains(string(b), ghMintedToken) {
+		t.Fatalf("Lease.RevokeSecret must never be serialized: %s", b)
+	}
+}
+
+func TestMintFailureAndLeakyPluginLeaseAreScrubbed(t *testing.T) {
+	const master = "leaky_master_secret_31337"
+	const token = "leaky_jit_token_31337"
+	// Scope "crash": dumps the RPC request (incl. master_secret) to stderr and exits 1.
+	// Otherwise: wrongly uses the minted token as lease ID.
+	script := `#!/bin/sh
+read input
+case "$input" in
+  *'"scope":"crash"'*) printf '%s' "$input" >&2; exit 1 ;;
+  *'"op":"mint"'*) echo '{"lease":{"id":"` + token + `","provider":"leaky","env":{"LEAKY_TOKEN":"` + token + `"}}}' ;;
+  *) echo '{}' ;;
+esac
+`
+	pluginSrc := t.TempDir()
+	if err := os.WriteFile(filepath.Join(pluginSrc, "plugin.json"), []byte(`{"name":"leaky","version":"0.1.0","kind":"provider","entrypoint":"run"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pluginSrc, "run"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	home := t.TempDir()
+	reg := core.NewRegistry()
+	vault := &builtin.KeychainVault{HomeDir: home, ForceFile: true}
+	_ = reg.Register(vault)
+	_ = reg.Register(builtin.NewMCPBridge())
+	rt := core.NewRuntime(home, "keychain", reg)
+	ctx := context.Background()
+	if _, err := core.InstallPlugin(ctx, rt.PluginsDir(), pluginSrc); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.LoadExternalPlugins(rt.PluginsDir(), reg); err != nil {
+		t.Fatal(err)
+	}
+	if err := vault.SetSecret(ctx, "leaky", master); err != nil {
+		t.Fatal(err)
+	}
+
+	// Failed mint: returned error must be scrubbed, directly and via MCP.
+	_, err := rt.ExecBlind(ctx, core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "leaky", Scope: "crash"},
+		Command:     []string{"echo", master},
+	})
+	if err == nil || strings.Contains(err.Error(), master) || !strings.Contains(err.Error(), core.RedactedPlaceholder) {
+		t.Fatalf("expected scrubbed mint error, got: %v", err)
+	}
+	bridge, err := reg.Bridge("mcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mcpInput := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mintrun_exec","arguments":{"provider":"leaky","scope":"crash","command":["echo","x"]}}}` + "\n"
+	var mcpOutput bytes.Buffer
+	if err := bridge.Serve(ctx, rt, strings.NewReader(mcpInput), &mcpOutput); err != nil {
+		t.Fatal(err)
+	}
+	if out := mcpOutput.String(); strings.Contains(out, master) || !strings.Contains(out, "mint failed") {
+		t.Fatalf("expected scrubbed mint failure in MCP output, got: %s", out)
+	}
+
+	// Successful mint whose lease ID is the token, with the master secret in argv.
+	res, err := rt.ExecBlind(ctx, core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "leaky"},
+		Command:     []string{"echo", master},
+	})
+	if err != nil || res.LeaseID != core.RedactedPlaceholder || strings.Contains(res.Stdout, master) {
+		t.Fatalf("expected scrubbed lease ID and stdout, got: %+v err=%v", res, err)
+	}
+
+	audit, err := os.ReadFile(filepath.Join(home, "audit.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(audit), master) || strings.Contains(string(audit), token) {
+		t.Fatalf("SECURITY LEAK: audit.jsonl contains a secret:\n%s", audit)
+	}
+}
+
 type dummyPlugin struct{ m core.Manifest }
 
 func (d dummyPlugin) Manifest() core.Manifest { return d.m }

@@ -190,7 +190,7 @@ func TestGitHubProviderAndJWTSigningComprehensive(t *testing.T) {
 			_, _ = w.Write([]byte(`{"token":"ghs_minted_555"}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/empty/access_tokens":
 			_, _ = w.Write([]byte(`{"token":""}`))
-		case r.Method == http.MethodDelete && r.URL.Path == "/installation/token":
+		case r.Method == http.MethodDelete && r.URL.Path == "/installation/token" && r.Header.Get("Authorization") == "Bearer ghs_minted_555":
 			w.WriteHeader(http.StatusNoContent)
 		default:
 			w.WriteHeader(http.StatusBadRequest)
@@ -207,11 +207,14 @@ func TestGitHubProviderAndJWTSigningComprehensive(t *testing.T) {
 		Scope:       "org/repo",
 		Permissions: []string{"contents:write", "pull_requests:read"},
 	})
-	if err != nil || !dynLease.Ephemeral || dynLease.ID != "ghs_minted_555" {
+	if err != nil || !dynLease.Ephemeral || !strings.HasPrefix(dynLease.ID, "gh-inst-555-") || dynLease.RevokeSecret != "ghs_minted_555" {
 		t.Fatalf("composite RSA mint failed: %+v %v", dynLease, err)
 	}
 	if err := gh.Revoke(ctx, "", dynLease); err != nil {
 		t.Fatalf("revoke failed: %v", err)
+	}
+	if err := gh.Revoke(ctx, "", &core.Lease{ID: dynLease.ID, Ephemeral: true}); err == nil {
+		t.Fatal("expected revoke error without RevokeSecret")
 	}
 
 	// Error cases in Mint

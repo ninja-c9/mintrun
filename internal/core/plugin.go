@@ -59,6 +59,9 @@ type Lease struct {
 	Redact    []string          `json:"redact"` // Sensitive strings to scrub from stdout/stderr
 	ExpiresAt time.Time         `json:"expires_at"`
 	Ephemeral bool              `json:"ephemeral"` // True if dynamically minted and revocable
+	// RevokeSecret is a provider-private credential needed only by Revoke (e.g. a GitHub installation token).
+	// Never serialized (audit, MCP, plugin RPC) and always scrubbed; ID must stay a non-secret handle.
+	RevokeSecret string `json:"-"`
 }
 
 // Plugin is the universal contract for all mintrun plugins.

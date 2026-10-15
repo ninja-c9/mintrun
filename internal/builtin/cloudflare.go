@@ -397,16 +397,17 @@ func (g *GitHubProvider) Mint(ctx context.Context, masterSecret string, req core
 		return nil, errors.New("github API returned empty installation token")
 	}
 	return &core.Lease{
-		ID:       resp.Token, // GitHub revokes installation tokens using the token itself as Bearer
+		ID:       fmt.Sprintf("gh-inst-%s-%d", instID, time.Now().Unix()), // opaque handle, safe to audit
 		Provider: "github",
 		Scope:    req.Scope,
 		Env: map[string]string{
 			"GITHUB_TOKEN": resp.Token,
 			"GH_TOKEN":     resp.Token,
 		},
-		Redact:    []string{resp.Token, bearer, masterSecret},
-		ExpiresAt: resp.ExpiresAt,
-		Ephemeral: true,
+		Redact:       []string{resp.Token, bearer, masterSecret},
+		ExpiresAt:    resp.ExpiresAt,
+		Ephemeral:    true,
+		RevokeSecret: resp.Token, // GitHub revokes installation tokens using the token itself as Bearer
 	}, nil
 }
 
@@ -439,10 +440,13 @@ func signGitHubAppJWT(appID, pemStr string) (string, error) {
 }
 
 func (g *GitHubProvider) Revoke(ctx context.Context, _ string, lease *core.Lease) error {
-	if lease == nil || !lease.Ephemeral || lease.ID == "" || lease.ID == "gh-static" {
+	if lease == nil || !lease.Ephemeral || lease.ID == "gh-static" {
 		return nil
 	}
-	return g.doGitHubJSON(ctx, lease.ID, http.MethodDelete, "/installation/token", nil, nil)
+	if lease.RevokeSecret == "" {
+		return errors.New("github lease has no revocation token")
+	}
+	return g.doGitHubJSON(ctx, lease.RevokeSecret, http.MethodDelete, "/installation/token", nil, nil)
 }
 
 func (g *GitHubProvider) doGitHubJSON(ctx context.Context, token, method, path string, body any, out any) error {
