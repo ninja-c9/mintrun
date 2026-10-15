@@ -663,6 +663,3 @@ func signAWSSigV4(req *http.Request, accessKey, secretKey, region, service strin
 		accessKey, credScope, signedHeaders, signature,
 	))
 }
-
-
-

@@ -274,4 +274,3 @@ func (o *OnePasswordVault) DeleteSecret(ctx context.Context, key string) error {
 	}
 	return nil
 }
-

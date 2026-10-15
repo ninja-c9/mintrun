@@ -55,8 +55,8 @@ type Lease struct {
 	ID        string            `json:"id"`
 	Provider  string            `json:"provider"`
 	Scope     string            `json:"scope,omitempty"`
-	Env       map[string]string `json:"env"`       // Injected into blind child process (e.g. CLOUDFLARE_API_TOKEN=...)
-	Redact    []string          `json:"redact"`    // Sensitive strings to scrub from stdout/stderr
+	Env       map[string]string `json:"env"`    // Injected into blind child process (e.g. CLOUDFLARE_API_TOKEN=...)
+	Redact    []string          `json:"redact"` // Sensitive strings to scrub from stdout/stderr
 	ExpiresAt time.Time         `json:"expires_at"`
 	Ephemeral bool              `json:"ephemeral"` // True if dynamically minted and revocable
 }

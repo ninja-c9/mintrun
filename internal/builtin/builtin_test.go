@@ -376,9 +376,9 @@ func TestMCPBridgeComprehensive(t *testing.T) {
 
 	rt := core.NewRuntime(home, "keychain", reg)
 	requests := []string{
-		"",                                       // empty line ignored
-		"{invalid-json",                          // malformed JSON ignored
-		`{"jsonrpc":"2.0","method":"notify"}`,    // notification without ID ignored
+		"",                                    // empty line ignored
+		"{invalid-json",                       // malformed JSON ignored
+		`{"jsonrpc":"2.0","method":"notify"}`, // notification without ID ignored
 		`{"jsonrpc":"2.0","id":1,"method":"initialize"}`,
 		`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`,
 		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":"not-an-object"}`,
@@ -488,4 +488,3 @@ func TestAWSProviderComprehensive(t *testing.T) {
 		t.Fatal("expected STS XML parse error")
 	}
 }
-

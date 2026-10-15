@@ -22,22 +22,22 @@ const RedactedPlaceholder = "[MINTRUN:REDACTED]"
 // ExecRequest defines a blind command execution request.
 type ExecRequest struct {
 	MintRequest
-	Vault      string   `json:"vault,omitempty"`   // Defaults to Runtime.DefaultVault
-	Command    []string `json:"command"`           // e.g. ["wrangler", "deploy"]
-	WorkingDir string   `json:"cwd,omitempty"`     // Optional working directory
+	Vault      string   `json:"vault,omitempty"` // Defaults to Runtime.DefaultVault
+	Command    []string `json:"command"`         // e.g. ["wrangler", "deploy"]
+	WorkingDir string   `json:"cwd,omitempty"`   // Optional working directory
 	TimeoutSec int      `json:"timeout_seconds,omitempty"`
 	Approve    bool     `json:"approve,omitempty"` // Require interactive human-in-the-loop approval
 }
 
 // ExecResult contains the scrubbed output of a blind command execution.
 type ExecResult struct {
-	ExitCode   int           `json:"exit_code"`
-	Stdout     string        `json:"stdout"`
-	Stderr     string        `json:"stderr"`
-	LeaseID    string        `json:"lease_id"`
-	Ephemeral  bool          `json:"ephemeral"`
-	Revoked    bool          `json:"revoked"`
-	DurationMs int64         `json:"duration_ms"`
+	ExitCode   int    `json:"exit_code"`
+	Stdout     string `json:"stdout"`
+	Stderr     string `json:"stderr"`
+	LeaseID    string `json:"lease_id"`
+	Ephemeral  bool   `json:"ephemeral"`
+	Revoked    bool   `json:"revoked"`
+	DurationMs int64  `json:"duration_ms"`
 }
 
 // AuditEntry is written to `~/.mintrun/audit.jsonl` for every mint/exec action.
