@@ -963,6 +963,60 @@ func TestMCPBridgeGovernanceTools(t *testing.T) {
 	}
 }
 
+// TestMCPBridgeExecCleanEnv runs a successful mintrun_exec with clean_env over JSON-RPC. The
+// policy allows static mode but does not force clean mode, so only the request's clean_env can
+// strip the host variable. The child prints the lease token: the agent must see only the
+// placeholder, which also proves the child got the exact secret.
+func TestMCPBridgeExecCleanEnv(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	t.Setenv("MINTRUN_HOME", home)
+	t.Setenv("MINTRUN_VAULT_KEY", "mintrun-mcp-exec-test-passphrase")
+	t.Setenv("MINTRUN_APPROVE", "")
+	t.Setenv("MINTRUN_TEST_AMBIENT", "ambient_value")
+	const secret = "cf_static_tok_mcp_clean_env"
+	if err := os.WriteFile(filepath.Join(home, "policy.json"), []byte(`{"cloudflare":{"allow_static":true}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reg := core.NewRegistry()
+	vault := &KeychainVault{HomeDir: home, ForceFile: true}
+	_ = reg.Register(vault)
+	_ = reg.Register(NewCloudflareProvider())
+	if err := vault.SetSecret(ctx, "cloudflare", secret); err != nil {
+		t.Fatal(err)
+	}
+	rt := core.NewRuntime(home, "keychain", reg)
+	rt.ApprovalFunc = func(context.Context, core.ExecRequest) (bool, error) {
+		t.Error("an exec without require_approval must never ask a human")
+		return false, nil
+	}
+
+	req := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mintrun_exec","arguments":{"provider":"cloudflare","permissions":["static"],"clean_env":true,"command":["sh","-c","echo ambient=${MINTRUN_TEST_AMBIENT:-unset} lease=$CF_API_TOKEN"]}}}`
+	var out bytes.Buffer
+	if err := NewMCPBridge().Serve(ctx, rt, strings.NewReader(req+"\n"), &out); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), secret) {
+		t.Fatalf("lease secret reached the agent:\n%s", out.String())
+	}
+	var resp struct {
+		Result struct {
+			IsError bool                    `json:"isError"`
+			Content []struct{ Text string } `json:"content"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil || resp.Result.IsError || len(resp.Result.Content) != 1 {
+		t.Fatalf("expected a successful tool result, got %s (err=%v)", out.String(), err)
+	}
+	var res core.ExecResult
+	if err := json.Unmarshal([]byte(resp.Result.Content[0].Text), &res); err != nil {
+		t.Fatal(err)
+	}
+	if want := "ambient=unset lease=" + core.RedactedPlaceholder; res.ExitCode != 0 || strings.TrimSpace(res.Stdout) != want {
+		t.Fatalf("got exit %d, stdout %q; want exit 0, stdout %q", res.ExitCode, res.Stdout, want)
+	}
+}
+
 // TestMain supplies a deterministic file-vault passphrase for the suite. The
 // AES-256-GCM fallback now mandates MINTRUN_VAULT_KEY (audit C3); tests that need
 // the "no passphrase" error path override it locally with t.Setenv.
