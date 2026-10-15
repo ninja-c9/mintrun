@@ -399,6 +399,63 @@ esac
 	}
 }
 
+func TestPolicyFailClosedPhase45PRB(t *testing.T) {
+	ctx := context.Background()
+	newRT := func(t *testing.T, policyJSON string) (*core.Runtime, string) {
+		home := t.TempDir()
+		if policyJSON != "" {
+			if err := os.WriteFile(filepath.Join(home, "policy.json"), []byte(policyJSON), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		reg := core.NewRegistry()
+		_ = reg.Register(&builtin.KeychainVault{HomeDir: home, ForceFile: true})
+		_ = reg.Register(builtin.NewCloudflareProvider())
+		return core.NewRuntime(home, "keychain", reg), home
+	}
+	deny := func(t *testing.T, rt *core.Runtime, req core.ExecRequest, want string) {
+		t.Helper()
+		if _, err := rt.ExecBlind(ctx, req); err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected denial containing %q, got %v", want, err)
+		}
+	}
+
+	// H1: rule restricts scopes, so an empty scope must be denied (previously fail-open).
+	rt, _ := newRT(t, `{"cloudflare":{"allowed_scopes":["allowed.com"]}}`)
+	deny(t, rt, core.ExecRequest{MintRequest: core.MintRequest{Provider: "cloudflare"}, Command: []string{"echo"}}, "not in allowed_scopes")
+
+	// H1/H2: rule restricts permissions, so declaring none is denied unless '*' is allowed.
+	rt, _ = newRT(t, `{"cloudflare":{"allowed_permissions":["dns:read"]}}`)
+	deny(t, rt, core.ExecRequest{MintRequest: core.MintRequest{Provider: "cloudflare", Scope: "x"}, Command: []string{"echo"}}, "requires declared permissions")
+
+	// H2: explicit static mode is denied without allow_static, via params.mode and via "static" perm.
+	rt, _ = newRT(t, "")
+	deny(t, rt, core.ExecRequest{MintRequest: core.MintRequest{Provider: "cloudflare", Params: map[string]string{"mode": "static"}}, Command: []string{"echo"}}, "allow_static")
+	rt, _ = newRT(t, `{"cloudflare":{}}`)
+	deny(t, rt, core.ExecRequest{MintRequest: core.MintRequest{Provider: "cloudflare", Permissions: []string{"STATIC"}}, Command: []string{"echo"}}, "allow_static")
+
+	// H3: a malformed policy.json makes every exec fail closed.
+	rt, _ = newRT(t, `{ not valid json `)
+	deny(t, rt, core.ExecRequest{MintRequest: core.MintRequest{Provider: "cloudflare", Scope: "x", Permissions: []string{"dns:read"}}, Command: []string{"echo"}}, "failed to load")
+
+	// M8: blocked_commands match case-insensitively.
+	rt, _ = newRT(t, `{"cloudflare":{"allowed_scopes":["*"],"blocked_commands":["RM -RF"]}}`)
+	deny(t, rt, core.ExecRequest{MintRequest: core.MintRequest{Provider: "cloudflare", Scope: "x", Permissions: []string{"dns:read"}}, Command: []string{"sh", "-c", "rm -rf /tmp/x"}}, "blocked pattern")
+
+	// Positive: static mode runs once policy opts in; exit code flows through.
+	rt, home := newRT(t, `{"cloudflare":{"allow_static":true}}`)
+	if err := (&builtin.KeychainVault{HomeDir: home, ForceFile: true}).SetSecret(ctx, "cloudflare", "cf_static_tok_abcdef"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := rt.ExecBlind(ctx, core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "cloudflare", Permissions: []string{"static"}},
+		Command:     []string{"sh", "-c", "exit 7"},
+	})
+	if err != nil || res.ExitCode != 7 {
+		t.Fatalf("expected static mode allowed with exit 7, got res=%+v err=%v", res, err)
+	}
+}
+
 type dummyPlugin struct{ m core.Manifest }
 
 func (d dummyPlugin) Manifest() core.Manifest { return d.m }
@@ -582,7 +639,8 @@ func TestPolicyAndRunnerEdgeCases(t *testing.T) {
     "allowed_permissions": ["dns:*", "static"],
     "blocked_commands": ["rm -rf"],
     "max_ttl_seconds": 120,
-    "require_approval": false
+    "require_approval": false,
+    "allow_static": true
   }
 }`
 	_ = os.WriteFile(filepath.Join(home, "policy.json"), []byte(policyJSON), 0o600)

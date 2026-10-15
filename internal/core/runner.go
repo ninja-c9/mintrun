@@ -63,6 +63,7 @@ type PolicyRule struct {
 	BlockedCommands    []string `json:"blocked_commands,omitempty"`    // Substrings or binary names to reject
 	MaxTTLSeconds      int      `json:"max_ttl_seconds,omitempty"`     // Caps requested TTL
 	RequireApproval    bool     `json:"require_approval,omitempty"`    // Prompt human via native OS dialog before minting
+	AllowStatic        bool     `json:"allow_static,omitempty"`        // Permit non-JIT static mode (params.mode=static or "static" perm)
 }
 
 func matchPattern(pattern, value string) bool {
@@ -80,6 +81,16 @@ func matchPattern(pattern, value string) bool {
 	return false
 }
 
+// hasToken reports whether list contains tok (case-insensitive, whitespace-trimmed).
+func hasToken(list []string, tok string) bool {
+	for _, s := range list {
+		if strings.EqualFold(strings.TrimSpace(s), tok) {
+			return true
+		}
+	}
+	return false
+}
+
 // Runtime coordinates Vaults, Providers, Bridges, Policy enforcement, Blind Execution, and Audit Logging.
 type Runtime struct {
 	HomeDir      string
@@ -87,6 +98,7 @@ type Runtime struct {
 	Registry     *Registry
 	Policies     map[string]PolicyRule
 	ApprovalFunc func(ctx context.Context, req ExecRequest) (bool, error)
+	policyErr    error // Non-nil if policy.json exists but failed to parse → every exec fails closed.
 }
 
 func NewRuntime(homeDir, defaultVault string, reg *Registry) *Runtime {
@@ -114,10 +126,20 @@ func (rt *Runtime) loadPolicyFile() {
 	if err != nil {
 		return
 	}
-	_ = json.Unmarshal(raw, &rt.Policies)
+	if err := json.Unmarshal(raw, &rt.Policies); err != nil {
+		// Fail closed: a malformed policy must not silently degrade to allow-all.
+		rt.Policies = make(map[string]PolicyRule)
+		rt.policyErr = err
+		fmt.Fprintf(os.Stderr, "mintrun: WARNING: policy.json is malformed (%v); denying all exec until fixed\n", err)
+	}
 }
 
 func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest) error {
+	// Fail closed: a policy.json that exists but failed to parse denies everything.
+	if rt.policyErr != nil {
+		return fmt.Errorf("policy denied: policy.json failed to load (%v)", rt.policyErr)
+	}
+
 	// Built-in guardrail: block trivial secret-dumping shell commands in blind runner.
 	if len(req.Command) > 0 {
 		bin := filepath.Base(req.Command[0])
@@ -129,8 +151,18 @@ func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest) error {
 	}
 
 	rule, hasRule := rt.Policies[req.Provider]
+
+	// Non-JIT static mode (direct long-lived secret, no ephemeral token or revoke) must be
+	// explicitly opted into via policy; an agent cannot silently downgrade by requesting it.
+	if req.Params["mode"] == "static" || hasToken(req.Permissions, "static") {
+		if !(hasRule && rule.AllowStatic) {
+			return fmt.Errorf("policy denied: static (non-JIT) mode for provider %q requires \"allow_static\": true in policy.json", req.Provider)
+		}
+	}
+
 	if hasRule {
-		if len(rule.AllowedScopes) > 0 && req.Scope != "" {
+		// Scope allowlist is fail-closed: an empty scope matches only a '*' or empty pattern.
+		if len(rule.AllowedScopes) > 0 {
 			allowed := false
 			for _, s := range rule.AllowedScopes {
 				if matchPattern(s, req.Scope) {
@@ -142,7 +174,11 @@ func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest) error {
 				return fmt.Errorf("policy denied: scope %q is not in allowed_scopes for provider %q", req.Scope, req.Provider)
 			}
 		}
-		if len(rule.AllowedPermissions) > 0 && len(req.Permissions) > 0 {
+		if len(rule.AllowedPermissions) > 0 {
+			// Fail closed: a request declaring no permissions is denied unless '*' is allowed.
+			if len(req.Permissions) == 0 && !hasToken(rule.AllowedPermissions, "*") {
+				return fmt.Errorf("policy denied: provider %q requires declared permissions within allowed_permissions", req.Provider)
+			}
 			for _, perm := range req.Permissions {
 				allowed := false
 				for _, ap := range rule.AllowedPermissions {
@@ -157,9 +193,9 @@ func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest) error {
 			}
 		}
 		if len(rule.BlockedCommands) > 0 && len(req.Command) > 0 {
-			cmdLine := strings.Join(req.Command, " ")
+			cmdLine := strings.ToLower(strings.Join(req.Command, " "))
 			for _, blocked := range rule.BlockedCommands {
-				if blocked != "" && strings.Contains(cmdLine, blocked) {
+				if blocked != "" && strings.Contains(cmdLine, strings.ToLower(blocked)) {
 					return fmt.Errorf("policy denied: command matches blocked pattern %q", blocked)
 				}
 			}

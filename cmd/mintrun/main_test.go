@@ -63,6 +63,11 @@ func TestCLISubcommandsEndToEnd(t *testing.T) {
 	t.Setenv("MINTRUN_FILE_VAULT", "1")
 	t.Setenv("MINTRUN_VAULT", "keychain")
 
+	// Static (non-JIT) mode must be explicitly allowed by policy (audit finding H2).
+	if err := os.WriteFile(filepath.Join(home, "policy.json"), []byte(`{"cloudflare":{"allow_static":true}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
 	// 1. defaultHomeDir with and without MINTRUN_HOME
 	if got := defaultHomeDir(); got != home {
 		t.Fatalf("expected %q, got %q", home, got)
