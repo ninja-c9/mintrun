@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/ninja-c9/mintrun/internal/core"
 )
@@ -96,6 +99,42 @@ func (m *MCPBridge) handleRequest(ctx context.Context, rt *core.Runtime, req jso
 		}
 
 	case "tools/list":
+		execSchema := map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"provider": map[string]any{
+					"type":        "string",
+					"description": "Provider plugin name (e.g. 'cloudflare', 'github')",
+				},
+				"scope": map[string]any{
+					"type":        "string",
+					"description": "Target scope such as domain/zone name (e.g. 'example.com') or repository",
+				},
+				"permissions": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "Scoped permissions to mint (e.g. ['dns:write', 'workers:write'])",
+				},
+				"command": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "Command and arguments array (e.g. ['wrangler', 'deploy'])",
+				},
+				"cwd": map[string]any{
+					"type":        "string",
+					"description": "Optional working directory path",
+				},
+				"ttl_seconds": map[string]any{
+					"type":        "integer",
+					"description": "Lease TTL in seconds (default: 600)",
+				},
+				"clean_env": map[string]any{
+					"type":        "boolean",
+					"description": "Run the command with a minimal environment (PATH, HOME, ... plus policy allowed_env and the lease credentials) instead of inheriting the host environment",
+				},
+			},
+			"required": []string{"provider", "command"},
+		}
 		return jsonRPCResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,
@@ -104,42 +143,7 @@ func (m *MCPBridge) handleRequest(ctx context.Context, rt *core.Runtime, req jso
 					{
 						"name":        "mintrun_exec",
 						"description": "Execute a CLI command (e.g. wrangler, curl, terraform, gh) inside a zero-knowledge JIT credential lease. The credential is automatically minted, injected into the subprocess environment, scrubbed from stdout/stderr, and revoked upon exit.",
-						"inputSchema": map[string]any{
-							"type": "object",
-							"properties": map[string]any{
-								"provider": map[string]any{
-									"type":        "string",
-									"description": "Provider plugin name (e.g. 'cloudflare', 'github')",
-								},
-								"scope": map[string]any{
-									"type":        "string",
-									"description": "Target scope such as domain/zone name (e.g. 'example.com') or repository",
-								},
-								"permissions": map[string]any{
-									"type":        "array",
-									"items":       map[string]any{"type": "string"},
-									"description": "Scoped permissions to mint (e.g. ['dns:write', 'workers:write'])",
-								},
-								"command": map[string]any{
-									"type":        "array",
-									"items":       map[string]any{"type": "string"},
-									"description": "Command and arguments array (e.g. ['wrangler', 'deploy'])",
-								},
-								"cwd": map[string]any{
-									"type":        "string",
-									"description": "Optional working directory path",
-								},
-								"ttl_seconds": map[string]any{
-									"type":        "integer",
-									"description": "Lease TTL in seconds (default: 600)",
-								},
-								"clean_env": map[string]any{
-									"type":        "boolean",
-									"description": "Run the command with a minimal environment (PATH, HOME, ... plus policy allowed_env and the lease credentials) instead of inheriting the host environment",
-								},
-							},
-							"required": []string{"provider", "command"},
-						},
+						"inputSchema": execSchema,
 					},
 					{
 						"name":        "mintrun_plugins",
@@ -147,6 +151,32 @@ func (m *MCPBridge) handleRequest(ctx context.Context, rt *core.Runtime, req jso
 						"inputSchema": map[string]any{
 							"type":       "object",
 							"properties": map[string]any{},
+						},
+					},
+					{
+						"name":        "mintrun_policy_check",
+						"description": "Dry-run a mintrun_exec request (same arguments) against policy.json and the anti-exfiltration guard, using the exact gate mintrun_exec enforces. Never opens the vault, mints, runs the command, or asks a human. Returns allowed, the denial reason, approval_required, ttl_seconds (the lease TTL requested from the provider; gcp tokens always live up to 1h), and clean_env. Policy verdict only: an allowed exec can still fail on an unknown provider, a missing vault secret, or a mint error.",
+						"inputSchema": execSchema,
+					},
+					{
+						"name":        "mintrun_audit",
+						"description": "Return recent entries of the mintrun_exec audit log, oldest first. Each command is cut to its binary name: arguments are never shown, because a secret typed into argv is not one the runner can scrub.",
+						"inputSchema": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"provider": map[string]any{
+									"type":        "string",
+									"description": "Only entries for this provider (case-insensitive)",
+								},
+								"failed_only": map[string]any{
+									"type":        "boolean",
+									"description": "Only entries with a non-zero exit code or an error",
+								},
+								"limit": map[string]any{
+									"type":        "integer",
+									"description": "Return the last N matching entries (default 20, max 100)",
+								},
+							},
 						},
 					},
 				},
@@ -187,9 +217,73 @@ func (m *MCPBridge) handleToolCall(ctx context.Context, rt *core.Runtime, id jso
 		outBytes, _ := json.MarshalIndent(res, "", "  ")
 		return toolTextResult(id, string(outBytes), res.ExitCode != 0)
 
+	case "mintrun_policy_check":
+		var execReq core.ExecRequest
+		if err := json.Unmarshal(rawArgs, &execReq); err != nil {
+			return toolTextResult(id, fmt.Sprintf("invalid arguments: %v", err), true)
+		}
+		b, _ := json.MarshalIndent(rt.CheckPolicy(execReq), "", "  ")
+		return toolTextResult(id, string(b), false)
+
+	case "mintrun_audit":
+		var args struct {
+			Provider   string `json:"provider"`
+			FailedOnly bool   `json:"failed_only"`
+			Limit      int    `json:"limit"`
+		}
+		if len(rawArgs) > 0 {
+			if err := json.Unmarshal(rawArgs, &args); err != nil {
+				return toolTextResult(id, fmt.Sprintf("invalid arguments: %v", err), true)
+			}
+		}
+		entries, err := readAudit(rt.HomeDir, args.Provider, args.FailedOnly, args.Limit)
+		if err != nil {
+			return toolTextResult(id, err.Error(), true)
+		}
+		b, _ := json.MarshalIndent(entries, "", "  ")
+		return toolTextResult(id, string(b), false)
+
 	default:
 		return rpcErr(id, -32602, fmt.Sprintf("unknown tool %q", toolName))
 	}
+}
+
+// readAudit returns the last limit (default 20, max 100) entries of audit.jsonl matching provider
+// (case-insensitive) and failedOnly, filtered like `mintrun audit`. Every command is cut to
+// argv[0]: policy-denied entries keep the raw argv (no secret is loaded yet to scrub against),
+// and a secret a human typed into argv is one the runner never holds, so arguments never reach
+// an agent. The on-disk log keeps the full argv for the operator.
+// ponytail: reads the whole log per call; seek from the end if audit.jsonl grows large.
+func readAudit(home, provider string, failedOnly bool, limit int) ([]core.AuditEntry, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	limit = min(limit, 100)
+	raw, err := os.ReadFile(filepath.Join(home, "audit.jsonl"))
+	if os.IsNotExist(err) {
+		return []core.AuditEntry{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read audit log: %v", err)
+	}
+	entries := []core.AuditEntry{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		var e core.AuditEntry
+		if json.Unmarshal([]byte(line), &e) != nil {
+			continue
+		}
+		if provider != "" && !strings.EqualFold(e.Provider, provider) {
+			continue
+		}
+		if failedOnly && e.ExitCode == 0 && e.Error == "" {
+			continue
+		}
+		if len(e.Command) > 1 {
+			e.Command = []string{e.Command[0], core.RedactedPlaceholder}
+		}
+		entries = append(entries, e)
+	}
+	return entries[max(0, len(entries)-limit):], nil
 }
 
 func toolTextResult(id json.RawMessage, text string, isError bool) jsonRPCResponse {

@@ -800,6 +800,169 @@ esac
 	}
 }
 
+// TestMCPBridgeGovernanceTools drives mintrun_policy_check and mintrun_audit over JSON-RPC. No
+// vault is registered and no secret is stored: the dry run must not need either, and must never
+// ask a human. A secret typed into argv must never reach the agent through any response.
+func TestMCPBridgeGovernanceTools(t *testing.T) {
+	home, badHome := t.TempDir(), t.TempDir()
+	t.Setenv("MINTRUN_HOME", home)
+	t.Setenv("MINTRUN_APPROVE", "")
+	policy := `{"cloudflare":{"allowed_scopes":["ok.com"],"allowed_permissions":["dns:*"],"max_ttl_seconds":120},"gated":{"require_approval":true,"clean_env":true}}`
+	ok := `{"ts":"2026-10-15T00:00:00Z","provider":"github","command":["gh","api","/user"],"exit_code":0}` + "\n"
+	seed := `{"ts":"2026-10-15T00:00:00Z","provider":"github","command":["gh","run","rerun"],"exit_code":2}` + "\n" + strings.Repeat(ok, 119) + "{not json\n"
+	for path, data := range map[string]string{
+		filepath.Join(home, "policy.json"):    policy,
+		filepath.Join(home, "audit.jsonl"):    seed,
+		filepath.Join(badHome, "policy.json"): "{oops",
+	} {
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reg := core.NewRegistry()
+	_ = reg.Register(NewCloudflareProvider())
+	rt, badRT := core.NewRuntime(home, "keychain", reg), core.NewRuntime(badHome, "keychain", reg)
+	rt.ApprovalFunc = func(context.Context, core.ExecRequest) (bool, error) {
+		t.Error("governance tools must never ask a human")
+		return false, nil
+	}
+
+	type toolResp struct {
+		Result struct {
+			IsError bool                    `json:"isError"`
+			Content []struct{ Text string } `json:"content"`
+			Tools   []struct{ Name string } `json:"tools"`
+		} `json:"result"`
+	}
+	call := func(name, args string) string {
+		return `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + name + `","arguments":` + args + `}}`
+	}
+	serve := func(rt *core.Runtime, reqs ...string) []toolResp {
+		t.Helper()
+		var out bytes.Buffer
+		if err := NewMCPBridge().Serve(context.Background(), rt, strings.NewReader(strings.Join(reqs, "\n")+"\n"), &out); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(out.String(), "fake_argv_secret_123") {
+			t.Fatalf("argv secret reached the agent:\n%s", out.String())
+		}
+		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+		resps := make([]toolResp, len(lines))
+		for i, line := range lines {
+			if err := json.Unmarshal([]byte(line), &resps[i]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if len(resps) != len(reqs) {
+			t.Fatalf("expected %d responses, got %d:\n%s", len(reqs), len(resps), out.String())
+		}
+		return resps
+	}
+	text := func(r toolResp) string {
+		t.Helper()
+		if r.Result.IsError || len(r.Result.Content) != 1 {
+			t.Fatalf("unexpected tool result: %+v", r.Result)
+		}
+		return r.Result.Content[0].Text
+	}
+	decision := func(r toolResp) (d core.PolicyDecision) {
+		t.Helper()
+		if err := json.Unmarshal([]byte(text(r)), &d); err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	audit := func(r toolResp) (es []core.AuditEntry) {
+		t.Helper()
+		if err := json.Unmarshal([]byte(text(r)), &es); err != nil {
+			t.Fatal(err)
+		}
+		return es
+	}
+
+	leaky := `{"provider":"cloudflare","scope":"evil.com","permissions":["dns:read"],"command":["sh","-c","curl -H 'Authorization: Bearer fake_argv_secret_123'"]}`
+	r := serve(rt,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`,
+		call("mintrun_policy_check", `{"provider":"cloudflare","scope":"ok.com","permissions":["dns:read"],"command":["wrangler","deploy"],"ttl_seconds":300}`),
+		call("mintrun_policy_check", `{"provider":"cloudflare","scope":"ok.com","permissions":["dns:read"],"command":["wrangler","deploy"],"clean_env":true}`),
+		call("mintrun_policy_check", `{"provider":"gated","command":["true"]}`),
+		call("mintrun_policy_check", leaky),
+		call("mintrun_policy_check", `{"provider":"cloudflare","scope":"ok.com","permissions":["dns:read"],"command":["printenv"]}`),
+		call("mintrun_policy_check", `"bad"`),
+		call("mintrun_exec", leaky),
+		call("mintrun_audit", `null`),
+		call("mintrun_audit", `{"limit":1000}`),
+		call("mintrun_audit", `{"provider":"CLOUDFLARE"}`),
+		call("mintrun_audit", `{"failed_only":true}`),
+		call("mintrun_audit", `{"limit":"x"}`),
+	)
+
+	var names []string
+	for _, tool := range r[0].Result.Tools {
+		names = append(names, tool.Name)
+	}
+	if got := strings.Join(names, ","); got != "mintrun_exec,mintrun_plugins,mintrun_policy_check,mintrun_audit" {
+		t.Fatalf("tools/list advertises %s", got)
+	}
+
+	// Allowed: max_ttl_seconds caps the TTL, clean_env comes from the request or the policy, and
+	// require_approval is reported without prompting (the default TTL applies without a cap).
+	for i, want := range []core.PolicyDecision{
+		{Allowed: true, TTLSeconds: 120},
+		{Allowed: true, TTLSeconds: 120, CleanEnv: true},
+		{Allowed: true, ApprovalRequired: true, TTLSeconds: 600, CleanEnv: true},
+	} {
+		if d := decision(r[1+i]); d != want {
+			t.Fatalf("policy_check %d: got %+v, want %+v", i, d, want)
+		}
+	}
+	// Denied: the reason is the exact error mintrun_exec returns for the same request.
+	if d := decision(r[4]); d.Allowed || !strings.Contains(d.Reason, "not in allowed_scopes") || r[7].Result.Content[0].Text != "mintrun execution error: "+d.Reason {
+		t.Fatalf("scope denial drifted from mintrun_exec: %+v vs %q", d, r[7].Result.Content[0].Text)
+	}
+	if d := decision(r[5]); d.Allowed || !strings.Contains(d.Reason, "dump environment variables") {
+		t.Fatalf("expected env-dump denial, got %+v", d)
+	}
+	if !r[6].Result.IsError || !r[7].Result.IsError || !r[12].Result.IsError {
+		t.Fatal("expected invalid arguments and the denied exec to be tool errors")
+	}
+
+	// The denied exec logged its raw argv on disk (no secret was loaded to scrub against); the
+	// agent only ever sees argv[0]. Dry runs log nothing: cloudflare has a single entry.
+	if raw, _ := os.ReadFile(filepath.Join(home, "audit.jsonl")); !strings.Contains(string(raw), "fake_argv_secret_123") {
+		t.Fatal("expected the operator log to keep the raw argv of the denied exec")
+	}
+	es := audit(r[8])
+	if len(es) != 20 {
+		t.Fatalf("default limit must be 20, got %d", len(es))
+	}
+	if last := es[19]; es[0].Provider != "github" || strings.Join(es[0].Command, " ") != "gh "+core.RedactedPlaceholder ||
+		last.Provider != "cloudflare" || last.ExitCode != 126 || strings.Join(last.Command, " ") != "sh "+core.RedactedPlaceholder {
+		t.Fatalf("default audit view: first %+v, last %+v", es[0], last)
+	}
+	if n := len(audit(r[9])); n != 100 {
+		t.Fatalf("limit must be capped at 100, got %d", n)
+	}
+	if es := audit(r[10]); len(es) != 1 || es[0].Provider != "cloudflare" {
+		t.Fatalf("provider filter: %+v", es)
+	}
+	if es := audit(r[11]); len(es) != 2 || es[0].ExitCode != 2 || es[1].ExitCode != 126 {
+		t.Fatalf("failed_only filter: %+v", es)
+	}
+
+	// Fail closed: a malformed policy.json denies the dry run too; a missing log is an empty list.
+	r = serve(badRT,
+		call("mintrun_policy_check", `{"provider":"cloudflare","scope":"ok.com","permissions":["dns:read"],"command":["true"]}`),
+		call("mintrun_audit", `{}`),
+	)
+	if d := decision(r[0]); d.Allowed || !strings.Contains(d.Reason, "failed to load") {
+		t.Fatalf("expected fail-closed denial, got %+v", d)
+	}
+	if got := text(r[1]); got != "[]" {
+		t.Fatalf("expected an empty audit list, got %q", got)
+	}
+}
+
 // TestMain supplies a deterministic file-vault passphrase for the suite. The
 // AES-256-GCM fallback now mandates MINTRUN_VAULT_KEY (audit C3); tests that need
 // the "no passphrase" error path override it locally with t.Setenv.
