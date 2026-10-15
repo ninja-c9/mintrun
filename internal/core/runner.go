@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 )
@@ -26,7 +27,8 @@ type ExecRequest struct {
 	Command    []string `json:"command"`         // e.g. ["wrangler", "deploy"]
 	WorkingDir string   `json:"cwd,omitempty"`   // Optional working directory
 	TimeoutSec int      `json:"timeout_seconds,omitempty"`
-	Approve    bool     `json:"approve,omitempty"` // Require interactive human-in-the-loop approval
+	Approve    bool     `json:"approve,omitempty"`   // Require interactive human-in-the-loop approval
+	CleanEnv   bool     `json:"clean_env,omitempty"` // Child gets only the base env + policy allowed_env + Lease.Env (can only tighten policy)
 }
 
 // ExecResult contains the scrubbed output of a blind command execution.
@@ -64,6 +66,8 @@ type PolicyRule struct {
 	MaxTTLSeconds      int      `json:"max_ttl_seconds,omitempty"`     // Caps requested TTL
 	RequireApproval    bool     `json:"require_approval,omitempty"`    // Prompt human via native OS dialog before minting
 	AllowStatic        bool     `json:"allow_static,omitempty"`        // Permit non-JIT static mode (params.mode=static or "static" perm)
+	CleanEnv           bool     `json:"clean_env,omitempty"`           // Force clean-env for every exec of this provider (audit M1)
+	AllowedEnv         []string `json:"allowed_env,omitempty"`         // Host env names (globs) a clean-env child keeps; non-empty implies clean_env
 }
 
 func matchPattern(pattern, value string) bool {
@@ -315,20 +319,10 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 		cmd.Dir = req.WorkingDir
 	}
 
-	// Build child environment: inherit OS env + inject leased credentials.
-	envMap := make(map[string]string)
-	for _, kv := range os.Environ() {
-		if k, v, ok := strings.Cut(kv, "="); ok {
-			envMap[k] = v
-		}
-	}
-	for k, v := range lease.Env {
-		envMap[k] = v
-	}
-	cmd.Env = make([]string, 0, len(envMap))
-	for k, v := range envMap {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
+	// Build child environment (audit M1): clean-env keeps only the base set plus policy
+	// allowed_env names; otherwise the host env is inherited. Lease.Env always wins.
+	rule := rt.Policies[req.Provider]
+	cmd.Env = childEnv(req.CleanEnv || rule.CleanEnv || len(rule.AllowedEnv) > 0, rule.AllowedEnv, lease.Env)
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
@@ -389,6 +383,35 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 	})
 
 	return res, nil
+}
+
+// cleanEnvBase is the host environment a clean-env child keeps besides policy allowed_env names.
+var cleanEnvBase = []string{"PATH", "HOME", "TMPDIR", "USER", "LANG", "TERM", "SSL_CERT_FILE"}
+
+// childEnv returns the blind child's environment, sorted for determinism. The file-vault
+// passphrase (MINTRUN_VAULT_KEY) never reaches the child, in any mode.
+func childEnv(clean bool, allowed []string, leaseEnv map[string]string) []string {
+	env := make(map[string]string)
+	for _, kv := range os.Environ() {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || k == "MINTRUN_VAULT_KEY" {
+			continue
+		}
+		if clean && !slices.Contains(cleanEnvBase, k) &&
+			!slices.ContainsFunc(allowed, func(p string) bool { return matchPattern(p, k) }) {
+			continue
+		}
+		env[k] = v
+	}
+	for k, v := range leaseEnv {
+		env[k] = v
+	}
+	out := make([]string, 0, len(env))
+	for k, v := range env {
+		out = append(out, k+"="+v)
+	}
+	slices.Sort(out)
+	return out
 }
 
 // Scrub replaces every non-trivial secret occurrence (including Base64, RawBase64, Hex,

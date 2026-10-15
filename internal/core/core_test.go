@@ -784,6 +784,52 @@ func TestPolicyAndRunnerEdgeCases(t *testing.T) {
 	})
 }
 
+// TestExecBlindCleanEnv covers audit M1: clean-env (request flag, policy clean_env, or
+// policy allowed_env) strips ambient host vars, keeps the base set and Lease.Env, and the
+// file-vault passphrase never reaches the child in any mode.
+func TestExecBlindCleanEnv(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("MINTRUN_TEST_AMBIENT", "ambient_value")
+	t.Setenv("MINTRUN_TEST_KEEP_ME", "kept_value")
+	const probe = `echo "ambient=${MINTRUN_TEST_AMBIENT:-unset} keep=${MINTRUN_TEST_KEEP_ME:-unset} path=${PATH:+set} lease=${CF_API_TOKEN:+set} vaultkey=${MINTRUN_VAULT_KEY:-unset}"`
+
+	for _, tc := range []struct {
+		name, policy string
+		cleanReq     bool
+		want         string
+	}{
+		{"inherit", `{"cloudflare":{"allow_static":true}}`, false, "ambient=ambient_value keep=kept_value path=set lease=set vaultkey=unset"},
+		{"request clean_env", `{"cloudflare":{"allow_static":true}}`, true, "ambient=unset keep=unset path=set lease=set vaultkey=unset"},
+		{"policy clean_env", `{"cloudflare":{"allow_static":true,"clean_env":true}}`, false, "ambient=unset keep=unset path=set lease=set vaultkey=unset"},
+		{"policy allowed_env", `{"cloudflare":{"allow_static":true,"allowed_env":["MINTRUN_TEST_KEEP_*","MINTRUN_VAULT_*"]}}`, false, "ambient=unset keep=kept_value path=set lease=set vaultkey=unset"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			if err := os.WriteFile(filepath.Join(home, "policy.json"), []byte(tc.policy), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			reg := core.NewRegistry()
+			vault := &builtin.KeychainVault{HomeDir: home, ForceFile: true}
+			_ = reg.Register(vault)
+			_ = reg.Register(builtin.NewCloudflareProvider())
+			if err := vault.SetSecret(ctx, "cloudflare", "cf_static_tok_cleanenv"); err != nil {
+				t.Fatal(err)
+			}
+			res, err := core.NewRuntime(home, "keychain", reg).ExecBlind(ctx, core.ExecRequest{
+				MintRequest: core.MintRequest{Provider: "cloudflare", Permissions: []string{"static"}},
+				Command:     []string{"sh", "-c", probe},
+				CleanEnv:    tc.cleanReq,
+			})
+			if err != nil || res.ExitCode != 0 {
+				t.Fatalf("exec failed: res=%+v err=%v", res, err)
+			}
+			if got := strings.TrimSpace(res.Stdout); got != tc.want {
+				t.Fatalf("child env mismatch:\n got: %s\nwant: %s", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestMain supplies a deterministic file-vault passphrase for the suite. The
 // AES-256-GCM fallback now mandates MINTRUN_VAULT_KEY (audit C3); tests that need
 // the "no passphrase" error path override it locally with t.Setenv.
