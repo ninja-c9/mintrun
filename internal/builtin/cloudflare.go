@@ -412,27 +412,37 @@ func (g *GitHubProvider) Mint(ctx context.Context, masterSecret string, req core
 }
 
 func signGitHubAppJWT(appID, pemStr string) (string, error) {
-	block, _ := pem.Decode([]byte(strings.ReplaceAll(pemStr, `\n`, "\n")))
-	if block == nil {
-		return "", errors.New("invalid PEM block")
-	}
-	var rsaKey *rsa.PrivateKey
-	if k, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
-		rsaKey = k
-	} else if pkcs8, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
-		if k, ok := pkcs8.(*rsa.PrivateKey); ok {
-			rsaKey = k
-		}
-	}
-	if rsaKey == nil {
-		return "", errors.New("unsupported RSA private key format")
+	key, err := parseRSAPrivateKey(pemStr)
+	if err != nil {
+		return "", err
 	}
 	now := time.Now().UTC().Unix()
-	hdr := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
-	claims, _ := json.Marshal(map[string]any{"iat": now - 60, "exp": now + 540, "iss": appID})
-	unsigned := hdr + "." + base64.RawURLEncoding.EncodeToString(claims)
+	return signRS256(key, map[string]any{"iat": now - 60, "exp": now + 540, "iss": appID})
+}
+
+// parseRSAPrivateKey decodes a PKCS#1 or PKCS#8 RSA private key PEM (literal `\n` escapes allowed).
+func parseRSAPrivateKey(pemStr string) (*rsa.PrivateKey, error) {
+	block, _ := pem.Decode([]byte(strings.ReplaceAll(pemStr, `\n`, "\n")))
+	if block == nil {
+		return nil, errors.New("invalid PEM block")
+	}
+	if k, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
+		return k, nil
+	}
+	if pkcs8, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
+		if k, ok := pkcs8.(*rsa.PrivateKey); ok {
+			return k, nil
+		}
+	}
+	return nil, errors.New("unsupported RSA private key format")
+}
+
+// signRS256 returns a compact RS256 JWT carrying claims (shared by the GitHub App and GCP providers).
+func signRS256(key *rsa.PrivateKey, claims map[string]any) (string, error) {
+	body, _ := json.Marshal(claims)
+	unsigned := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`)) + "." + base64.RawURLEncoding.EncodeToString(body)
 	digest := sha256.Sum256([]byte(unsigned))
-	sig, err := rsa.SignPKCS1v15(rand.Reader, rsaKey, crypto.SHA256, digest[:])
+	sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, digest[:])
 	if err != nil {
 		return "", err
 	}
@@ -666,4 +676,162 @@ func signAWSSigV4(req *http.Request, accessKey, secretKey, region, service strin
 		"AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
 		accessKey, credScope, signedHeaders, signature,
 	))
+}
+
+// GCPProvider mints short-lived Google Cloud OAuth2 access tokens from a service-account JSON
+// key (RS256 JWT bearer grant, RFC 7523), or wraps an existing access token in static mode.
+type GCPProvider struct {
+	TokenURL  string
+	RevokeURL string
+	Client    *http.Client
+}
+
+func NewGCPProvider() *GCPProvider {
+	return &GCPProvider{
+		TokenURL:  "https://oauth2.googleapis.com/token",
+		RevokeURL: "https://oauth2.googleapis.com/revoke",
+		Client:    &http.Client{Timeout: 15 * time.Second},
+	}
+}
+
+func (g *GCPProvider) Manifest() core.Manifest {
+	return core.Manifest{
+		Name:        "gcp",
+		Version:     "0.5.0",
+		Kind:        core.KindProvider,
+		Description: "Google Cloud OAuth2 JIT Access Token Minter (service-account RS256 JWT bearer grant, 100% stdlib)",
+		Scopes:      []string{"cloud-platform", "cloud-platform.read-only", "devstorage.read_only", "devstorage.read_write", "compute", "compute.readonly", "static"},
+		Builtin:     true,
+	}
+}
+
+func (g *GCPProvider) Mint(ctx context.Context, masterSecret string, req core.MintRequest) (*core.Lease, error) {
+	if masterSecret == "" {
+		return nil, errors.New("empty GCP master secret")
+	}
+
+	// Static mode is explicit (so the policy allow_static gate applies) and only wraps an
+	// existing OAuth2 access token: a service-account key is a long-lived private key and is
+	// never injected into the child.
+	if req.Params["mode"] == "static" || containsPerm(req.Permissions, "static") {
+		if strings.HasPrefix(strings.TrimSpace(masterSecret), "{") || strings.Contains(masterSecret, "PRIVATE KEY") {
+			return nil, errors.New("gcp static mode wraps an OAuth2 access token; refusing to inject a service-account private key")
+		}
+		return &core.Lease{
+			ID:       "gcp-static",
+			Provider: "gcp",
+			Scope:    req.Scope,
+			Env: map[string]string{
+				"CLOUDSDK_AUTH_ACCESS_TOKEN": masterSecret,
+				"GOOGLE_OAUTH_ACCESS_TOKEN":  masterSecret,
+			},
+			Redact:    []string{masterSecret},
+			ExpiresAt: time.Now().UTC().Add(time.Hour),
+			Ephemeral: false,
+		}, nil
+	}
+
+	// ponytail: the key file's token_uri is ignored, so the signed assertion only ever goes to
+	// g.TokenURL (Google by default); honor token_uri if non-default universe domains matter.
+	var sa struct {
+		ClientEmail string `json:"client_email"`
+		PrivateKey  string `json:"private_key"`
+	}
+	if json.Unmarshal([]byte(masterSecret), &sa) != nil || sa.ClientEmail == "" || sa.PrivateKey == "" {
+		return nil, errors.New(`gcp JIT mode needs a service-account JSON key with client_email and private_key (wrap an access token with the "static" permission instead)`)
+	}
+	key, err := parseRSAPrivateKey(sa.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("gcp service-account private_key: %w", err)
+	}
+
+	// Permissions are OAuth2 scopes: short names expand under googleapis.com/auth/.
+	var scopes []string
+	for _, p := range req.Permissions {
+		if p = strings.TrimSpace(p); p == "" {
+			continue
+		}
+		if !strings.HasPrefix(p, "https://") {
+			p = "https://www.googleapis.com/auth/" + p
+		}
+		scopes = append(scopes, p)
+	}
+	if len(scopes) == 0 {
+		return nil, errors.New("gcp JIT mode needs at least one OAuth2 scope permission (e.g. cloud-platform.read-only)")
+	}
+
+	// Google caps assertions at 1h and fixes the access-token lifetime (<=1h); TTL cannot shorten it.
+	now := time.Now().UTC().Unix()
+	assertion, err := signRS256(key, map[string]any{
+		"iss":   sa.ClientEmail,
+		"scope": strings.Join(scopes, " "),
+		"aud":   g.TokenURL,
+		"iat":   now,
+		"exp":   now + 3600,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sign gcp JWT assertion: %w", err)
+	}
+
+	var tok struct {
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int    `json:"expires_in"`
+	}
+	form := url.Values{"grant_type": {"urn:ietf:params:oauth:grant-type:jwt-bearer"}, "assertion": {assertion}}
+	if err := g.postForm(ctx, g.TokenURL, form, &tok, assertion, sa.PrivateKey, masterSecret); err != nil {
+		return nil, err
+	}
+	if tok.AccessToken == "" {
+		return nil, errors.New("gcp token endpoint returned an empty access_token")
+	}
+	return &core.Lease{
+		ID:       fmt.Sprintf("gcp-sa-%d", time.Now().Unix()), // opaque handle, safe to audit
+		Provider: "gcp",
+		Scope:    req.Scope,
+		Env: map[string]string{
+			"CLOUDSDK_AUTH_ACCESS_TOKEN": tok.AccessToken,
+			"GOOGLE_OAUTH_ACCESS_TOKEN":  tok.AccessToken,
+		},
+		Redact:       []string{tok.AccessToken, assertion, sa.PrivateKey, masterSecret},
+		ExpiresAt:    time.Now().UTC().Add(time.Duration(tok.ExpiresIn) * time.Second).Truncate(time.Second),
+		Ephemeral:    true,
+		RevokeSecret: tok.AccessToken,
+	}, nil
+}
+
+// Revoke calls Google's revoke endpoint on exit. It is best-effort: Google documents
+// service-account tokens as not revocable server-side, so a refusal surfaces as
+// revoked=false and the token still dies at its <=1h expiry.
+func (g *GCPProvider) Revoke(ctx context.Context, _ string, lease *core.Lease) error {
+	if lease == nil || !lease.Ephemeral {
+		return nil
+	}
+	if lease.RevokeSecret == "" {
+		return errors.New("gcp lease has no revocation token")
+	}
+	// The token travels in the POST body, never the query string (keeps it out of access logs).
+	return g.postForm(ctx, g.RevokeURL, url.Values{"token": {lease.RevokeSecret}}, nil, lease.RevokeSecret)
+}
+
+// postForm POSTs an OAuth2 form and decodes a JSON reply into out (when non-nil). Error bodies
+// are scrubbed of the given sub-secrets: core only knows the master secret as one whole string.
+func (g *GCPProvider) postForm(ctx context.Context, endpoint string, form url.Values, out any, secrets ...string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := g.Client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("gcp OAuth2 %s failed (HTTP %d): %s", endpoint, resp.StatusCode, core.Scrub(strings.TrimSpace(string(body)), secrets))
+	}
+	if out != nil && json.Unmarshal(body, out) != nil {
+		return fmt.Errorf("gcp OAuth2 %s returned malformed JSON", endpoint)
+	}
+	return nil
 }

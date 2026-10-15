@@ -32,27 +32,36 @@ const (
 	vaultSaltLen  = 16
 )
 
-// KeychainVault stores master secrets in macOS Keychain (`/usr/bin/security`)
-// with a fallback to an AES-256-GCM encrypted 0600 file vault (`~/.mintrun/vault.json`).
+// KeychainVault stores master secrets in macOS Keychain (`/usr/bin/security`) or Linux
+// libsecret (`secret-tool`), with a fallback to an AES-256-GCM encrypted 0600 file vault
+// (`~/.mintrun/vault.json`).
 type KeychainVault struct {
-	mu        sync.Mutex
-	HomeDir   string
-	ForceFile bool // Used on Linux or in deterministic unit tests
+	mu         sync.Mutex
+	HomeDir    string
+	ForceFile  bool   // Skip macOS Keychain (non-macOS hosts or deterministic unit tests)
+	SecretTool string // Path to Linux libsecret `secret-tool`; empty disables it
 }
 
 func NewKeychainVault(homeDir string) *KeychainVault {
-	return &KeychainVault{
+	k := &KeychainVault{
 		HomeDir:   homeDir,
 		ForceFile: runtime.GOOS != "darwin" || os.Getenv("MINTRUN_FILE_VAULT") == "1",
 	}
+	if runtime.GOOS == "linux" && os.Getenv("MINTRUN_FILE_VAULT") != "1" {
+		// err != nil includes exec.ErrDot: never run a secret-tool found via a relative PATH entry.
+		if p, err := exec.LookPath("secret-tool"); err == nil {
+			k.SecretTool = p
+		}
+	}
+	return k
 }
 
 func (k *KeychainVault) Manifest() core.Manifest {
 	return core.Manifest{
 		Name:        "keychain",
-		Version:     "0.4.0",
+		Version:     "0.5.0",
 		Kind:        core.KindVault,
-		Description: "OS native secret vault (macOS Keychain via /usr/bin/security with AES-256-GCM 0600 fallback)",
+		Description: "OS native secret vault (macOS Keychain via /usr/bin/security, Linux libsecret via secret-tool, AES-256-GCM 0600 fallback)",
 		Builtin:     true,
 	}
 }
@@ -61,7 +70,24 @@ func (k *KeychainVault) serviceName(key string) string {
 	return "mintrun:" + strings.TrimSpace(strings.ToLower(key))
 }
 
+// secretTool runs Linux libsecret `secret-tool` against this key's attributes. The secret only
+// travels on stdin (store) or stdout (lookup), never argv, so it cannot leak via `ps` (audit M5).
+func (k *KeychainVault) secretTool(ctx context.Context, stdin, action, key string, extra ...string) (string, error) {
+	args := append(append([]string{action}, extra...), "service", k.serviceName(key), "account", keychainAccount)
+	cmd := exec.CommandContext(ctx, k.SecretTool, args...)
+	cmd.Stdin = strings.NewReader(stdin)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err := cmd.Run()
+	return strings.TrimSpace(out.String()), err
+}
+
 func (k *KeychainVault) GetSecret(ctx context.Context, key string) (string, error) {
+	if k.SecretTool != "" {
+		if val, err := k.secretTool(ctx, "", "lookup", key); err == nil && val != "" {
+			return val, nil
+		}
+	}
 	if !k.ForceFile {
 		cmd := exec.CommandContext(ctx, "/usr/bin/security", "find-generic-password",
 			"-a", keychainAccount,
@@ -85,6 +111,11 @@ func (k *KeychainVault) SetSecret(ctx context.Context, key, value string) error 
 	if value == "" {
 		return errors.New("secret value cannot be empty")
 	}
+	if k.SecretTool != "" {
+		if _, err := k.secretTool(ctx, value, "store", key, "--label="+k.serviceName(key)); err == nil {
+			return nil
+		}
+	}
 	if !k.ForceFile {
 		cmd := exec.CommandContext(ctx, "/usr/bin/security", "add-generic-password",
 			"-U",
@@ -100,6 +131,9 @@ func (k *KeychainVault) SetSecret(ctx context.Context, key, value string) error 
 }
 
 func (k *KeychainVault) DeleteSecret(ctx context.Context, key string) error {
+	if k.SecretTool != "" {
+		_, _ = k.secretTool(ctx, "", "clear", key)
+	}
 	if !k.ForceFile {
 		_ = exec.CommandContext(ctx, "/usr/bin/security", "delete-generic-password",
 			"-a", keychainAccount,
@@ -283,6 +317,9 @@ func (k *KeychainVault) deleteFileSecret(key string) error {
 	m, err := k.readMap()
 	if err != nil {
 		return err
+	}
+	if _, ok := m[k.serviceName(key)]; !ok {
+		return nil // nothing to delete: don't (re-)write a vault, which would demand MINTRUN_VAULT_KEY
 	}
 	delete(m, k.serviceName(key))
 	return k.writeMap(m)

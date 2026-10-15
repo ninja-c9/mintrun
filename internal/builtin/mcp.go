@@ -133,6 +133,10 @@ func (m *MCPBridge) handleRequest(ctx context.Context, rt *core.Runtime, req jso
 									"type":        "integer",
 									"description": "Lease TTL in seconds (default: 600)",
 								},
+								"clean_env": map[string]any{
+									"type":        "boolean",
+									"description": "Run the command with a minimal environment (PATH, HOME, ... plus policy allowed_env and the lease credentials) instead of inheriting the host environment",
+								},
 							},
 							"required": []string{"provider", "command"},
 						},

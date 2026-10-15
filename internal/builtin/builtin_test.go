@@ -3,11 +3,14 @@ package builtin
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"net/http"
@@ -16,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ninja-c9/mintrun/internal/core"
 )
@@ -232,6 +236,7 @@ func TestGitHubProviderAndJWTSigningComprehensive(t *testing.T) {
 func TestKeychainAndOnePasswordVaults(t *testing.T) {
 	home := t.TempDir()
 	kv := NewKeychainVault(home)
+	kv.SecretTool = "" // hermetic on Linux hosts with libsecret installed
 	if kv.Manifest().Name != "keychain" {
 		t.Fatalf("unexpected manifest: %+v", kv.Manifest())
 	}
@@ -560,6 +565,238 @@ func TestFileVaultPassphraseRequiredPhase45PRC(t *testing.T) {
 	}
 	if onDisk2["__salt__"] == onDisk["__salt__"] {
 		t.Fatal("expected a fresh salt on re-write")
+	}
+}
+
+// TestGCPProviderPhase5 drives the GCP provider against an offline mock OAuth2 server: the
+// JWT bearer assertion must be RS256-signed by the service-account key with the expected
+// claims, and every error path must stay scrubbed of the assertion and private key.
+func TestGCPProviderPhase5(t *testing.T) {
+	ctx := context.Background()
+	const token = "ya29.mock_gcp_access_token"
+	const jwtHeader = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9" // base64url {"alg":"RS256","typ":"JWT"}
+
+	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pemKey := string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privKey)}))
+	saJSON, _ := json.Marshal(map[string]string{"type": "service_account", "client_email": "ci@example.iam.gserviceaccount.com", "private_key": pemKey})
+
+	checkAssertion := func(r *http.Request) string {
+		if r.PostForm.Get("grant_type") != "urn:ietf:params:oauth:grant-type:jwt-bearer" {
+			return "bad grant_type"
+		}
+		parts := strings.Split(r.PostForm.Get("assertion"), ".")
+		if len(parts) != 3 {
+			return "malformed assertion"
+		}
+		sig, _ := base64.RawURLEncoding.DecodeString(parts[2])
+		digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+		if rsa.VerifyPKCS1v15(&privKey.PublicKey, crypto.SHA256, digest[:], sig) != nil {
+			return "bad RS256 signature"
+		}
+		var c struct {
+			Iss, Scope, Aud string
+			Iat, Exp        int64
+		}
+		body, _ := base64.RawURLEncoding.DecodeString(parts[1])
+		_ = json.Unmarshal(body, &c)
+		switch {
+		case c.Iss != "ci@example.iam.gserviceaccount.com":
+			return "bad iss " + c.Iss
+		case c.Scope != "https://www.googleapis.com/auth/cloud-platform.read-only https://www.googleapis.com/auth/devstorage.read_only":
+			return "bad scope " + c.Scope
+		case c.Aud != "http://"+r.Host+r.URL.Path:
+			return "bad aud " + c.Aud
+		case c.Exp-c.Iat != 3600:
+			return "bad exp"
+		}
+		return ""
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		switch r.URL.Path {
+		case "/token":
+			if msg := checkAssertion(r); msg != "" {
+				http.Error(w, msg, http.StatusBadRequest)
+				return
+			}
+			_, _ = w.Write([]byte(`{"access_token":"` + token + `","expires_in":3599,"token_type":"Bearer"}`))
+		case "/echo": // a buggy endpoint echoing the grant and key back in its error body
+			http.Error(w, "invalid_grant: "+r.PostForm.Encode()+" key="+pemKey, http.StatusBadRequest)
+		case "/empty":
+			_, _ = w.Write([]byte(`{"access_token":""}`))
+		case "/garbage":
+			_, _ = w.Write([]byte(`not json`))
+		case "/revoke":
+			if r.URL.RawQuery != "" || r.PostForm.Get("token") != token {
+				http.Error(w, "token must be in the POST body", http.StatusBadRequest)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	dead := httptest.NewServer(http.NotFoundHandler())
+	deadURL := dead.URL
+	dead.Close()
+
+	g := NewGCPProvider()
+	if g.Manifest().Name != "gcp" || g.TokenURL != "https://oauth2.googleapis.com/token" {
+		t.Fatalf("unexpected gcp provider: %+v", g.Manifest())
+	}
+	g.TokenURL, g.RevokeURL = srv.URL+"/token", srv.URL+"/revoke"
+	jit := core.MintRequest{Scope: "example-project", Permissions: []string{"cloud-platform.read-only", " ", "https://www.googleapis.com/auth/devstorage.read_only"}}
+
+	lease, err := g.Mint(ctx, string(saJSON), jit)
+	if err != nil {
+		t.Fatalf("JIT mint failed: %v", err)
+	}
+	if !lease.Ephemeral || !strings.HasPrefix(lease.ID, "gcp-sa-") || lease.RevokeSecret != token ||
+		lease.Env["CLOUDSDK_AUTH_ACCESS_TOKEN"] != token || lease.Env["GOOGLE_OAUTH_ACCESS_TOKEN"] != token ||
+		len(lease.Redact) != 4 || time.Until(lease.ExpiresAt) < 59*time.Minute {
+		t.Fatalf("unexpected JIT lease: %+v", lease)
+	}
+	if err := g.Revoke(ctx, "", lease); err != nil {
+		t.Fatalf("revoke failed: %v", err)
+	}
+
+	// Static mode wraps an access token, but never a service-account key.
+	static, err := g.Mint(ctx, "ya29.static_access_token", core.MintRequest{Permissions: []string{"static"}})
+	if err != nil || static.Ephemeral || static.ID != "gcp-static" || static.Env["CLOUDSDK_AUTH_ACCESS_TOKEN"] != "ya29.static_access_token" {
+		t.Fatalf("unexpected static lease: %+v %v", static, err)
+	}
+	if err := g.Revoke(ctx, "", static); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Revoke(ctx, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, master := range []string{string(saJSON), pemKey} {
+		if _, err := g.Mint(ctx, master, core.MintRequest{Params: map[string]string{"mode": "static"}}); err == nil {
+			t.Fatal("expected static mode to refuse service-account key material")
+		}
+	}
+
+	// Mint errors.
+	for name, master := range map[string]string{
+		"empty":       "",
+		"not json":    "ya29.not_a_key",
+		"no key":      `{"client_email":"ci@example.iam.gserviceaccount.com"}`,
+		"bad pem":     `{"client_email":"ci@example.iam.gserviceaccount.com","private_key":"not-a-pem"}`,
+		"scopeless":   string(saJSON),
+		"token_400":   string(saJSON),
+		"empty_token": string(saJSON),
+		"bad_json":    string(saJSON),
+		"bad_url":     string(saJSON),
+		"unreachable": string(saJSON),
+	} {
+		g2 := *g
+		req := jit
+		switch name {
+		case "scopeless":
+			req.Permissions = []string{" "}
+		case "token_400":
+			g2.TokenURL = srv.URL + "/echo"
+		case "empty_token":
+			g2.TokenURL = srv.URL + "/empty"
+		case "bad_json":
+			g2.TokenURL = srv.URL + "/garbage"
+		case "bad_url":
+			g2.TokenURL = "://bad"
+		case "unreachable":
+			g2.TokenURL = deadURL + "/token"
+		}
+		_, err := g2.Mint(ctx, master, req)
+		if err == nil {
+			t.Fatalf("%s: expected mint error", name)
+		}
+		if msg := err.Error(); strings.Contains(msg, jwtHeader) || strings.Contains(msg, "PRIVATE KEY") {
+			t.Fatalf("%s: mint error leaked the assertion or private key: %s", name, msg)
+		}
+		if name == "token_400" && !strings.Contains(err.Error(), core.RedactedPlaceholder) {
+			t.Fatalf("expected the echoed grant to be scrubbed, got: %v", err)
+		}
+	}
+
+	// Revoke errors.
+	if err := g.Revoke(ctx, "", &core.Lease{Ephemeral: true}); err == nil {
+		t.Fatal("expected missing revocation token error")
+	}
+	g.RevokeURL = srv.URL + "/nope"
+	if err := g.Revoke(ctx, "", lease); err == nil {
+		t.Fatal("expected revoke HTTP 404 error")
+	}
+}
+
+// TestKeychainVaultLinuxSecretTool drives the libsecret path through a mock `secret-tool`:
+// the secret must travel on stdin only (never argv), a failing secret-tool must fall back to
+// the encrypted file vault, and deleting a libsecret-only key must not demand MINTRUN_VAULT_KEY.
+func TestKeychainVaultLinuxSecretTool(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, argLog := filepath.Join(dir, "store"), filepath.Join(dir, "argv.log")
+	if err := os.Mkdir(store, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Mock CLI: secret-tool <store|lookup|clear> [--label=L] service <svc> account mintrun
+	script := `#!/bin/sh
+echo "$*" >> "$MOCK_SECRET_LOG"
+action=$1; shift
+case "$1" in --label=*) shift ;; esac
+case "$2" in *fail*) exit 1 ;; esac
+f="$MOCK_SECRET_STORE/$2"
+case "$action" in
+  store) cat > "$f" ;;
+  lookup) cat "$f" 2>/dev/null || exit 1 ;;
+  clear) rm -f "$f" ;;
+esac
+`
+	tool := filepath.Join(dir, "secret-tool")
+	if err := os.WriteFile(tool, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MOCK_SECRET_STORE", store)
+	t.Setenv("MOCK_SECRET_LOG", argLog)
+
+	kv := &KeychainVault{HomeDir: filepath.Join(dir, "home"), ForceFile: true, SecretTool: tool}
+	if err := kv.SetSecret(ctx, "GCP", "  sa_json_secret_value  "); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := kv.GetSecret(ctx, "gcp"); err != nil || got != "sa_json_secret_value" {
+		t.Fatalf("libsecret round trip failed: %q %v", got, err)
+	}
+	logged, _ := os.ReadFile(argLog)
+	if strings.Contains(string(logged), "sa_json_secret_value") || !strings.Contains(string(logged), "store --label=mintrun:gcp service mintrun:gcp account mintrun") {
+		t.Fatalf("unexpected secret-tool argv (secret must go via stdin):\n%s", logged)
+	}
+
+	// Deleting a libsecret-only key needs no passphrase and never creates vault.json.
+	t.Setenv("MINTRUN_VAULT_KEY", "")
+	if err := kv.DeleteSecret(ctx, "gcp"); err != nil {
+		t.Fatalf("delete without MINTRUN_VAULT_KEY: %v", err)
+	}
+	if _, err := kv.GetSecret(ctx, "gcp"); err == nil {
+		t.Fatal("expected secret to be gone after delete")
+	}
+	if _, err := os.Stat(kv.vaultFilePath()); !os.IsNotExist(err) {
+		t.Fatalf("libsecret-only usage must not create vault.json: %v", err)
+	}
+
+	// A failing secret-tool (no D-Bus session, locked keyring) falls back to the file vault.
+	t.Setenv("MINTRUN_VAULT_KEY", "mintrun-unit-test-passphrase")
+	if err := kv.SetSecret(ctx, "fail-key", "file_fallback_val"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := kv.GetSecret(ctx, "fail-key"); err != nil || got != "file_fallback_val" {
+		t.Fatalf("expected file-vault fallback, got %q %v", got, err)
+	}
+	if err := kv.DeleteSecret(ctx, "fail-key"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kv.GetSecret(ctx, "fail-key"); err == nil {
+		t.Fatal("expected fallback secret to be gone after delete")
 	}
 }
 
