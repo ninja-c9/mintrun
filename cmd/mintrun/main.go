@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -162,6 +163,7 @@ func cmdSecret(ctx context.Context, rt *core.Runtime, args []string) {
 		var val string
 		if len(args) >= 3 {
 			val = args[2]
+			fmt.Fprintln(os.Stderr, "mintrun: warning: a secret given as an argument is visible in shell history and `ps`; pipe it on stdin or use the prompt instead")
 		} else if fi, err := os.Stdin.Stat(); err == nil && fi.Mode()&os.ModeCharDevice == 0 {
 			// Piped or redirected (`< sa-key.json`): read it whole so multi-line secrets such as a
 			// GCP service-account key or a PEM survive intact (and stay off argv, audit M5).
@@ -172,9 +174,14 @@ func cmdSecret(ctx context.Context, rt *core.Runtime, args []string) {
 			val = string(b)
 		} else {
 			fmt.Fprintf(os.Stderr, "Enter master secret for %q: ", key)
+			hidden := setEcho(false)
 			sc := bufio.NewScanner(os.Stdin)
 			if sc.Scan() {
 				val = sc.Text()
+			}
+			if hidden {
+				setEcho(true) // not deferred: fatal exits without running defers
+				fmt.Fprintln(os.Stderr)
 			}
 		}
 		if err := vault.SetSecret(ctx, key, val); err != nil {
@@ -313,6 +320,18 @@ Usage:
   mintrun plugin remove <name>                                Remove an installed external plugin
   mintrun mcp                                                 Start MCP JSON-RPC 2.0 server over stdio
   mintrun audit                                               View zero-secret execution audit trail`)
+}
+
+// setEcho turns terminal echo on or off so a typed secret is not shown (the stdlib has no termios
+// API). It reports whether stty succeeded, which it does not when stdin is not a terminal.
+func setEcho(on bool) bool {
+	mode := "-echo"
+	if on {
+		mode = "echo"
+	}
+	cmd := exec.Command("/bin/stty", mode)
+	cmd.Stdin = os.Stdin
+	return cmd.Run() == nil
 }
 
 func fatal(format string, a ...any) {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -230,6 +231,36 @@ func TestCLISubcommandsEndToEnd(t *testing.T) {
 	}
 	if code, exited := runMainWithArgs(t, "", "mcp", "nonexistent_bridge"); !exited || code != 1 {
 		t.Fatal("expected exit 1 on unknown mcp bridge")
+	}
+}
+
+// TestCLISecretArgvWarning: a secret given on the command line still works, but warns that argv is
+// visible in shell history and `ps` (audit M5); a piped secret stays quiet.
+func TestCLISecretArgvWarning(t *testing.T) {
+	t.Setenv("MINTRUN_HOME", t.TempDir())
+	t.Setenv("MINTRUN_FILE_VAULT", "1")
+	t.Setenv("MINTRUN_VAULT", "keychain")
+	stderrOf := func(stdin string, args ...string) string {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		orig := os.Stderr
+		os.Stderr = w
+		_, exited := runMainWithArgs(t, stdin, args...)
+		os.Stderr = orig
+		_ = w.Close()
+		out, _ := io.ReadAll(r)
+		if exited {
+			t.Fatalf("%v exited: %s", args, out)
+		}
+		return string(out)
+	}
+	if out := stderrOf("", "secret", "set", "cloudflare", "cf_argv_secret_4242"); !strings.Contains(out, "visible in shell history") || strings.Contains(out, "cf_argv_secret_4242") {
+		t.Fatalf("expected an argv warning without the secret, got %q", out)
+	}
+	if out := stderrOf("gh_piped_secret_4242\n", "secret", "set", "github"); out != "" {
+		t.Fatalf("a piped secret must not warn, got %q", out)
 	}
 }
 
