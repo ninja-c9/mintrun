@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" width="100%" height="100%">
+  <defs>
+    <linearGradient id="pipeBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#090B10"/>
+      <stop offset="100%" stop-color="#0F141D"/>
+    </linearGradient>
+    <linearGradient id="stepCard" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#171C26"/>
+      <stop offset="100%" stop-color="#10141C"/>
+    </linearGradient>
+    <linearGradient id="lineAccent" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#34D399"/>
+      <stop offset="50%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#A78BFA"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="320" rx="24" fill="url(#pipeBg)"/>
+  <rect x="1" y="1" width="1198" height="318" rx="23" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1.5"/>
+
+  <text x="48" y="46" fill="#34D399" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif" font-size="11" font-weight="700" letter-spacing="1.5">ZERO-KNOWLEDGE EXECUTION LIFECYCLE</text>
+  <text x="48" y="74" fill="#FFFFFF" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif" font-size="22" font-weight="700">Five-Stage Ephemeral Lease Pipeline</text>
+
+  <!-- Connecting Line -->
+  <line x1="140" y1="185" x2="1060" y2="185" stroke="url(#lineAccent)" stroke-width="2.5" stroke-dasharray="6,5"/>
+
+  <!-- Step 1 -->
+  <g transform="translate(44, 104)">
+    <rect width="204" height="176" rx="16" fill="url(#stepCard)" stroke="#34D399" stroke-opacity="0.35" stroke-width="1.2"/>
+    <circle cx="32" cy="32" r="14" fill="#064E3B"/>
+    <text x="32" y="36.5" fill="#34D399" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12" font-weight="700" text-anchor="middle">01</text>
+    <text x="20" y="72" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif" font-size="16" font-weight="700">Policy Gate</text>
+    <text x="20" y="96" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif" font-size="12">Validates scope rules,</text>
+    <text x="20" y="114" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif" font-size="12">caps max TTL, blocks</text>
+    <text x="20" y="132" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif" font-size="12">env-dump commands.</text>
+    <text x="20" y="158" fill="#34D399" font-family="'SF Mono', Menlo, monospace" font-size="10.5">policy.json</text>
+  </g>
+
+  <!-- Step 2 -->
+  <g transform="translate(271, 104)">
+    <rect width="204" height="176" rx="16" fill="url(#stepCard)" stroke="#34D399" stroke-opacity="0.35" stroke-width="1.2"/>
+    <circle cx="32" cy="32" r="14" fill="#064E3B"/>
+    <text x="32" y="36.5" fill="#34D399" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12" font-weight="700" text-anchor="middle">02</text>
+    <text x="20" y="72" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif" font-size="16" font-weight="700">Vault Unlock</text>
+    <text x="20" y="96" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif" font-size="12">Fetches Master Secret</text>
+    <text x="20" y="114" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif" font-size="12">from macOS Keychain</text>
+    <text x="20" y="132" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif" font-size="12">into isolated RAM.</text>
+    <text x="20" y="158" fill="#34D399" font-family="'SF Mono', Menlo, monospace" font-size="10.5">/usr/bin/security</text>
+  </g>
+
+  <!-- Step 3 -->
+  <g transform="translate(498, 104)">
+    <rect width="204" height="176" rx="16" fill="url(#stepCard)" stroke="#38BDF8" stroke-opacity="0.4" stroke-width="1.2"/>
+    <circle cx="32" cy="32" r="14" fill="#0C4A6E"/>
+    <text x="32" y="36.5" fill="#38BDF8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12" font-weight="700" text-anchor="middle">03</text>
+    <text x="20" y="72" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif" font-size="16" font-weight="700">Scoped JIT Mint</text>
+    <text x="20" y="96" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif" font-size="12">Resolves target Zone ID</text>
+    <text x="20" y="114" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif" font-size="12">and mints disposable</text>
+    <text x="20" y="132" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif" font-size="12">least-privilege token.</text>
+    <text x="20" y="158" fill="#38BDF8" font-family="'SF Mono', Menlo, monospace" font-size="10.5">Provider.Mint()</text>
+  </g>
+
+  <!-- Step 4 -->
+  <g transform="translate(725, 104)">
+    <rect width="204" height="176" rx="16" fill="url(#stepCard)" stroke="#38BDF8" stroke-opacity="0.4" stroke-width="1.2"/>
+    <circle cx="32" cy="32" r="14" fill="#0C4A6E"/>
+    <text x="32" y="36.5" fill="#38BDF8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12" font-weight="700" text-anchor="middle">04</text>
+    <text x="20" y="72" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif" font-size="16" font-weight="700">Blind Exec &amp; Scrub</text>
+    <text x="20" y="96" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif" font-size="12">Injects leased env into</text>
+    <text x="20" y="114" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif" font-size="12">child CLI and scrubs</text>
+    <text x="20" y="132" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif" font-size="12">stdout/stderr leaks.</text>
+    <text x="20" y="158" fill="#38BDF8" font-family="'SF Mono', Menlo, monospace" font-size="10.5">[MINTRUN:REDACTED]</text>
+  </g>
+
+  <!-- Step 5 -->
+  <g transform="translate(952, 104)">
+    <rect width="204" height="176" rx="16" fill="url(#stepCard)" stroke="#A78BFA" stroke-opacity="0.45" stroke-width="1.2"/>
+    <circle cx="32" cy="32" r="14" fill="#3B0764"/>
+    <text x="32" y="36.5" fill="#C4B5FD" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="12" font-weight="700" text-anchor="middle">05</text>
+    <text x="20" y="72" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif" font-size="16" font-weight="700">Revoke &amp; Audit</text>
+    <text x="20" y="96" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif" font-size="12">Immediately destroys</text>
+    <text x="20" y="114" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif" font-size="12">sub-token via API and</text>
+    <text x="20" y="132" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif" font-size="12">logs zero-secret entry.</text>
+    <text x="20" y="158" fill="#C4B5FD" font-family="'SF Mono', Menlo, monospace" font-size="10.5">audit.jsonl</text>
+  </g>
+</svg>
