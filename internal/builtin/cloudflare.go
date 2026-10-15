@@ -626,9 +626,14 @@ func (a *AWSProvider) Mint(ctx context.Context, masterSecret string, req core.Mi
 	}, nil
 }
 
-func (a *AWSProvider) Revoke(_ context.Context, _ string, _ *core.Lease) error {
-	// AWS STS temporary credentials expire automatically when DurationSeconds elapses.
-	return nil
+// Revoke always fails for an STS lease: AWS cannot revoke one session's temporary credentials
+// early (IAM's revoke-sessions policy cuts off every session of the role), so ExecBlind reports
+// revoked=false and the credentials live until their expiry, at least 900s after minting.
+func (a *AWSProvider) Revoke(_ context.Context, _ string, lease *core.Lease) error {
+	if lease == nil || !lease.Ephemeral {
+		return nil
+	}
+	return fmt.Errorf("aws STS credentials cannot be revoked early; they expire at %s", lease.ExpiresAt.Format(time.RFC3339))
 }
 
 func hmacSHA256(key []byte, data string) []byte {
@@ -644,9 +649,22 @@ func signAWSSigV4(req *http.Request, accessKey, secretKey, region, service strin
 	payloadHex := hex.EncodeToString(payloadHash[:])
 
 	req.Header.Set("X-Amz-Date", amzDate)
-	host := req.URL.Host
-	canonicalHeaders := "content-type:" + req.Header.Get("Content-Type") + "\nhost:" + host + "\nx-amz-date:" + amzDate + "\n"
-	signedHeaders := "content-type;host;x-amz-date"
+	// Canonical headers, in sorted order; a header the request lacks is not signed. Signing
+	// the session token binds it to this request (audit L5).
+	var canonicalHeaders string
+	var signed []string
+	for _, h := range [][2]string{
+		{"content-type", req.Header.Get("Content-Type")},
+		{"host", req.URL.Host},
+		{"x-amz-date", amzDate},
+		{"x-amz-security-token", req.Header.Get("X-Amz-Security-Token")},
+	} {
+		if h[1] != "" {
+			canonicalHeaders += h[0] + ":" + h[1] + "\n"
+			signed = append(signed, h[0])
+		}
+	}
+	signedHeaders := strings.Join(signed, ";")
 
 	canonicalReq := strings.Join([]string{
 		req.Method,

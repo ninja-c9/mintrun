@@ -446,10 +446,13 @@ func TestAWSProviderComprehensive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Mock AWS STS server verifying SigV4 header & inline session policy
+	// Mock AWS STS server verifying SigV4 header & inline session policy. A session token is
+	// sent only with a signature that covers it (audit L5).
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "AWS4-HMAC-SHA256 Credential=") {
+		tokenSigned := strings.Contains(auth, "SignedHeaders=host;x-amz-date;x-amz-security-token,") ||
+			strings.Contains(auth, "SignedHeaders=content-type;host;x-amz-date;x-amz-security-token,")
+		if !strings.HasPrefix(auth, "AWS4-HMAC-SHA256 Credential=") || tokenSigned != (r.Header.Get("X-Amz-Security-Token") != "") {
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
@@ -477,6 +480,11 @@ func TestAWSProviderComprehensive(t *testing.T) {
 	if err != nil || !jitLease.Ephemeral || jitLease.Env["AWS_ACCESS_KEY_ID"] != "ASIAJIT123456" {
 		t.Fatalf("unexpected JIT STS lease: %+v err=%v", jitLease, err)
 	}
+	// STS credentials cannot be revoked early (audit M3): Revoke fails, so ExecBlind reports
+	// revoked=false, and names the expiry the lease lives until.
+	if err := aws.Revoke(ctx, "", jitLease); err == nil || !strings.Contains(err.Error(), "2026-10-15T12:00:00Z") {
+		t.Fatalf("expected an expires-only revoke error, got %v", err)
+	}
 	// Test upper TTL clamp (>43200) and error responses
 	if _, err := aws.Mint(ctx, "AKIA123456:secret123456", core.MintRequest{
 		Scope:      "arn:aws:iam::123456789012:role/DeployRole",
@@ -495,6 +503,24 @@ func TestAWSProviderComprehensive(t *testing.T) {
 		t.Fatal("expected STS XML parse error")
 	}
 }
+
+// TestAWSSigV4FixedVector pins signAWSSigV4 to the post-sts-header-before case of AWS's
+// published SigV4 test suite. The key, token and signature are AWS's documentation EXAMPLE
+// values, not real credentials. The session token must be a signed header (audit L5).
+func TestAWSSigV4FixedVector(t *testing.T) {
+	const token = "AQoDYXdzEPT//////////wEXAMPLEtc764bNrC9SAPBSM22wDOk4x4HIZ8j4FZTwdQWLWsKWHGBuFqwAeMicRXmxfpSPfIeoIYRqTflfKD8YUuwthAx7mSEI/qkPpKPi/kMcGdQrmGdeehM4IC1NtBmUpp2wUE8phUZampKsburEDy0KPkyQDYwT7WZ0wq5VSXDvp75YU9HFvlRd8Tx6q6fE8YQcHNVXAkiY9q6d+xo0rKwT38xVqr7ZD0u0iPPkUL64lIZbqBAz+scqKmlzm8FDrypNC9Yjc8fPOLn9FX9KSYvKTr4rvx3iSIlTJabIQwj2ICCR/oLxBA=="
+	req := httptest.NewRequest(http.MethodPost, "https://example.amazonaws.com/", nil)
+	req.Header.Set("X-Amz-Security-Token", token)
+	signAWSSigV4(req, "AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "us-east-1", "service", nil,
+		time.Date(2015, 8, 30, 12, 36, 0, 0, time.UTC))
+	want := "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, " +
+		"SignedHeaders=host;x-amz-date;x-amz-security-token, " +
+		"Signature=85d96828115b5dc0cfc3bd16ad9e210dd772bbebba041836c64533a82be05ead"
+	if got := req.Header.Get("Authorization"); got != want {
+		t.Fatalf("Authorization mismatch:\n got %s\nwant %s", got, want)
+	}
+}
+
 func TestFileVaultPassphraseRequiredPhase45PRC(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()

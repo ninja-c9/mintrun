@@ -142,7 +142,7 @@ func (m *MCPBridge) handleRequest(ctx context.Context, rt *core.Runtime, req jso
 				"tools": []map[string]any{
 					{
 						"name":        "mintrun_exec",
-						"description": "Execute a CLI command (e.g. wrangler, curl, terraform, gh) inside a zero-knowledge JIT credential lease. The credential is automatically minted, injected into the subprocess environment, scrubbed from stdout/stderr, and revoked upon exit.",
+						"description": "Execute a CLI command (e.g. wrangler, curl, terraform, gh) inside a zero-knowledge JIT credential lease. The credential is automatically minted, injected into the subprocess environment, scrubbed from stdout/stderr, and revoked upon exit where the provider allows it (AWS STS and GCP credentials can only expire; the result's revoked field reports which). Each output stream is capped at 4 MiB; truncated=true marks a cut.",
 						"inputSchema": execSchema,
 					},
 					{
