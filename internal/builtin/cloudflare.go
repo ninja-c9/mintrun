@@ -3,7 +3,14 @@ package builtin
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -318,12 +325,25 @@ func (g *GitHubProvider) Mint(ctx context.Context, masterSecret string, req core
 	}
 	expiresAt := time.Now().UTC().Add(10 * time.Minute)
 
-	// Format for JIT Installation Token minting: "<installation_id>:<app_jwt>" or Params["installation_id"].
+	// Format for JIT Installation Token minting:
+	// 1. "<app_id>:<installation_id>:<rsa_private_key_pem>" (auto-signs RS256 JWT)
+	// 2. "<installation_id>:<app_jwt>" or Params["installation_id"]
 	instID := req.Params["installation_id"]
 	bearer := masterSecret
 	if instID == "" && strings.Contains(masterSecret, ":") && !strings.HasPrefix(masterSecret, "gh") {
-		parts := strings.SplitN(masterSecret, ":", 2)
-		instID, bearer = parts[0], parts[1]
+		if strings.Contains(masterSecret, "-----BEGIN") {
+			parts := strings.SplitN(masterSecret, ":", 3)
+			if len(parts) == 3 {
+				jwtTok, err := signGitHubAppJWT(parts[0], parts[2])
+				if err != nil {
+					return nil, fmt.Errorf("sign github app JWT: %w", err)
+				}
+				instID, bearer = parts[1], jwtTok
+			}
+		} else {
+			parts := strings.SplitN(masterSecret, ":", 2)
+			instID, bearer = parts[0], parts[1]
+		}
 	}
 
 	if instID == "" || req.Params["mode"] == "static" || containsPerm(req.Permissions, "static") {
@@ -386,6 +406,34 @@ func (g *GitHubProvider) Mint(ctx context.Context, masterSecret string, req core
 	}, nil
 }
 
+func signGitHubAppJWT(appID, pemStr string) (string, error) {
+	block, _ := pem.Decode([]byte(strings.ReplaceAll(pemStr, `\n`, "\n")))
+	if block == nil {
+		return "", errors.New("invalid PEM block")
+	}
+	var rsaKey *rsa.PrivateKey
+	if k, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
+		rsaKey = k
+	} else if pkcs8, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
+		if k, ok := pkcs8.(*rsa.PrivateKey); ok {
+			rsaKey = k
+		}
+	}
+	if rsaKey == nil {
+		return "", errors.New("unsupported RSA private key format")
+	}
+	now := time.Now().UTC().Unix()
+	hdr := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
+	claims, _ := json.Marshal(map[string]any{"iat": now - 60, "exp": now + 540, "iss": appID})
+	unsigned := hdr + "." + base64.RawURLEncoding.EncodeToString(claims)
+	digest := sha256.Sum256([]byte(unsigned))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, rsaKey, crypto.SHA256, digest[:])
+	if err != nil {
+		return "", err
+	}
+	return unsigned + "." + base64.RawURLEncoding.EncodeToString(sig), nil
+}
+
 func (g *GitHubProvider) Revoke(ctx context.Context, _ string, lease *core.Lease) error {
 	if lease == nil || !lease.Ephemeral || lease.ID == "" || lease.ID == "gh-static" {
 		return nil
@@ -425,4 +473,5 @@ func (g *GitHubProvider) doGitHubJSON(ctx context.Context, token, method, path s
 	}
 	return nil
 }
+
 

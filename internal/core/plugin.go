@@ -3,6 +3,8 @@ package core
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -359,10 +361,15 @@ func InstallPlugin(ctx context.Context, pluginsDir, source string) (Manifest, er
 type remoteBundle struct {
 	Manifest
 	Script string `json:"script,omitempty"` // Self-contained executable script body for lightweight plugins
+	SHA256 string `json:"sha256,omitempty"` // Optional SHA-256 hex digest of Script for integrity verification
 }
 
-func installRemotePlugin(ctx context.Context, pluginsDir, url string) (Manifest, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func installRemotePlugin(ctx context.Context, pluginsDir, rawURL string) (Manifest, error) {
+	expectedHash := ""
+	if base, frag, ok := strings.Cut(rawURL, "#sha256="); ok {
+		rawURL, expectedHash = base, strings.ToLower(strings.TrimSpace(frag))
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return Manifest{}, err
 	}
@@ -372,7 +379,7 @@ func installRemotePlugin(ctx context.Context, pluginsDir, url string) (Manifest,
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return Manifest{}, fmt.Errorf("fetch plugin %s: HTTP %d", url, resp.StatusCode)
+		return Manifest{}, fmt.Errorf("fetch plugin %s: HTTP %d", rawURL, resp.StatusCode)
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
 	if err != nil {
@@ -384,6 +391,15 @@ func installRemotePlugin(ctx context.Context, pluginsDir, url string) (Manifest,
 	}
 	if bundle.Name == "" || bundle.Script == "" {
 		return Manifest{}, errors.New("remote plugin bundle requires name and script")
+	}
+	if expectedHash == "" && bundle.SHA256 != "" {
+		expectedHash = strings.ToLower(strings.TrimSpace(bundle.SHA256))
+	}
+	if expectedHash != "" {
+		sum := sha256.Sum256([]byte(bundle.Script))
+		if actual := hex.EncodeToString(sum[:]); actual != expectedHash {
+			return Manifest{}, fmt.Errorf("plugin %q SHA-256 mismatch: expected %s, got %s", bundle.Name, expectedHash, actual)
+		}
 	}
 	if bundle.Entrypoint == "" {
 		bundle.Entrypoint = "run"
