@@ -156,7 +156,7 @@ func defaultOSApproval(ctx context.Context, req ExecRequest) (bool, error) {
 	if runtime.GOOS != "darwin" {
 		return false, errors.New("interactive approval requires macOS osascript or custom ApprovalFunc")
 	}
-	msg := fmt.Sprintf("mintrun HITL Security Gate\\n\\nAllow AI agent to execute command?\\n• Provider: %s\\n• Scope: %s\\n• Command: %s",
+	msg := fmt.Sprintf("mintrun HITL Security Gate\n\nAllow AI agent to execute command?\n• Provider: %s\n• Scope: %s\n• Command: %s",
 		req.Provider, req.Scope, strings.Join(req.Command, " "))
 	script := fmt.Sprintf(`display dialog %q with title "mintrun Security Enclave" buttons {"Deny", "Allow"} default button "Allow" cancel button "Deny" with icon caution`, msg)
 	err := exec.CommandContext(ctx, "/usr/bin/osascript", "-e", script).Run()
