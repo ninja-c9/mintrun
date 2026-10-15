@@ -53,7 +53,9 @@ func bootRuntime() (*core.Runtime, error) {
 }
 
 func main() {
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// SIGHUP too: a blind command runs in its own process group (audit L2), so a terminal hangup
+	// no longer reaches it; cancelling the context kills that group, revokes the lease and audits.
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer cancel()
 
 	if len(os.Args) < 2 {

@@ -40,6 +40,7 @@ type ExecResult struct {
 	Ephemeral  bool   `json:"ephemeral"`
 	Revoked    bool   `json:"revoked"`
 	DurationMs int64  `json:"duration_ms"`
+	Truncated  bool   `json:"truncated,omitempty"` // stdout or stderr passed MaxOutputBytes and was cut
 }
 
 // AuditEntry is written to `~/.mintrun/audit.jsonl` for every mint/exec action.
@@ -56,6 +57,7 @@ type AuditEntry struct {
 	Revoked     bool     `json:"revoked"`
 	ExitCode    int      `json:"exit_code"`
 	DurationMs  int64    `json:"duration_ms"`
+	Truncated   bool     `json:"truncated,omitempty"`
 	Error       string   `json:"error,omitempty"`
 }
 
@@ -350,6 +352,8 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 	defer cancel()
 
 	cmd := exec.CommandContext(execCtx, req.Command[0], req.Command[1:]...)
+	killProcessGroup(cmd) // a timeout or cancel kills the child's whole process group (audit L2)
+	cmd.WaitDelay = PipeWaitDelay
 	if req.WorkingDir != "" {
 		cmd.Dir = req.WorkingDir
 	}
@@ -359,19 +363,19 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 	// names; otherwise the host env is inherited. Lease.Env always wins.
 	cmd.Env = childEnv(req.CleanEnv, rt.Policies[req.Provider].AllowedEnv, lease.Env)
 
-	var stdoutBuf, stderrBuf bytes.Buffer
-	cmd.Stdout = &stdoutBuf
-	cmd.Stderr = &stderrBuf
+	stdoutBuf := &cappedBuffer{limit: MaxOutputBytes}
+	stderrBuf := &cappedBuffer{limit: MaxOutputBytes}
+	cmd.Stdout = stdoutBuf
+	cmd.Stderr = stderrBuf
 
 	runErr := cmd.Run()
 	exitCode := 0
-	if runErr != nil {
-		var exitErr *exec.ExitError
-		if errors.As(runErr, &exitErr) {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = 1
-		}
+	var exitErr *exec.ExitError
+	switch {
+	case errors.As(runErr, &exitErr):
+		exitCode = exitErr.ExitCode()
+	case runErr != nil && !errors.Is(runErr, exec.ErrWaitDelay): // ErrWaitDelay follows a clean exit
+		exitCode = 1
 	}
 
 	// Revoke before returning so we can report accurate revocation status.
@@ -389,18 +393,21 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 	leaseID := Scrub(lease.ID, secrets)
 	redactSet := append(secrets, lease.ID)
 
+	stdout, outCut := stdoutBuf.scrubbed(redactSet)
+	stderr, errCut := stderrBuf.scrubbed(redactSet)
 	res := &ExecResult{
 		ExitCode:   exitCode,
-		Stdout:     Scrub(stdoutBuf.String(), redactSet),
-		Stderr:     Scrub(stderrBuf.String(), redactSet),
+		Stdout:     stdout,
+		Stderr:     stderr,
 		LeaseID:    leaseID,
 		Ephemeral:  lease.Ephemeral || revoked,
 		Revoked:    revoked,
 		DurationMs: time.Since(start).Milliseconds(),
+		Truncated:  outCut || errCut,
 	}
 
 	errMsg := ""
-	if runErr != nil && exitCode != 0 {
+	if runErr != nil {
 		errMsg = Scrub(runErr.Error(), redactSet)
 	}
 	rt.writeAudit(AuditEntry{
@@ -414,6 +421,7 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 		Revoked:     revoked,
 		ExitCode:    exitCode,
 		DurationMs:  res.DurationMs,
+		Truncated:   res.Truncated,
 		Error:       errMsg,
 	})
 
@@ -455,26 +463,78 @@ func Scrub(text string, secrets []string) string {
 	if text == "" {
 		return ""
 	}
-	out := text
 	for _, s := range secrets {
-		trimmed := strings.TrimSpace(s)
-		if len(trimmed) < 4 {
-			continue
+		for _, v := range scrubVariants(s) {
+			text = strings.ReplaceAll(text, v, RedactedPlaceholder)
 		}
-		variants := []string{
-			trimmed,
-			base64.StdEncoding.EncodeToString([]byte(trimmed)),
-			base64.RawStdEncoding.EncodeToString([]byte(trimmed)),
-			hex.EncodeToString([]byte(trimmed)),
-			url.QueryEscape(trimmed),
-		}
-		for _, v := range variants {
-			if len(v) >= 4 {
-				out = strings.ReplaceAll(out, v, RedactedPlaceholder)
+	}
+	return text
+}
+
+// scrubVariants lists the forms of one secret that Scrub redacts. A secret shorter than 4
+// characters after trimming is skipped, so every variant is at least 4 characters long.
+func scrubVariants(secret string) []string {
+	trimmed := strings.TrimSpace(secret)
+	if len(trimmed) < 4 {
+		return nil
+	}
+	return []string{
+		trimmed,
+		base64.StdEncoding.EncodeToString([]byte(trimmed)),
+		base64.RawStdEncoding.EncodeToString([]byte(trimmed)),
+		hex.EncodeToString([]byte(trimmed)),
+		url.QueryEscape(trimmed),
+	}
+}
+
+// Limits on a blind command, as vars so tests can shrink them.
+var (
+	// MaxOutputBytes caps how much of each child stream ExecBlind keeps (audit L1).
+	MaxOutputBytes = 4 << 20
+	// PipeWaitDelay bounds the wait, after the command exits or is killed, for output pipes still
+	// held by a process it left behind or that escaped the group kill (audit L2).
+	PipeWaitDelay = 5 * time.Second
+)
+
+// cappedBuffer keeps the first limit bytes written to it and counts the rest. Write never fails,
+// so the child is not killed by EPIPE for being chatty.
+type cappedBuffer struct {
+	buf     bytes.Buffer
+	limit   int
+	dropped int
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	n := min(len(p), max(c.limit-c.buf.Len(), 0))
+	c.buf.Write(p[:n])
+	c.dropped += len(p) - n
+	return len(p), nil
+}
+
+// scrubbed returns the kept output with secrets redacted, and whether the cap cut it. Scrub
+// matches whole secrets only, so a cut stream first loses any tail that starts a secret variant.
+// Trimming repeats until no tail starts one, because a trimmed tail can expose the start of
+// another (or of a whole secret ending exactly at the cap). A marker reports the bytes cut.
+func (c *cappedBuffer) scrubbed(secrets []string) (string, bool) {
+	out := c.buf.String()
+	if c.dropped == 0 {
+		return Scrub(out, secrets), false
+	}
+	end := len(out)
+	for trimmed := true; trimmed; {
+		trimmed = false
+		for _, s := range secrets {
+			for _, v := range scrubVariants(s) {
+				for k := min(len(v)-1, end); k > 0; k-- {
+					if strings.HasSuffix(out[:end], v[:k]) {
+						end, trimmed = end-k, true
+						break
+					}
+				}
 			}
 		}
 	}
-	return out
+	return Scrub(out[:end], secrets) + fmt.Sprintf("\n[MINTRUN:TRUNCATED %d bytes]\n", c.dropped+len(out)-end), true
 }
 
 // leaseSecrets lists every value that must never leave the enclave: the master secret plus

@@ -11,9 +11,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ninja-c9/mintrun/internal/builtin"
 	"github.com/ninja-c9/mintrun/internal/core"
@@ -913,6 +915,98 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 	t.Setenv("MINTRUN_APPROVE", "1")
 	if d := rt.CheckPolicy(probe("ok.com", []string{"dns:read"}, "true")); !d.ApprovalRequired || approvals != 1 {
 		t.Fatalf("MINTRUN_APPROVE=1 must require approval without prompting: %+v approvals=%d", d, approvals)
+	}
+}
+
+// probeRuntime is a runtime whose "probe" provider injects nothing, so the vault's master
+// secret (and the lease ID) are the only values ExecBlind redacts.
+func probeRuntime(t *testing.T, master string) (*core.Runtime, string) {
+	t.Helper()
+	home := t.TempDir()
+	reg := core.NewRegistry()
+	vault := &builtin.KeychainVault{HomeDir: home, ForceFile: true}
+	_ = reg.Register(vault)
+	_ = reg.Register(ttlProbe{new(int)})
+	if err := vault.SetSecret(context.Background(), "probe", master); err != nil {
+		t.Fatal(err)
+	}
+	return core.NewRuntime(home, "keychain", reg), home
+}
+
+// TestExecBlindOutputCap covers audit L1: each stream keeps its first MaxOutputBytes, no byte of
+// a secret cut by the cap survives, and the cut is reported in the output and the audit log.
+func TestExecBlindOutputCap(t *testing.T) {
+	defer func(n int) { core.MaxOutputBytes = n }(core.MaxOutputBytes)
+	core.MaxOutputBytes = 64
+	// Starts and ends with "c", and URL-encodes differently from its raw form, so a whole copy
+	// ending exactly at the cap is only removed if trimming repeats until no tail starts a secret.
+	const secret = "cap/probe_master_secret_c"
+	rt, home := probeRuntime(t, secret)
+	for _, tc := range []struct {
+		name, script, want string
+		truncated          bool
+	}{
+		{"fits exactly", `printf '%064d' 0`, strings.Repeat("0", 64), false},
+		// 10 + 25 + 10 bytes, then the cap falls 19 bytes into the second copy.
+		{"secret straddles the cap", `printf '%010d%s%010d%s%0100d' 0 "$1" 0 "$1" 0`,
+			"0000000000" + core.RedactedPlaceholder + "0000000000\n[MINTRUN:TRUNCATED 125 bytes]\n", true},
+		{"secret ends at the cap", `printf '%039d%s0000' 0 "$1"`,
+			strings.Repeat("0", 39) + "\n[MINTRUN:TRUNCATED 29 bytes]\n", true},
+	} {
+		res, err := rt.ExecBlind(context.Background(), core.ExecRequest{
+			MintRequest: core.MintRequest{Provider: "probe"},
+			Command:     []string{"sh", "-c", tc.script, "sh", secret},
+		})
+		if err != nil || res.ExitCode != 0 {
+			t.Fatalf("%s: exec failed: res=%+v err=%v", tc.name, res, err)
+		}
+		if res.Stdout != tc.want || res.Truncated != tc.truncated {
+			t.Fatalf("%s: got stdout %q truncated=%v, want %q truncated=%v", tc.name, res.Stdout, res.Truncated, tc.want, tc.truncated)
+		}
+		raw, _ := os.ReadFile(filepath.Join(home, "audit.jsonl"))
+		lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+		if last := lines[len(lines)-1]; strings.Contains(last, `"truncated":true`) != tc.truncated || strings.Contains(last, secret) {
+			t.Fatalf("%s: audit entry %s", tc.name, last)
+		}
+	}
+}
+
+// TestExecBlindKillsProcessGroup covers audit L2: a timeout kills the child's whole process group,
+// so a grandchild holding the output pipe cannot outlive the command or keep ExecBlind waiting.
+func TestExecBlindKillsProcessGroup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process groups are Unix-only")
+	}
+	rt, home := probeRuntime(t, "probe_master_secret_pgid")
+	start := time.Now()
+	// sh forks sleep because a command follows it. Killing only sh would leave sleep holding
+	// stdout, and ExecBlind would wait for the pipe until WaitDelay (5s).
+	res, err := rt.ExecBlind(context.Background(), core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "probe"},
+		Command:     []string{"sh", "-c", "sleep 30; true"},
+		TimeoutSec:  1,
+	})
+	if err != nil || res.ExitCode == 0 {
+		t.Fatalf("expected a killed command, got res=%+v err=%v", res, err)
+	}
+	if d := time.Since(start); d > 4*time.Second {
+		t.Fatalf("timeout left the grandchild holding the pipe: ExecBlind took %v", d)
+	}
+
+	// A clean exit that leaves a background process holding stdout keeps exit code 0: ExecBlind
+	// stops waiting for the pipe after PipeWaitDelay and records why in the audit log.
+	defer func(d time.Duration) { core.PipeWaitDelay = d }(core.PipeWaitDelay)
+	core.PipeWaitDelay = 100 * time.Millisecond
+	res, err = rt.ExecBlind(context.Background(), core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "probe"},
+		Command:     []string{"sh", "-c", "sleep 3 & echo started"},
+	})
+	if err != nil || res.ExitCode != 0 || res.Stdout != "started\n" {
+		t.Fatalf("expected a clean exit despite the held pipe, got res=%+v err=%v", res, err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(home, "audit.jsonl"))
+	if !strings.Contains(string(raw), "WaitDelay expired") {
+		t.Fatalf("audit log does not record the held pipe:\n%s", raw)
 	}
 }
 
