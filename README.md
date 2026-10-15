@@ -379,7 +379,7 @@ Place a `plugin.json` manifest and an executable entrypoint inside `~/.mintrun/p
 
 ## Verification & Testing
 
-`mintrun` ships with a deterministic, offline unit and integration test suite (92.6% total statement coverage, measured) that mocks Cloudflare, GitHub App RS256, AWS STS SigV4 (plus a fixed AWS signing vector), and Google OAuth2 JWT-bearer APIs plus the macOS `security` and Linux `secret-tool` CLIs, checks child environment isolation, the output cap, and the process-group kill, verifies AES-256-GCM encryption at rest, tests multi-encoding leak scrubbing, enforces policy guardrails, and validates external plugin execution and the governance tools over MCP. It never touches the real Keychain:
+`mintrun` ships with a deterministic, offline unit and integration test suite (92.7% total statement coverage, measured) that mocks Cloudflare, GitHub App RS256, AWS STS SigV4 (plus a fixed AWS signing vector), and Google OAuth2 JWT-bearer APIs plus the macOS `security` and Linux `secret-tool` CLIs, checks child environment isolation, the output cap, and the process-group kill, verifies AES-256-GCM encryption at rest, tests multi-encoding leak scrubbing, enforces policy guardrails, and validates external plugin execution and the governance tools over MCP. It never touches the real Keychain:
 
 ```bash
 go test -v -cover ./...
