@@ -13,7 +13,7 @@
 | **`v0.7.0` — GitHub Installation Binding** | ✅ Done | Consistent GitHub master secret parsing with `params.installation_id`; `github` refuses a `params.installation_id` that differs from the installation pinned in the stored credential; policy `allowed_installations` (exact, fail-closed, enforced in `CheckPolicy` for both `ExecBlind` and `mintrun_policy_check`); `params` in the MCP input schema; `92.7%` verified statement coverage |
 | **`v0.8.0` — Secrets Off argv, Bounded Audit Reads & Long Keychain Secrets** | ✅ Done | 1Password `secret set` pipes the secret to `op item create` on `stdin` and archives older items with the same title; `mintrun audit` and MCP `mintrun_audit` stream `audit.jsonl` through `core.TailAudit`, so memory no longer grows with the log; macOS Keychain secrets too long for one `security -i` line are stored as up to 16 checksummed parts (24,000 bytes); the hidden `secret set` prompt is tested with a stub `stty`; `93.6%` verified statement coverage |
 | **`v0.9.0` — Keystore Cleanup, Example Plugins & Phone Approval** | ✅ Done | A `secret set` that falls back to the file vault after a failed Keychain or libsecret store removes the older keystore item for the key, which used to shadow the new secret on read, or fails with an error saying that item still wins; a successful Keychain or libsecret store removes the older file-vault copy of the key, which a failed keystore lookup used to return, or warns that it may remain when `MINTRUN_VAULT_KEY` is not set to decrypt `vault.json`; README documents `MINTRUN_FILE_VAULT=1` for a host whose keystore cannot be reached; Three plugins in `examples/plugins/` that install from a clone (a `bitwarden` vault; `vercel` and `postgres-jit` providers; Python 3.9+ standard library), tested through the CLI against a stub `bw`, a stub `psql`, and a local Vercel API, with `postgres-jit` also run against real PostgreSQL 15 and 16; `-approve` and `require_approval` ask the macOS dialog and a Telegram bot at once and the first answer wins (`approval-telegram` in the default vault; no answer within 10 minutes is not an approval); `94.0%` verified statement coverage, measured in a `git archive v0.9.0` export |
-| **Unreleased — Quoted Approval Text** | ⏳ Untagged | The macOS approval dialog and the Telegram message show the same text, built by `core.ApprovalText`: every field an agent sets (provider, scope, permissions, params, argv) is quoted, so a line break in an argument shows as `\n` and cannot fake a `Command:` line or push the command out of view, and a control character no longer stops the dialog from opening; the dialog now shows permissions and params and cuts a long request with a TRUNCATED warning; `94.0%` verified statement coverage |
+| **Unreleased — Quoted Approval Text & Slack Approval** | ⏳ Untagged | The macOS approval dialog and the Telegram message show the same text, built by `core.ApprovalText`: every field an agent sets (provider, scope, permissions, params, argv) is quoted, so a line break in an argument shows as `\n` and cannot fake a `Command:` line or push the command out of view, and a control character no longer stops the dialog from opening; the dialog now shows permissions and params and cuts a long request with a TRUNCATED warning; `-approve` and `require_approval` also ask through a Slack bot, which DMs the request and takes the stored user's ✅ or ❌ reaction (`approval-slack` in the default vault; it polls, so no public URL is needed; no answer within 10 minutes is not an approval); `94.1%` verified statement coverage |
 
 ---
 
@@ -24,7 +24,7 @@
 - **Security Audit Report:** [audit.md](audit.md)
 - **Pipeline Status:**
   - `gofmt -s -l cmd internal examples` and `go vet ./...`: clean (`0` issues)
-  - `go test -count=1 -cover ./...` (without build tags): **93.9%** total statement coverage (`cmd/mintrun` 94.3%, `internal/builtin` 93.6%, `internal/core` 94.3%)
+  - `go test -count=1 -cover ./...` (without build tags): **94.1%** total statement coverage (`cmd/mintrun` 94.3%, `internal/builtin` 93.9%, `internal/core` 94.3%)
   - `go test -race -count=1 ./...`: pass (`0` data races)
   - `go build -trimpath -o mintrun ./cmd/mintrun && ./mintrun plugin list`: pass (`7` built-in plugins registered, `0` local path strings in binary)
   - Cross-compilation (`GOOS=linux`, `GOOS=windows`, `GOOS=freebsd`): pass
@@ -36,11 +36,10 @@
 - **Child Sandbox (`sandbox: true`):** keep the blind command out of `~/.mintrun` and the Keychain with a macOS `sandbox-exec` profile; designed with spike evidence in [plan.md](plan.md) §3 item 1, awaiting approval. `no_network` stays open.
 - **Team Relay (`mintrun relay`):** a server that holds the masters and hands laptops leases only; designed in [plan.md](plan.md) §3 item 6, awaiting approval.
 - **Live 1Password Verification:** Run `mintrun secret set`, `check`, and `rm` against a real 1Password account; the `stdin` item template and the archiving of older items are tested against a mock `op` only.
-- **Linux Host Verification:** Verify `secret-tool`, and `-approve` with Telegram as the only channel, on a Linux host.
-- **Live Telegram, Bitwarden & Vercel Verification:** Telegram approval, the `bitwarden` vault, and the `vercel` provider are tested against a local Bot API, a stub `bw`, and a local Vercel API only; run each against a real bot or account before calling it verified. The steps are in [plan.md](plan.md) §3 item 3.
-- **Two-Way Slack Approval:** Not built, because an incoming webhook only sends. It needs a Slack app token, `chat.postMessage`, and polling for the answer; Socket Mode needs WebSockets, which the standard library lacks.
+- **Linux Host Verification:** Verify `secret-tool`, and `-approve` with Telegram and Slack as the only channels, on a Linux host.
+- **Live Telegram, Slack, Bitwarden & Vercel Verification:** Telegram and Slack approval, the `bitwarden` vault, and the `vercel` provider are tested against a local Bot API, a local Slack Web API, a stub `bw`, and a local Vercel API only; run each against a real bot, workspace, or account before calling it verified. The steps are in [plan.md](plan.md) §3 items 3 and 4.
 - **Audit Read Time:** `TailAudit` bounds memory but still scans the whole log on every read; seek back from the end if it reaches gigabytes.
-- **Approval Text Gaps:** The macOS dialog's default button is "Allow", so Return approves; `strconv.Quote` keeps look-alike letters and combining marks as written (the look-alike row in [checks.md](checks.md)); neither approver shows `Vault` or `WorkingDir`, both of which an agent sets.
+- **Approval Text Gaps:** The macOS dialog's default button is "Allow", so Return approves; `strconv.Quote` keeps look-alike letters and combining marks as written (the look-alike row in [checks.md](checks.md)); no approver shows `Vault` or `WorkingDir`, both of which an agent sets.
 
 ---
 
@@ -78,4 +77,13 @@
 - **Outputs:** sửa `internal/core/runner.go`, `internal/core/core_test.go`, `internal/builtin/telegram.go`.
 - **Kiểm chứng:** dòng Approval Text trong `checks.md`; 7/7 mutant đều bị `TestOSApproval` bắt; `osascript` thật đọc literal của hộp thoại ra đúng văn bản từng byte.
 - **Chưa xử lý:** mục Approval Text Gaps ở phần 3.
+- **Next step:** tag bản mới khi bạn đồng ý.
+
+## Checkpoint — Duyệt lệnh qua Slack (2026-10-16)
+
+- **Hoàn thành:** Workstream L. `-approve`, `MINTRUN_APPROVE=1` và `require_approval` hỏi thêm qua một bot Slack, song song với hộp thoại macOS và Telegram: bot nhắn riêng (DM) cho bạn, gắn sẵn ✅ và ❌, rồi đọc reaction mỗi 3 giây. Không cần URL công khai hay WebSocket.
+- **Outputs:** `internal/builtin/slack.go`, `internal/builtin/slack_test.go`; sửa `cmd/mintrun/main.go`, `README.md`, `AGENTS.md` (luật 4 và 31, thêm luật 34), `plan.md`, `checks.md`, `progress.md`.
+- **Quyết định:** cấu hình `approval-slack` (`<user_id>:<bot_token>`) chỉ đọc từ vault mặc định; chỉ reaction của đúng user đó được tính, ❌ thắng ✅; lỗi API (kể cả thiếu scope), quá 10 phút hay bị huỷ đều là lỗi, không bao giờ là duyệt; 429 thì chờ theo `Retry-After`; văn bản dùng chung `core.ApprovalText`, thoát `&`, `<`, `>`, và cắt trước khi thoát để bản đã thoát vừa 3.500 byte.
+- **Kiểm chứng:** dòng Slack Approval trong `checks.md`; 31/31 mutant đều bị `TestSlackApproval` bắt.
+- **Chưa kiểm chứng:** workspace Slack thật (cần token thật và sự đồng ý của bạn); máy Linux.
 - **Next step:** tag bản mới khi bạn đồng ý.

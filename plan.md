@@ -131,7 +131,7 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
 - **Files:** `internal/core/runner.go`, `internal/core/core_test.go`, `internal/builtin/telegram.go`, `internal/builtin/telegram_test.go`, `cmd/mintrun/main.go`
 - **Deliverables:**
   1. `[SERIAL]` `core.OSApproval` (the macOS dialog, now exported) reports Deny as `(false, nil)` and a dialog that could not be shown as an error. `core.FirstApproval` asks several approvers at once: the first answer, allow or deny, wins and closes the others; an approver that fails drops out, and only when all fail is their joined error returned.
-  2. `[PARALLEL]` `builtin.TelegramApproval` sends the request to a private Telegram chat with Allow and Deny buttons and long-polls `getUpdates` for a tap from that user carrying the message's random nonce. The bot token and user ID are read at approval time from the default vault (`approval-telegram`, never `req.Vault`), every error is scrubbed of the token, and agent-controlled fields are quoted so they cannot forge lines of the message. A Slack incoming webhook is one-way and cannot approve, so it is not built.
+  2. `[PARALLEL]` `builtin.TelegramApproval` sends the request to a private Telegram chat with Allow and Deny buttons and long-polls `getUpdates` for a tap from that user carrying the message's random nonce. The bot token and user ID are read at approval time from the default vault (`approval-telegram`, never `req.Vault`), every error is scrubbed of the token, and agent-controlled fields are quoted so they cannot forge lines of the message. A Slack incoming webhook is one-way and cannot approve; two-way Slack came later, in Workstream L.
   3. `[SERIAL]` `bootRuntime` sets `ApprovalFunc` to `FirstApproval(OSApproval, TelegramApproval(rt))`.
 - **Verification:**
   ```bash
@@ -160,6 +160,24 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
   go test -count=1 -v -run 'TestTelegramApproval' ./internal/builtin
   ```
 
+### Workstream L — Slack Approval
+- **Files:** `internal/builtin/slack.go`, `internal/builtin/slack_test.go`, `cmd/mintrun/main.go`
+- **Design** (checked against Slack's Web API reference on 2026-10-16): Slack's interactive buttons post the tap to a public Request URL, and Socket Mode needs a WebSocket client, which the standard library lacks. So `mintrun` posts the request and polls for a reaction, which needs no endpoint of its own:
+  1. `chat.postMessage` with `channel=<user_id>` posts into the bot's DM with that user and returns the DM's channel ID and the message `ts`. The text is plain (`mrkdwn=false`, `parse=none`, `link_names=false`, no unfurls), quotes every agent-controlled field as Telegram does, and escapes `&`, `<`, `>` to the entities Slack shows as text, so no field can open a `<!channel>`, `<@U…>`, or `<url|label>` sequence. `core.ApprovalText` (Workstream J) cuts the raw text short enough that its escaped form fits in 3,500 bytes, because `chat.update` refuses text over 4,000 characters; escaping after the cut never splits an entity.
+  2. `reactions.add` puts ✅ (`white_check_mark`) and ❌ (`x`) on the message, so one tap answers. Both must succeed before polling starts.
+  3. `reactions.get` with `full=true` (the complete `users` list) runs every 3 s. Only a reaction whose `users` holds the stored user ID counts, so the bot's own reactions never do, and ❌ wins over ✅. A config naming the bot itself therefore reads as both, a denial.
+  4. `chat.update` replaces the prompt with the outcome, best effort, even after the context is cancelled.
+  - The config is `<user_id>:<bot_token>` in the default vault's `approval-slack` (never `req.Vault`), for a bot with the `chat:write`, `reactions:read`, and `reactions:write` scopes. The token travels in `Authorization: Bearer` on form-encoded POSTs.
+  - Failures: HTTP 429 waits `Retry-After` seconds (at least the poll interval) before the next poll. A network error, HTTP 5xx, or malformed reply is retried. An API error (`ok: false`, such as `missing_scope`, `invalid_auth`, or `channel_not_found`) ends the wait with that error, because retrying will not fix it. No answer within 10 minutes, or a cancelled context, is an error. None of these is ever an approval, and every error is scrubbed of the token.
+- **Limits:** an answer is seen within about 3 s, not at once, and each pending request spends about 20 `reactions.get` calls a minute from the app's Tier 3 quota (50+ a minute, shared by parallel requests). The request (provider, scope, permissions, params, argv) passes through Slack's servers and stays in the DM. Other emoji are ignored. Tested only against a mock Slack Web API, never a real workspace.
+- **Deliverables:**
+  1. `[SERIAL]` `builtin.SlackApproval(rt)` and its hermetic test against an `httptest` Slack API, with one mutant per security condition run on a copy of the repo.
+  2. `[SERIAL]` `bootRuntime` sets `ApprovalFunc` to `FirstApproval(OSApproval, TelegramApproval(rt), SlackApproval(rt))`, and the `-approve` help names `approval-slack`.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestSlackApproval|TestTelegramApproval' ./internal/builtin
+  ```
+
 ---
 
 ## 3. Deferred Backlog (Next Actionable Items)
@@ -186,15 +204,16 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
    - **Tests:** the denials (no `sandbox-exec`, Linux) pinned in `TestCheckPolicyMatchesExecBlind`; a stub `sandbox-exec` that records the profile and the resolved paths; a `-tags integration` test that runs the real profile against a throwaway home and Keychain item.
    - **`no_network` stays open:** every built-in provider's CLI calls a network API, so it fits offline commands only, and a macOS `(deny network*)` also blocks Unix sockets (`ssh-agent`, Docker).
 2. **Linux Host Verification:**
-   - Run integration tests against real `secret-tool` on Linux, and `-approve` with Telegram as the only channel (`OSApproval` is macOS-only).
+   - Run integration tests against real `secret-tool` on Linux, and `-approve` with Telegram and Slack as the only channels (`OSApproval` is macOS-only).
 3. **Live Runs: Telegram, 1Password, Bitwarden & Vercel:**
    - These have run only against stand-ins (a local Bot API, a mock `op`, a stub `bw`, a local Vercel API). The user runs each check below with a throwaway bot or account of their own, and `checks.md` §3 turns `pass` only on that run's output.
    - **Telegram:** create a bot with @BotFather and send it `/start`, store `<user_id>:<bot_token>` at the hidden prompt of `./mintrun secret set approval-telegram`, then run `./mintrun exec -approve -provider <p> -scope <s> -- true` three times, with `<p>` a provider whose master secret is already stored: tap Allow (the command runs), tap Deny (it does not), and on macOS click the dialog first (the Telegram message is edited to show the outcome). `audit.jsonl` gets one entry per run, and no output holds the token.
    - **1Password:** after `op signin`, `MINTRUN_VAULT=1password ./mintrun secret set mintrun-live-test`, then `secret check`, `secret set` again (one active item remains and the older one is archived), and `secret delete`.
    - **Bitwarden:** `./mintrun plugin install bitwarden`, `export BW_SESSION="$(bw unlock --raw)"`, then `MINTRUN_VAULT=bitwarden ./mintrun secret set mintrun-live-test`, `secret check`, and `secret delete` (the note moves to the trash).
    - **Vercel:** `./mintrun plugin install vercel`, store a Vercel token with `./mintrun secret set vercel`, then `./mintrun exec -provider vercel -ttl 300 -- npx vercel whoami` (the minted token works) and `-- sleep 60`: the account's token list shows the new token while the command runs, and it is gone after the command exits.
-4. **Two-Way Slack Approval:**
-   - Deferred: an incoming webhook only sends, so it cannot carry an answer back. A Slack app could post with `chat.postMessage` and poll `conversations.replies` or `reactions.get` with the standard library; Socket Mode needs WebSockets, which the standard library lacks. Build it when a user asks for Slack.
+4. **Live Slack Approval Run:**
+   - Slack approval has run only against a local Slack Web API. The user runs this check with a throwaway workspace and app of their own, and `checks.md` §3 "Live Slack Web API" turns `pass` only on that run's output.
+   - Create the app and store `<user_id>:<bot_token>` at the hidden prompt of `./mintrun secret set approval-slack` as README "Approve From Your Phone" says, then run `./mintrun exec -approve -provider <p> -scope <s> -- true` three times, with `<p>` a provider whose master secret is already stored: react ✅ (the command runs), react ❌ (it does not), and on macOS click the dialog first (the Slack message is edited to show the outcome). `audit.jsonl` gets one entry per run, and no output holds the token.
 5. **GCP `token_uri` From the Service-Account Key:**
    - Deferred: only keys outside the default Google universe carry a different `token_uri`, and honoring it also means sending revocation to that universe. Add it when such a key is in use.
 6. **Team Relay (`mintrun relay`), design only, awaiting approval:**

@@ -15,7 +15,7 @@ Engineered with **100% Go standard library**, **zero external dependencies**, an
   <a href="https://github.com/ninja-c9/mintrun/blob/main/go.mod"><img src="https://img.shields.io/badge/Go-1.24.0-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go 1.24.0" /></a>
   <a href="#architecture-everything-is-a-plugin"><img src="https://img.shields.io/badge/Dependencies-Zero_(100%25_stdlib)-10B981?style=flat-square" alt="Zero Dependencies" /></a>
   <a href="#ai-agent-integration-mcp"><img src="https://img.shields.io/badge/MCP-JSON--RPC_2.0_Ready-38BDF8?style=flat-square" alt="MCP Ready" /></a>
-  <a href="#verification--testing"><img src="https://img.shields.io/badge/Coverage-94.0%25_Verified-A78BFA?style=flat-square" alt="94.0% Coverage" /></a>
+  <a href="#verification--testing"><img src="https://img.shields.io/badge/Coverage-94.1%25_Verified-A78BFA?style=flat-square" alt="94.1% Coverage" /></a>
 </p>
 
 <p align="center">
@@ -54,7 +54,7 @@ Yet every existing way of handing credentials to an agent forces a bad trade-off
 | **What the child CLI receives** | Account-wide permanent credential | Account-wide permanent credential | **Narrowly scoped JIT sub-token** locked to 1 zone, 1 repo, 1 IAM role ARN, or specific OAuth2 scopes |
 | **Token lifetime** | Weeks, months, or never rotated | Weeks, months, or never rotated | **Seconds to minutes.** Cloudflare & GitHub sub-tokens are deleted (`DELETE`) the instant the command exits; AWS STS & GCP tokens cannot be revoked early and expire on their own (AWS ≥ 15 min, GCP ≤ 1 h) |
 | **Stdout / Stderr scrubbing** | None | Exact raw string match only | **5-Encoding Scrubber** redacts Raw, Base64, RawBase64, Hex, and URL-encoded forms with `[MINTRUN:REDACTED]` |
-| **Exfiltration & policy gate** | None | None | **Fail-closed `policy.json`** blocks `env`/`printenv`, restricts scopes/permissions, isolates child env, and can ask a human first (macOS dialog or Telegram) |
+| **Exfiltration & policy gate** | None | None | **Fail-closed `policy.json`** blocks `env`/`printenv`, restricts scopes/permissions, isolates child env, and can ask a human first (macOS dialog, Telegram, or Slack) |
 | **Supply-chain footprint** | N/A | Dozens to hundreds of external packages | **0 external dependencies.** 100% Go 1.24 standard library |
 
 > **Design Principle — Separate Authority from Possession:**
@@ -130,8 +130,10 @@ mintrun/
 │       ├── cloudflare.go                 # Built-in Cloudflare, GitHub (RS256 JWT), AWS STS (SigV4) & GCP (JWT bearer) providers
 │       ├── mcp.go                        # MCP JSON-RPC 2.0 stdio bridge server
 │       ├── telegram.go                   # Telegram approval channel (Bot API long polling)
+│       ├── slack.go                      # Slack approval channel (polls a DM's reactions)
 │       ├── builtin_test.go               # Comprehensive provider, vault, and MCP unit test suite
 │       ├── telegram_test.go              # Telegram approval against a local Bot API
+│       ├── slack_test.go                 # Slack approval against a local Web API
 │       └── keychain_integration_test.go  # Real macOS Keychain round trip (`-tags integration` only)
 ├── examples/plugins/                     # Plugins built into the binary (`plugin install <name>`): bitwarden (vault), vercel & postgres-jit (providers)
 └── docs/
@@ -283,9 +285,11 @@ Connect `mintrun` to **Google Antigravity**, **Claude Code**, **Cursor**, or **W
 | **`mintrun_policy_check`** | Dry-runs a `mintrun_exec` request against `policy.json` and the anti-exfiltration guard, through the same gate `mintrun_exec` enforces. Never opens the vault, mints, runs the command, or asks a human. Returns `allowed`, the denial `reason` (the exact error `mintrun_exec` would return), `approval_required`, `ttl_seconds` (the TTL requested from the provider after `max_ttl_seconds`; `gcp` tokens always live up to 1h), and `clean_env`. | Same as `mintrun_exec` |
 | **`mintrun_audit`** | Returns recent audit entries, oldest first, filtered like `mintrun audit`. Each command is cut to its binary name plus `[MINTRUN:REDACTED]`: a policy-denied entry keeps the raw `argv` (no secret is loaded yet to scrub against), and a secret typed into `argv` is one the runner never holds, so arguments never reach an agent. The on-disk log keeps the full `argv` for the operator. | `provider` (case-insensitive), `failed_only`, `limit` (default 20, max 100) |
 
-### Approve From Your Phone (Telegram)
+### Approve From Your Phone (Telegram or Slack)
 
-`mintrun exec -approve`, `MINTRUN_APPROVE=1` in `mintrun`'s environment, and `"require_approval": true` in a provider's policy ask a human before anything is minted; the last two also cover an agent's `mintrun_exec` calls. On macOS a dialog asks. With a Telegram bot set up, your phone is asked at the same time, so you can approve an agent's commands away from the machine. The first answer, from either, wins and closes the other.
+`mintrun exec -approve`, `MINTRUN_APPROVE=1` in `mintrun`'s environment, and `"require_approval": true` in a provider's policy ask a human before anything is minted; the last two also cover an agent's `mintrun_exec` calls. On macOS a dialog asks. With a Telegram or Slack bot set up (or both), your phone is asked at the same time, so you can approve an agent's commands away from the machine. The first answer, from any of them, wins and closes the others.
+
+**Telegram:**
 
 1. Create a bot for `mintrun` alone with [@BotFather](https://t.me/BotFather), and send it `/start` from your account so it may message you.
 2. Store your numeric Telegram user ID (not your @username) and the bot token in the default vault:
@@ -294,13 +298,25 @@ Connect `mintrun` to **Google Antigravity**, **Claude Code**, **Cursor**, or **W
 mintrun secret set approval-telegram    # enter <user_id>:<bot_token>
 ```
 
-- **Only your tap on this request's message counts.** A tap from another account, or on another request's message, is ignored. The message is then edited to show the outcome.
-- **Ten minutes, then no.** Telegram gives up after 10 minutes and the request is not approved, while the macOS dialog, which has no timeout, keeps waiting. On Linux, where there is no dialog, Telegram is the only channel. With neither, `-approve` fails closed.
-- **A bot of its own.** `mintrun` reads taps with `getUpdates`, which Telegram refuses while the bot has a webhook.
-- **The default vault only.** The setting is read from the default vault (`MINTRUN_VAULT`, or `keychain`), never from the vault a request names, so an agent cannot send approvals to a bot it controls.
-- **Every field quoted.** The dialog and the message show each field an agent sets in quotes, so a line break in an argument shows as `\n` and cannot pose as a line of the request. A request too long to show ends in a TRUNCATED warning: deny it unless you know the rest.
-- **What Telegram sees.** The message carries the provider, scope, permissions, params, and command through Telegram's servers. It holds no secret, because approval comes before any secret is loaded, but a secret typed into the command's arguments would be in it.
-- **No Slack.** A Slack incoming webhook only sends, so it cannot carry your answer back.
+**Slack:**
+
+1. Create an app for `mintrun` alone at [api.slack.com/apps](https://api.slack.com/apps), give its bot the `chat:write`, `reactions:read`, and `reactions:write` scopes, and install it to your workspace.
+2. Store your Slack member ID (`U…`, from **Copy member ID** in your profile's menu) and the bot token (`xoxb-…`) in the default vault:
+
+```bash
+mintrun secret set approval-slack       # enter <user_id>:<bot_token>
+```
+
+The bot sends you a direct message with ✅ and ❌ already on it: tap one. `mintrun` polls the message's reactions, so it needs no public URL.
+
+- **Only your answer to this request counts.** A tap or reaction from another account, or on another request's message, is ignored, and so are the Slack bot's own reactions and any emoji but ✅ and ❌. In Slack, ❌ wins if you add both. The message is then edited to show the outcome.
+- **Ten minutes, then no.** Telegram and Slack each give up after 10 minutes and the request is not approved, while the macOS dialog, which has no timeout, keeps waiting. On Linux, where there is no dialog, Telegram and Slack are the only channels. With none, `-approve` fails closed.
+- **A Telegram bot of its own.** `mintrun` reads taps with `getUpdates`, which Telegram refuses while the bot has a webhook.
+- **Slack polls.** `mintrun` reads the message's reactions every 3 seconds, so an answer takes a few seconds to land, and each waiting request spends about 20 `reactions.get` calls a minute of the app's Tier 3 limit (50 or more a minute). When Slack rate-limits it, it waits as long as `Retry-After` says. A missing scope, a revoked token, or any other refusal ends the Slack request with that error, never an approval.
+- **The default vault only.** The settings are read from the default vault (`MINTRUN_VAULT`, or `keychain`), never from the vault a request names, so an agent cannot send approvals to a bot it controls.
+- **Every field quoted.** The dialog and the messages show each field an agent sets in quotes, so a line break in an argument shows as `\n` and cannot pose as a line of the request. Slack's message also escapes `&`, `<`, and `>`, so an argument cannot mention `@channel` or a person, or hide a link behind other text. A request too long to show ends in a TRUNCATED warning: deny it unless you know the rest.
+- **What Telegram and Slack see.** The message carries the provider, scope, permissions, params, and command through Telegram's or Slack's servers, and stays in the chat. It holds no secret, because approval comes before any secret is loaded, but a secret typed into the command's arguments would be in it.
+- **Tested against stand-ins.** Both channels have run only against a local Bot API and a local Slack Web API in `go test`, never a real Telegram bot or Slack workspace.
 
 ---
 
@@ -308,7 +324,7 @@ mintrun secret set approval-telegram    # enter <user_id>:<bot_token>
 
 ### 1. Declarative Policy Guardrails (`~/.mintrun/policy.json`)
 
-Restrict which domains, repositories, roles, or permissions an AI agent may touch, cap lease TTLs, enforce a minimal child environment, or require human approval (macOS dialog or [Telegram](#approve-from-your-phone-telegram)) per provider in `~/.mintrun/policy.json`:
+Restrict which domains, repositories, roles, or permissions an AI agent may touch, cap lease TTLs, enforce a minimal child environment, or require human approval (macOS dialog, [Telegram, or Slack](#approve-from-your-phone-telegram-or-slack)) per provider in `~/.mintrun/policy.json`:
 
 ```json
 {
@@ -481,7 +497,7 @@ Put only secrets in `env`. `mintrun` removes every `env` value, every `redact` e
 
 ## Verification & Testing
 
-`mintrun` ships with a deterministic, offline unit and integration test suite (**94.0%** total statement coverage, measured without build tags) that mocks Cloudflare, GitHub App RS256, AWS STS SigV4 (plus a fixed AWS signing vector), Google OAuth2 JWT-bearer, and Telegram Bot APIs plus the macOS `security` and `osascript`, Linux `secret-tool`, 1Password `op`, and `stty` CLIs, checks child environment isolation, the output cap, and the process-group kill, verifies AES-256-GCM encryption at rest, tests multi-encoding leak scrubbing, enforces policy guardrails, validates external plugin execution and the governance tools over MCP, and installs and runs the [example plugins](examples/plugins/README.md) against a stub `bw`, a stub `psql`, and a local Vercel API (skipped without `python3`). It never touches the real Keychain, Telegram, Bitwarden, Vercel, or a database:
+`mintrun` ships with a deterministic, offline unit and integration test suite (**94.1%** total statement coverage, measured without build tags) that mocks Cloudflare, GitHub App RS256, AWS STS SigV4 (plus a fixed AWS signing vector), Google OAuth2 JWT-bearer, Telegram Bot, and Slack Web APIs plus the macOS `security` and `osascript`, Linux `secret-tool`, 1Password `op`, and `stty` CLIs, checks child environment isolation, the output cap, and the process-group kill, verifies AES-256-GCM encryption at rest, tests multi-encoding leak scrubbing, enforces policy guardrails, validates external plugin execution and the governance tools over MCP, and installs and runs the [example plugins](examples/plugins/README.md) against a stub `bw`, a stub `psql`, and a local Vercel API (skipped without `python3`). It never touches the real Keychain, Telegram, Slack, Bitwarden, Vercel, or a database:
 
 ```bash
 go test -v -cover ./...
