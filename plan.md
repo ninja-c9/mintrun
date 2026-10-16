@@ -1,6 +1,6 @@
 # `mintrun` Execution Plan & Backlog
 
-> **Harness Spec:** [AGENTS.md](AGENTS.md) · **Latest Release:** `v0.6.0` · **Constraints:** 100% Go `1.24.0` standard library (`0` external dependencies), `> 90%` verified statement coverage measured without build tags.
+> **Harness Spec:** [AGENTS.md](AGENTS.md) · **Latest Release:** `v0.7.0` · **Constraints:** 100% Go `1.24.0` standard library (`0` external dependencies), `> 90%` verified statement coverage measured without build tags.
 
 ---
 
@@ -80,13 +80,29 @@ Every change to `cmd/` or `internal/` must pass the following verification pipel
 
 ---
 
-## 3. Deferred Backlog (Next Actionable Items)
+## 3. Active Workstream
 
-1. **OS Network Sandbox (`no_network: true`):**
-   - Implement optional per-OS network isolation (Linux `CLONE_NEWNET` network namespace / macOS `sandbox-exec` deny-network profile) that fails closed when requested but unsupported on the host.
-2. **1Password CLI (`op item create`) `stdin` Secret Passing:**
-   - Replace `credential=<secret>` on `argv` in `OnePasswordVault.SetSecret` with a JSON template passed over `stdin`.
-3. **Linux Host Verification & HITL Support:**
+### Workstream E — Secrets Off argv, Bounded Audit Reads & Long Keychain Secrets (`v0.8.0`)
+- **Files:** `internal/builtin/keychain.go`, `internal/builtin/mcp.go`, `internal/core/runner.go`, `cmd/mintrun/main.go`, and their tests (`internal/builtin/builtin_test.go`, `internal/builtin/keychain_integration_test.go`, `internal/core/core_test.go`, `cmd/mintrun/main_test.go`)
+- **Deliverables:**
+  1. `OnePasswordVault.SetSecret` pipes a JSON item template to `op item create -`, so the secret travels on `stdin` instead of `argv`. It scrubs the secret from any `op` output it quotes, and archives older items with the same title so `op item get` stays unambiguous. `exec.Command` already refuses an `op` found through a relative `PATH` entry, and a test pins that.
+  2. `core.TailAudit` streams `audit.jsonl` line by line and keeps only the last `limit` matches. `mintrun audit` (a raw copy when unfiltered) and MCP `mintrun_audit` both use it, so memory no longer grows with the log.
+  3. `keychainSet` splits a secret too long for one `security -i` line into at most 16 items of 1,500 bytes under a fresh random generation. It writes a checksummed header item last, then removes the previous generation's items. `keychainGet` reassembles and verifies the parts, and `DeleteSecret` removes them.
+  4. `setEcho` runs a swappable `sttyPath`. A test covers the prompt path with `/dev/null` as `stdin` and a stub `stty`.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestKeychainAndOnePasswordVaults|TestTailAudit|TestMCPBridgeGovernanceTools|TestKeychainVaultMacOSSecurity|TestCLISecretPromptHidesEcho|TestCLISubcommandsEndToEnd' ./internal/core ./internal/builtin ./cmd/mintrun
+  go test -tags integration -count=1 -v -run TestKeychainVaultRealKeychain ./internal/builtin
+  ```
+
+---
+
+## 4. Deferred Backlog (Next Actionable Items)
+
+1. **OS Network Sandbox (`no_network: true`), awaiting approval:**
+   - Optional per-OS network isolation for the child: a Linux `CLONE_NEWNET` network namespace or a macOS `sandbox-exec` deny-network profile. It must fail closed when requested but unsupported on the host.
+   - Open questions before building it: every built-in provider mints a credential for a CLI that calls a network API, so the flag only fits offline commands. A macOS `(deny network*)` profile also blocks Unix sockets (`ssh-agent`, Docker). Many Linux hosts restrict the unprivileged user namespaces that `CLONE_NEWNET` needs.
+2. **Linux Host Verification & HITL Support:**
    - Run integration tests against real `secret-tool` on Linux and evaluate `zenity`/`kdialog` or terminal confirmation for `-approve` on Linux.
-4. **Tail-Reading `~/.mintrun/audit.jsonl`:**
-   - Read from the end of `audit.jsonl` in `mintrun audit` and `mintrun_audit` so memory usage stays bounded as the audit log grows.
+3. **GCP `token_uri` From the Service-Account Key:**
+   - Deferred: only keys outside the default Google universe carry a different `token_uri`, and honoring it also means sending revocation to that universe. Add it when such a key is in use.
