@@ -13,6 +13,7 @@
 | **`v0.7.0` — GitHub Installation Binding** | ✅ Done | Consistent GitHub master secret parsing with `params.installation_id`; `github` refuses a `params.installation_id` that differs from the installation pinned in the stored credential; policy `allowed_installations` (exact, fail-closed, enforced in `CheckPolicy` for both `ExecBlind` and `mintrun_policy_check`); `params` in the MCP input schema; `92.7%` verified statement coverage |
 | **`v0.8.0` — Secrets Off argv, Bounded Audit Reads & Long Keychain Secrets** | ✅ Done | 1Password `secret set` pipes the secret to `op item create` on `stdin` and archives older items with the same title; `mintrun audit` and MCP `mintrun_audit` stream `audit.jsonl` through `core.TailAudit`, so memory no longer grows with the log; macOS Keychain secrets too long for one `security -i` line are stored as up to 16 checksummed parts (24,000 bytes); the hidden `secret set` prompt is tested with a stub `stty`; `93.6%` verified statement coverage |
 | **Unreleased — Keystore Fallback Cleanup** | ⏳ Untagged | A `secret set` that falls back to the file vault after a failed Keychain or libsecret store removes the older keystore item for the key, which used to shadow the new secret on read, or fails with an error saying that item still wins; a successful Keychain or libsecret store removes the older file-vault copy of the key, which a failed keystore lookup used to return, or warns that it may remain when `MINTRUN_VAULT_KEY` is not set to decrypt `vault.json`; README documents `MINTRUN_FILE_VAULT=1` for a host whose keystore cannot be reached; `93.8%` verified statement coverage |
+| **Unreleased — Example Plugins & Telegram Approval** | ⏳ Untagged | Three plugins in `examples/plugins/` that install from a clone (a `bitwarden` vault; `vercel` and `postgres-jit` providers; Python 3.9+ standard library), tested through the CLI against a stub `bw`, a stub `psql`, and a local Vercel API, with `postgres-jit` also run against real PostgreSQL 15 and 16; `-approve` and `require_approval` ask the macOS dialog and a Telegram bot at once and the first answer wins (`approval-telegram` in the default vault; no answer within 10 minutes is not an approval); `94.0%` verified statement coverage |
 
 ---
 
@@ -23,7 +24,7 @@
 - **Security Audit Report:** [audit.md](audit.md)
 - **Pipeline Status:**
   - `gofmt -s -l cmd internal` and `go vet ./...`: clean (`0` issues)
-  - `go test -count=1 -cover ./...` (without build tags): **93.8%** total statement coverage (`cmd/mintrun` 95.1%, `internal/builtin` 93.4%, `internal/core` 93.8%)
+  - `go test -count=1 -cover ./...` (without build tags): **94.0%** total statement coverage (`cmd/mintrun` 95.1%, `internal/builtin` 93.7%, `internal/core` 94.2%)
   - `go test -race -count=1 ./...`: pass (`0` data races)
   - `go build -trimpath -o mintrun ./cmd/mintrun && ./mintrun plugin list`: pass (`7` built-in plugins registered, `0` local path strings in binary)
   - Cross-compilation (`GOOS=linux`, `GOOS=windows`, `GOOS=freebsd`): pass
@@ -32,10 +33,12 @@
 
 ## 3. Open Items & Next Steps
 
-- **Next Tag:** Workstreams F and G are untagged; choose their version and tag them once approved.
+- **Next Tag:** Workstreams F, G, H, and I are untagged; choose their version and tag them once approved.
 - **OS Network Sandbox (`no_network: true`):** Optional fail-closed network namespace / `sandbox-exec` isolation for child processes; awaiting approval of the open questions in [plan.md](plan.md).
 - **Live 1Password Verification:** Run `mintrun secret set`, `check`, and `rm` against a real 1Password account; the `stdin` item template and the archiving of older items are tested against a mock `op` only.
-- **Linux Host Verification:** Verify `secret-tool` and HITL behavior on a Linux host.
+- **Linux Host Verification:** Verify `secret-tool`, and `-approve` with Telegram as the only channel, on a Linux host.
+- **Live Telegram, Bitwarden & Vercel Verification:** Telegram approval, the `bitwarden` vault, and the `vercel` provider are tested against a local Bot API, a stub `bw`, and a local Vercel API only; run each against a real bot or account before calling it verified.
+- **Two-Way Slack Approval:** Not built, because an incoming webhook only sends. It needs a Slack app token, `chat.postMessage`, and polling for the answer; Socket Mode needs WebSockets, which the standard library lacks.
 - **Audit Read Time:** `TailAudit` bounds memory but still scans the whole log on every read; seek back from the end if it reaches gigabytes.
 
 ---
@@ -48,3 +51,12 @@
 - **Quyết định:** không đổi file Go; không thêm skill vào repo; token trên màn hình đều là `FAKE-…`.
 - **Kiểm chứng:** mục "Video giới thiệu" trong `checks.md`.
 - **Git:** commit cả MP4 (~13 MB) theo xác nhận của bạn ngày 2026-10-16.
+
+## Checkpoint — Plugin mẫu & duyệt lệnh qua Telegram (2026-10-16)
+
+- **Hoàn thành:** Workstream H (3 plugin mẫu cài được ngay sau khi clone) và Workstream I (duyệt lệnh qua Telegram, hỏi song song với hộp thoại macOS).
+- **Outputs:** `examples/plugins/{bitwarden,vercel,postgres-jit}/` (`plugin.json` + `run`), `examples/plugins/README.md`, `cmd/mintrun/examples_test.go`, `internal/builtin/telegram.go`, `internal/builtin/telegram_test.go`; sửa `internal/core/runner.go`, `internal/core/core_test.go`, `cmd/mintrun/main.go`.
+- **Quyết định:** chưa làm Slack (incoming webhook chỉ gửi một chiều, không nhận lại câu trả lời); cấu hình Telegram chỉ đọc từ vault mặc định, không bao giờ từ vault do agent chọn; quá 10 phút không trả lời là không duyệt; plugin mẫu viết bằng Python thư viện chuẩn, chạy được với Python 3.9 có sẵn trên macOS.
+- **Kiểm chứng:** các dòng Approval Channels, Telegram Approval, Example Plugins, `postgres-jit` on Real PostgreSQL và Hermetic Default Test Suite trong `checks.md`; 28/28 mutant đều bị test bắt.
+- **Chưa kiểm chứng:** bot Telegram, tài khoản Bitwarden và Vercel thật; máy Linux.
+- **Next step:** chọn phiên bản và tag cho Workstreams F, G, H, I.

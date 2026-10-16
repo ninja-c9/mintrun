@@ -15,7 +15,7 @@ Engineered with **100% Go standard library**, **zero external dependencies**, an
   <a href="https://github.com/ninja-c9/mintrun/blob/main/go.mod"><img src="https://img.shields.io/badge/Go-1.24.0-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go 1.24.0" /></a>
   <a href="#architecture-everything-is-a-plugin"><img src="https://img.shields.io/badge/Dependencies-Zero_(100%25_stdlib)-10B981?style=flat-square" alt="Zero Dependencies" /></a>
   <a href="#ai-agent-integration-mcp"><img src="https://img.shields.io/badge/MCP-JSON--RPC_2.0_Ready-38BDF8?style=flat-square" alt="MCP Ready" /></a>
-  <a href="#verification--testing"><img src="https://img.shields.io/badge/Coverage-93.8%25_Verified-A78BFA?style=flat-square" alt="93.8% Coverage" /></a>
+  <a href="#verification--testing"><img src="https://img.shields.io/badge/Coverage-94.0%25_Verified-A78BFA?style=flat-square" alt="94.0% Coverage" /></a>
 </p>
 
 <p align="center">
@@ -54,7 +54,7 @@ Yet every existing way of handing credentials to an agent forces a bad trade-off
 | **What the child CLI receives** | Account-wide permanent credential | Account-wide permanent credential | **Narrowly scoped JIT sub-token** locked to 1 zone, 1 repo, 1 IAM role ARN, or specific OAuth2 scopes |
 | **Token lifetime** | Weeks, months, or never rotated | Weeks, months, or never rotated | **Seconds to minutes.** Cloudflare & GitHub sub-tokens are deleted (`DELETE`) the instant the command exits; AWS STS & GCP tokens cannot be revoked early and expire on their own (AWS ≥ 15 min, GCP ≤ 1 h) |
 | **Stdout / Stderr scrubbing** | None | Exact raw string match only | **5-Encoding Scrubber** redacts Raw, Base64, RawBase64, Hex, and URL-encoded forms with `[MINTRUN:REDACTED]` |
-| **Exfiltration & policy gate** | None | None | **Fail-closed `policy.json`** blocks `env`/`printenv`, restricts scopes/permissions, isolates child env, and supports macOS HITL approval |
+| **Exfiltration & policy gate** | None | None | **Fail-closed `policy.json`** blocks `env`/`printenv`, restricts scopes/permissions, isolates child env, and can ask a human first (macOS dialog or Telegram) |
 | **Supply-chain footprint** | N/A | Dozens to hundreds of external packages | **0 external dependencies.** 100% Go 1.24 standard library |
 
 > **Design Principle — Separate Authority from Possession:**
@@ -117,7 +117,8 @@ Stage 5 reports revocation honestly. **Cloudflare** and **GitHub** delete the su
 mintrun/
 ├── cmd/mintrun/
 │   ├── main.go                           # CLI entrypoint (exec, secret, plugin, mcp, audit)
-│   └── main_test.go                      # End-to-end CLI & subcommand test suite
+│   ├── main_test.go                      # End-to-end CLI & subcommand test suite
+│   └── examples_test.go                  # Installs and runs the example plugins against stand-ins
 ├── internal/
 │   ├── core/
 │   │   ├── plugin.go                     # Plugin ABI, Registry, SHA-256 pinning & ExternalPlugin SDK
@@ -128,8 +129,11 @@ mintrun/
 │       ├── keychain.go                   # macOS Keychain / Linux libsecret + AES-256-GCM fallback & 1Password vault
 │       ├── cloudflare.go                 # Built-in Cloudflare, GitHub (RS256 JWT), AWS STS (SigV4) & GCP (JWT bearer) providers
 │       ├── mcp.go                        # MCP JSON-RPC 2.0 stdio bridge server
+│       ├── telegram.go                   # Telegram approval channel (Bot API long polling)
 │       ├── builtin_test.go               # Comprehensive provider, vault, and MCP unit test suite
+│       ├── telegram_test.go              # Telegram approval against a local Bot API
 │       └── keychain_integration_test.go  # Real macOS Keychain round trip (`-tags integration` only)
+├── examples/plugins/                     # Ready-to-install plugins: bitwarden (vault), vercel & postgres-jit (providers)
 └── docs/
     ├── assets/                           # SVG architectural diagrams
     └── video/                            # Self-contained HTML/MP4 motion overview & storyboard
@@ -279,13 +283,31 @@ Connect `mintrun` to **Google Antigravity**, **Claude Code**, **Cursor**, or **W
 | **`mintrun_policy_check`** | Dry-runs a `mintrun_exec` request against `policy.json` and the anti-exfiltration guard, through the same gate `mintrun_exec` enforces. Never opens the vault, mints, runs the command, or asks a human. Returns `allowed`, the denial `reason` (the exact error `mintrun_exec` would return), `approval_required`, `ttl_seconds` (the TTL requested from the provider after `max_ttl_seconds`; `gcp` tokens always live up to 1h), and `clean_env`. | Same as `mintrun_exec` |
 | **`mintrun_audit`** | Returns recent audit entries, oldest first, filtered like `mintrun audit`. Each command is cut to its binary name plus `[MINTRUN:REDACTED]`: a policy-denied entry keeps the raw `argv` (no secret is loaded yet to scrub against), and a secret typed into `argv` is one the runner never holds, so arguments never reach an agent. The on-disk log keeps the full `argv` for the operator. | `provider` (case-insensitive), `failed_only`, `limit` (default 20, max 100) |
 
+### Approve From Your Phone (Telegram)
+
+`mintrun exec -approve`, `MINTRUN_APPROVE=1` in `mintrun`'s environment, and `"require_approval": true` in a provider's policy ask a human before anything is minted; the last two also cover an agent's `mintrun_exec` calls. On macOS a dialog asks. With a Telegram bot set up, your phone is asked at the same time, so you can approve an agent's commands away from the machine. The first answer, from either, wins and closes the other.
+
+1. Create a bot for `mintrun` alone with [@BotFather](https://t.me/BotFather), and send it `/start` from your account so it may message you.
+2. Store your numeric Telegram user ID (not your @username) and the bot token in the default vault:
+
+```bash
+mintrun secret set approval-telegram    # enter <user_id>:<bot_token>
+```
+
+- **Only your tap on this request's message counts.** A tap from another account, or on another request's message, is ignored. The message is then edited to show the outcome.
+- **Ten minutes, then no.** Telegram gives up after 10 minutes and the request is not approved, while the macOS dialog, which has no timeout, keeps waiting. On Linux, where there is no dialog, Telegram is the only channel. With neither, `-approve` fails closed.
+- **A bot of its own.** `mintrun` reads taps with `getUpdates`, which Telegram refuses while the bot has a webhook.
+- **The default vault only.** The setting is read from the default vault (`MINTRUN_VAULT`, or `keychain`), never from the vault a request names, so an agent cannot send approvals to a bot it controls.
+- **What Telegram sees.** The message carries the provider, scope, permissions, params, and command through Telegram's servers. It holds no secret, because approval comes before any secret is loaded, but a secret typed into the command's arguments would be in it.
+- **No Slack.** A Slack incoming webhook only sends, so it cannot carry your answer back.
+
 ---
 
 ## Defense-in-Depth Security Model
 
 ### 1. Declarative Policy Guardrails (`~/.mintrun/policy.json`)
 
-Restrict which domains, repositories, roles, or permissions an AI agent may touch, cap lease TTLs, enforce a minimal child environment, or require interactive macOS approval per provider in `~/.mintrun/policy.json`:
+Restrict which domains, repositories, roles, or permissions an AI agent may touch, cap lease TTLs, enforce a minimal child environment, or require human approval (macOS dialog or [Telegram](#approve-from-your-phone-telegram)) per provider in `~/.mintrun/policy.json`:
 
 ```json
 {
@@ -346,7 +368,7 @@ On Unix the command runs in its own process group. A timeout (5 min by default) 
 | **macOS Keychain / Linux libsecret** | Other users and a copy of the disk; the secret never touches `argv`, `ps`, or shell history | Any process running as your user while the keychain is unlocked: it can run `security find-generic-password` or `secret-tool lookup` itself |
 | **Encrypted file vault** (`~/.mintrun/vault.json`) | A copy of `vault.json` (backup, sync folder, lost disk) without the passphrase: AES-256-GCM with a key derived from `MINTRUN_VAULT_KEY` (PBKDF2-HMAC-SHA256, 210,000 iterations, per-vault random salt); a tampered file fails to decrypt | Any process running as your user that can read both `vault.json` and the passphrase (from `mintrun`'s environment, a shell profile, or an MCP config file), a keylogger, or offline guessing of a weak passphrase |
 
-The blind command is such a process. `mintrun` never passes `MINTRUN_VAULT_KEY` to it, which stops accidental exposure (an `env` dump, a debug log), but a command written to steal secrets can still read `mintrun`'s own environment (`ps -E -p $PPID` on macOS, `/proc/$PPID/environ` on Linux) or query the keystore. `mintrun` keeps raw secrets out of the agent's context and transcripts; it does not sandbox the command it runs. Block what an agent must not run with `blocked_commands`, and use `require_approval` (macOS) to see each command before it runs.
+The blind command is such a process. `mintrun` never passes `MINTRUN_VAULT_KEY` to it, which stops accidental exposure (an `env` dump, a debug log), but a command written to steal secrets can still read `mintrun`'s own environment (`ps -E -p $PPID` on macOS, `/proc/$PPID/environ` on Linux) or query the keystore. `mintrun` keeps raw secrets out of the agent's context and transcripts; it does not sandbox the command it runs. Block what an agent must not run with `blocked_commands`, and use `require_approval` (macOS dialog or Telegram) to see each command before it runs.
 
 ### 6. Known Gap: No Network Sandbox
 
@@ -358,6 +380,8 @@ A blind command keeps network access, so it can send its lease credential elsewh
 
 Because **everything in `mintrun` is a plugin**, any developer can extend `mintrun` with new third-party Vaults (`lastpass`, `bitwarden`, `hashicorp-vault`) or JIT Providers (`vercel`, `supabase`, `digitalocean`, `stripe`) in **any language** (Python, Bash, Node.js, Go, Rust) without recompiling the binary. External plugins cannot override built-in plugin names.
 
+Three working plugins ship in [`examples/plugins/`](examples/plugins/README.md), ready to install from a clone: a `bitwarden` vault, and `vercel` and `postgres-jit` providers.
+
 ### Managing Plugins
 
 ```bash
@@ -365,32 +389,32 @@ Because **everything in `mintrun` is a plugin**, any developer can extend `mintr
 ./mintrun plugin list
 
 # Install from a local directory containing plugin.json + executable entrypoint
-./mintrun plugin install ./examples/plugins/lastpass
+./mintrun plugin install ./examples/plugins/bitwarden
 
 # Install a single-file remote plugin bundle over HTTPS with mandatory out-of-band SHA-256 pinning
-./mintrun plugin install "https://registry.example.com/plugins/lastpass.json#sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+./mintrun plugin install "https://registry.example.com/plugins/bitwarden.json#sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 # Use an installed external vault for a single command or as the default vault
-./mintrun exec -vault lastpass -provider cloudflare -scope example.com -- npx wrangler deploy
-export MINTRUN_VAULT=lastpass
+./mintrun exec -vault bitwarden -provider cloudflare -scope example.com -- npx wrangler deploy
+export MINTRUN_VAULT=bitwarden
 
 # Remove an external plugin
-./mintrun plugin remove lastpass
+./mintrun plugin remove bitwarden
 ```
 
 ### Writing an External Plugin (`stdin` $\rightarrow$ `stdout` JSON Protocol)
 
 Place a `plugin.json` manifest and an executable entrypoint inside `~/.mintrun/plugins/<name>/` (or publish a single-file JSON bundle with `"script"` for remote installation):
 
-**1. `plugin.json` (Provider Example: `vercel`, or Vault Example: `lastpass`)**
+**1. `plugin.json`** (from [`examples/plugins/vercel`](examples/plugins/vercel/plugin.json))
 ```json
 {
   "name": "vercel",
   "version": "0.1.0",
   "kind": "provider",
-  "description": "Vercel Scoped Deployment Token Minter",
+  "description": "Mints a Vercel token that expires with the lease and deletes it on exit",
   "entrypoint": "run",
-  "scopes": ["deployments:write", "logs:read"]
+  "scopes": ["<project_id>", "<team_id>/<project_id>"]
 }
 ```
 
@@ -401,31 +425,33 @@ Place a `plugin.json` manifest and an executable entrypoint inside `~/.mintrun/p
   "master_secret": "<resolved-from-vault>",
   "mint_request": {
     "provider": "vercel",
-    "scope": "my-team/web-app",
-    "permissions": ["deployments:write"],
-    "ttl_seconds": 600
+    "scope": "team_abc/prj_def",
+    "ttl_seconds": 900
   }
 }
 ```
-*(For a `"kind": "vault"` plugin such as `lastpass`, `mintrun` sends `"op": "get_secret"`, `"set_secret"`, or `"delete_secret"` with `"key"` and `"value"`, and expects `{"value": "..."}` on `stdout`.)*
+*(For a `"kind": "vault"` plugin such as [`bitwarden`](examples/plugins/bitwarden/run), `mintrun` sends `"op": "get_secret"`, `"set_secret"`, or `"delete_secret"` with `"key"` and `"value"`, and expects `{"value": "..."}` on `stdout`.)*
 
 **3. Response Payload (`stdout` from `entrypoint`)**
 ```json
 {
   "lease": {
-    "id": "vercel-lease-01",
+    "id": "<vercel-token-id>",
     "provider": "vercel",
-    "scope": "my-team/web-app",
+    "scope": "team_abc/prj_def",
     "env": {
-      "VERCEL_TOKEN": "vcp_shortLivedScopedToken"
+      "VERCEL_TOKEN": "<new-bearer-token>"
     },
-    "redact": ["vcp_shortLivedScopedToken"],
+    "redact": ["<new-bearer-token>"],
+    "expires_at": "2026-10-16T10:15:00Z",
     "ephemeral": true
   }
 }
 ```
 
 When the child command finishes, `mintrun` invokes your provider plugin again with `{"op": "revoke", "master_secret": "...", "lease": {...}}` so it can invalidate the token. If the token cannot be invalidated early and can only expire, reply `{"error": "..."}`, and `mintrun` reports `revoked: false`.
+
+Put only secrets in `env`. `mintrun` removes every `env` value, every `redact` entry, and the lease `id` from the command's output, so a non-secret such as a port number would be blanked wherever it appears. The `id` is public: the audit log and the MCP result show it.
 
 ---
 
@@ -448,7 +474,7 @@ When the child command finishes, `mintrun` invokes your provider plugin again wi
 
 ## Verification & Testing
 
-`mintrun` ships with a deterministic, offline unit and integration test suite (**93.8%** total statement coverage, measured without build tags) that mocks Cloudflare, GitHub App RS256, AWS STS SigV4 (plus a fixed AWS signing vector), and Google OAuth2 JWT-bearer APIs plus the macOS `security`, Linux `secret-tool`, 1Password `op`, and `stty` CLIs, checks child environment isolation, the output cap, and the process-group kill, verifies AES-256-GCM encryption at rest, tests multi-encoding leak scrubbing, enforces policy guardrails, and validates external plugin execution and the governance tools over MCP. It never touches the real Keychain:
+`mintrun` ships with a deterministic, offline unit and integration test suite (**94.0%** total statement coverage, measured without build tags) that mocks Cloudflare, GitHub App RS256, AWS STS SigV4 (plus a fixed AWS signing vector), Google OAuth2 JWT-bearer, and Telegram Bot APIs plus the macOS `security` and `osascript`, Linux `secret-tool`, 1Password `op`, and `stty` CLIs, checks child environment isolation, the output cap, and the process-group kill, verifies AES-256-GCM encryption at rest, tests multi-encoding leak scrubbing, enforces policy guardrails, validates external plugin execution and the governance tools over MCP, and installs and runs the [example plugins](examples/plugins/README.md) against a stub `bw`, a stub `psql`, and a local Vercel API (skipped without `python3`). It never touches the real Keychain, Telegram, Bitwarden, Vercel, or a database:
 
 ```bash
 go test -v -cover ./...
