@@ -120,7 +120,7 @@ func NewRuntime(homeDir, defaultVault string, reg *Registry) *Runtime {
 		DefaultVault: defaultVault,
 		Registry:     reg,
 		Policies:     make(map[string]PolicyRule),
-		ApprovalFunc: defaultOSApproval,
+		ApprovalFunc: OSApproval,
 	}
 	rt.loadPolicyFile()
 	return rt
@@ -267,25 +267,81 @@ func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest) error {
 	if d.ApprovalRequired {
 		approveFn := rt.ApprovalFunc
 		if approveFn == nil {
-			approveFn = defaultOSApproval
+			approveFn = OSApproval
 		}
 		ok, err := approveFn(ctx, *req)
-		if err != nil || !ok {
+		if err != nil {
 			return fmt.Errorf("policy denied: human-in-the-loop approval rejected (%v)", err)
+		}
+		if !ok {
+			return errors.New("policy denied: human-in-the-loop approval rejected (denied)")
 		}
 	}
 	return nil
 }
 
-func defaultOSApproval(ctx context.Context, req ExecRequest) (bool, error) {
+// OsascriptPath is the AppleScript runner OSApproval calls, a var so tests can stub it.
+var OsascriptPath = "/usr/bin/osascript"
+
+// OSApproval asks in a macOS dialog. Deny (or Esc) is an answer, (false, nil); a dialog that
+// could not be shown is an error, so FirstApproval keeps waiting for another channel.
+func OSApproval(ctx context.Context, req ExecRequest) (bool, error) {
 	if runtime.GOOS != "darwin" {
 		return false, errors.New("interactive approval requires macOS osascript or custom ApprovalFunc")
 	}
 	msg := fmt.Sprintf("mintrun HITL Security Gate\n\nAllow AI agent to execute command?\n• Provider: %s\n• Scope: %s\n• Command: %s",
 		req.Provider, req.Scope, strings.Join(req.Command, " "))
 	script := fmt.Sprintf(`display dialog %q with title "mintrun Security Enclave" buttons {"Deny", "Allow"} default button "Allow" cancel button "Deny" with icon caution`, msg)
-	err := exec.CommandContext(ctx, "/usr/bin/osascript", "-e", script).Run()
-	return err == nil, err
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, OsascriptPath, "-e", script)
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		return true, nil
+	}
+	if ctx.Err() == nil && strings.Contains(stderr.String(), "(-128)") { // errAEUserCanceled: Deny or Esc
+		return false, nil
+	}
+	return false, err
+}
+
+// FirstApproval asks every approver at once. The first answer, allow or deny, wins and cancels
+// the others; it returns once they have all returned, so none outlives the decision. An approver
+// that fails (no GUI, not configured, unreachable) drops out, and only when every one fails is
+// their joined error returned.
+func FirstApproval(approvers ...func(context.Context, ExecRequest) (bool, error)) func(context.Context, ExecRequest) (bool, error) {
+	return func(ctx context.Context, req ExecRequest) (bool, error) {
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		type answer struct {
+			i   int
+			ok  bool
+			err error
+		}
+		answers := make(chan answer, len(approvers))
+		for i, approve := range approvers {
+			go func() {
+				ok, err := approve(ctx, req)
+				answers <- answer{i, ok, err}
+			}()
+		}
+		decided, allowed := false, false
+		errs := make([]string, len(approvers)) // in approver order, whatever order they fail in
+		for range approvers {
+			switch a := <-answers; {
+			case decided:
+			case a.err == nil:
+				decided, allowed = true, a.ok
+				cancel()
+			default:
+				errs[a.i] = a.err.Error()
+			}
+		}
+		if decided {
+			return allowed, nil
+		}
+		return false, errors.New(strings.Join(errs, "; "))
+	}
 }
 
 // ExecBlind resolves the master credential from Vault, mints a scoped JIT lease from the Provider,

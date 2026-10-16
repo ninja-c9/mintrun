@@ -1098,6 +1098,116 @@ not json
 	}
 }
 
+// TestFirstApproval pins the race between approval channels: the first answer wins, allow or
+// deny, the losers are cancelled and have returned before the decision does, and an approver that
+// fails only drops out.
+func TestFirstApproval(t *testing.T) {
+	ctx := context.Background()
+	answer := func(ok bool) func(context.Context, core.ExecRequest) (bool, error) {
+		return func(context.Context, core.ExecRequest) (bool, error) { return ok, nil }
+	}
+	failing := func(msg string) func(context.Context, core.ExecRequest) (bool, error) {
+		return func(context.Context, core.ExecRequest) (bool, error) { return false, errors.New(msg) }
+	}
+	var waiterDone atomic.Bool
+	waiter := func(ctx context.Context, _ core.ExecRequest) (bool, error) {
+		<-ctx.Done()
+		time.Sleep(20 * time.Millisecond) // a loser still closing its prompt
+		waiterDone.Store(true)
+		return false, ctx.Err()
+	}
+
+	for _, c := range []struct {
+		name      string
+		approvers []func(context.Context, core.ExecRequest) (bool, error)
+		want      bool
+		wantErr   string
+	}{
+		{"deny beats a waiting channel", []func(context.Context, core.ExecRequest) (bool, error){waiter, answer(false)}, false, ""},
+		{"allow beats a waiting channel", []func(context.Context, core.ExecRequest) (bool, error){answer(true), waiter}, true, ""},
+		{"a failed channel drops out", []func(context.Context, core.ExecRequest) (bool, error){failing("no GUI"), answer(true)}, true, ""},
+		{"all channels failed", []func(context.Context, core.ExecRequest) (bool, error){failing("no GUI"), failing("not configured")}, false, "no GUI; not configured"},
+	} {
+		waiterDone.Store(false)
+		ok, err := core.FirstApproval(c.approvers...)(ctx, core.ExecRequest{})
+		if ok != c.want || (err == nil) != (c.wantErr == "") || (err != nil && err.Error() != c.wantErr) {
+			t.Errorf("%s: got (%v, %v), want (%v, %q)", c.name, ok, err, c.want, c.wantErr)
+		}
+		if strings.Contains(c.name, "waiting") && !waiterDone.Load() {
+			t.Errorf("%s: returned before the cancelled channel did", c.name)
+		}
+	}
+
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if ok, err := core.FirstApproval(waiter, waiter)(canceled, core.ExecRequest{}); ok || err == nil || !strings.Contains(err.Error(), "context canceled") {
+		t.Errorf("cancelled caller: got (%v, %v), want the cancellation error", ok, err)
+	}
+
+	// Through ExecBlind: a denial and an all-failed verdict both stop before any vault is opened.
+	rt := core.NewRuntime(t.TempDir(), "no-such-vault", core.NewRegistry())
+	req := core.ExecRequest{MintRequest: core.MintRequest{Provider: "cloudflare"}, Command: []string{"true"}, Approve: true}
+	for approval, want := range map[string]string{
+		"deny":   "approval rejected (denied)",
+		"failed": "approval rejected (no GUI; not configured)",
+	} {
+		rt.ApprovalFunc = core.FirstApproval(failing("no GUI"), answer(false))
+		if approval == "failed" {
+			rt.ApprovalFunc = core.FirstApproval(failing("no GUI"), failing("not configured"))
+		}
+		if _, err := rt.ExecBlind(ctx, req); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: got %v, want %q", approval, err, want)
+		}
+	}
+}
+
+// TestOSApproval runs the macOS dialog against a stub osascript: Allow is (true, nil), Deny
+// (errAEUserCanceled, -128) is (false, nil), and a dialog that cannot be shown is an error. The
+// stub also logs its argv, proving the prompt reaches osascript as one escaped line (rule 4).
+func TestOSApproval(t *testing.T) {
+	req := core.ExecRequest{MintRequest: core.MintRequest{Provider: "github", Scope: "o/r"}, Command: []string{"gh", "pr", "list"}}
+	if runtime.GOOS != "darwin" {
+		if _, err := core.OSApproval(context.Background(), req); err == nil {
+			t.Fatal("expected the macOS-only error")
+		}
+		return
+	}
+	dir := t.TempDir()
+	log := filepath.Join(dir, "argv.log")
+	stub := filepath.Join(dir, "osascript")
+	script := `#!/bin/sh
+printf '%s\n' "$@" > "` + log + `"
+case "$MINTRUN_TEST_DIALOG" in
+allow) exit 0 ;;
+deny) echo "0:251: execution error: User canceled. (-128)" >&2; exit 1 ;;
+*) echo "0:251: execution error: No user interaction allowed. (-1713)" >&2; exit 1 ;;
+esac
+`
+	if err := os.WriteFile(stub, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	orig := core.OsascriptPath
+	core.OsascriptPath = stub
+	t.Cleanup(func() { core.OsascriptPath = orig })
+
+	for _, c := range []struct {
+		dialog string
+		want   bool
+		err    bool
+	}{{"allow", true, false}, {"deny", false, false}, {"headless", false, true}} {
+		t.Setenv("MINTRUN_TEST_DIALOG", c.dialog)
+		ok, err := core.OSApproval(context.Background(), req)
+		if ok != c.want || (err != nil) != c.err {
+			t.Errorf("%s: got (%v, %v), want (%v, error %v)", c.dialog, ok, err, c.want, c.err)
+		}
+		argv, _ := os.ReadFile(log)
+		lines := strings.Split(strings.TrimSuffix(string(argv), "\n"), "\n")
+		if len(lines) != 2 || lines[0] != "-e" || !strings.HasPrefix(lines[1], `display dialog "mintrun HITL Security Gate\n\n`) || !strings.Contains(lines[1], `• Command: gh pr list`) {
+			t.Errorf("%s: osascript argv = %q", c.dialog, argv)
+		}
+	}
+}
+
 func TestMain(m *testing.M) {
 	if os.Getenv("MINTRUN_VAULT_KEY") == "" {
 		os.Setenv("MINTRUN_VAULT_KEY", "mintrun-unit-test-passphrase")
