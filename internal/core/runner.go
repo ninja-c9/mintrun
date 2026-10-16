@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"os/exec"
@@ -582,4 +584,45 @@ func (rt *Runtime) writeAudit(entry AuditEntry) {
 		return
 	}
 	_, _ = f.Write(append(line, '\n'))
+}
+
+// TailAudit streams an audit log line by line and calls fn, in log order, for each entry matching
+// provider (case-insensitive) and failedOnly; unparseable lines are skipped. With limit > 0 only
+// the last limit matches are kept and handed over at the end, so memory stays bounded however
+// long the log grows.
+// ponytail: reads the whole log each call (O(log) time); seek back from the end if it reaches GBs.
+func TailAudit(r io.Reader, provider string, failedOnly bool, limit int, fn func(line string, e AuditEntry)) error {
+	type match struct {
+		line string
+		e    AuditEntry
+	}
+	var last []match
+	br := bufio.NewReader(r) // no line-length cap, unlike bufio.Scanner: an entry holds a full argv
+	for {
+		line, err := br.ReadString('\n')
+		var e AuditEntry
+		if json.Unmarshal([]byte(line), &e) == nil &&
+			(provider == "" || strings.EqualFold(e.Provider, provider)) &&
+			(!failedOnly || e.ExitCode != 0 || e.Error != "") {
+			line = strings.TrimRight(line, "\r\n")
+			if limit <= 0 {
+				fn(line, e)
+			} else {
+				if len(last) == limit {
+					last = last[1:]
+				}
+				last = append(last, match{line, e})
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+	for _, m := range last {
+		fn(m.line, m.e)
+	}
+	return nil
 }

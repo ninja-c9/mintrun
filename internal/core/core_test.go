@@ -7,14 +7,17 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/ninja-c9/mintrun/internal/builtin"
@@ -1054,6 +1057,47 @@ func TestExecBlindKillsProcessGroup(t *testing.T) {
 // TestMain supplies a deterministic file-vault passphrase for the suite. The
 // AES-256-GCM fallback now mandates MINTRUN_VAULT_KEY (audit C3); tests that need
 // the "no passphrase" error path override it locally with t.Setenv.
+// TestTailAudit pins the streaming reader `mintrun audit` and `mintrun_audit` share: log order,
+// filters, the last-N window, skipped junk, no line-length cap, and read errors.
+func TestTailAudit(t *testing.T) {
+	long := strings.Repeat("x", 100<<10) // past bufio.Scanner's 64 KiB default token size
+	log := `{"provider":"cloudflare","exit_code":0}
+not json
+
+{"provider":"GitHub","exit_code":1}
+{"provider":"github","error":"denied","command":["gh","` + long + `"]}
+{"provider":"cloudflare","exit_code":2}` // no trailing newline
+	lines := strings.Split(log, "\n")
+	cf, gh1, gh2, cf2 := lines[0], lines[3], lines[4], lines[5]
+	for _, c := range []struct {
+		provider string
+		failed   bool
+		limit    int
+		want     []string
+	}{
+		{"", false, 0, []string{cf, gh1, gh2, cf2}},
+		{"github", false, 0, []string{gh1, gh2}},
+		{"", true, 0, []string{gh1, gh2, cf2}},
+		{"", false, 2, []string{gh2, cf2}},
+		{"", true, 1, []string{cf2}},
+	} {
+		var got []string
+		err := core.TailAudit(strings.NewReader(log), c.provider, c.failed, c.limit, func(line string, e core.AuditEntry) {
+			if !strings.Contains(line, `"provider":"`+e.Provider+`"`) {
+				t.Errorf("entry %q handed over with line %.60q", e.Provider, line)
+			}
+			got = append(got, line)
+		})
+		if err != nil || !slices.Equal(got, c.want) {
+			t.Errorf("TailAudit(%q, %v, %d) = %d lines (%v), want %d", c.provider, c.failed, c.limit, len(got), err, len(c.want))
+		}
+	}
+	boom := errors.New("disk gone")
+	if err := core.TailAudit(io.MultiReader(strings.NewReader(cf+"\n"), iotest.ErrReader(boom)), "", false, 1, func(string, core.AuditEntry) {}); !errors.Is(err, boom) {
+		t.Fatalf("expected the read error, got %v", err)
+	}
+}
+
 func TestMain(m *testing.M) {
 	if os.Getenv("MINTRUN_VAULT_KEY") == "" {
 		os.Setenv("MINTRUN_VAULT_KEY", "mintrun-unit-test-passphrase")
