@@ -349,8 +349,9 @@ func (g *GitHubProvider) Mint(ctx context.Context, masterSecret string, req core
 	}
 
 	// Format for JIT Installation Token minting, parsed the same way whether or not
-	// Params["installation_id"] is set (the param overrides only the installation ID):
-	// 1. "<app_id>:<installation_id>:<rsa_private_key_pem>" (auto-signs RS256 JWT)
+	// Params["installation_id"] is set. The param only fills in an installation the master does
+	// not pin; one that differs from the pinned installation is refused before any request:
+	// 1. "<app_id>:<installation_id>:<rsa_private_key_pem>" (auto-signs RS256 JWT; "<app_id>::<pem>" pins none)
 	// 2. "<installation_id>:<app_jwt>"
 	// 3. "<app_jwt>" with Params["installation_id"]
 	var instID string
@@ -371,6 +372,9 @@ func (g *GitHubProvider) Mint(ctx context.Context, masterSecret string, req core
 		}
 	}
 	if id := req.Params["installation_id"]; id != "" {
+		if instID != "" && id != instID {
+			return nil, errors.New(`github installation_id param differs from the installation pinned in the stored credential; to let an agent pick the installation, store <app_id>::<private_key_pem> and list the IDs it may use in "allowed_installations" in policy.json`)
+		}
 		instID = id
 	}
 

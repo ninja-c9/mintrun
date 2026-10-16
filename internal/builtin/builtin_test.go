@@ -264,9 +264,9 @@ func TestGitHubProviderAndJWTSigningComprehensive(t *testing.T) {
 		t.Fatal("expected HTTP 400 error")
 	}
 
-	// params.installation_id overrides only the installation ID: the master is parsed the same way
-	// with or without it, so a composite key is still signed into a JWT, and key material that was
-	// not signed never reaches the Authorization header.
+	// params.installation_id only fills in an installation the master does not pin: the master is
+	// parsed the same way with or without it, so a composite key is still signed into a JWT, and
+	// key material that was not signed never reaches the Authorization header.
 	const appJWT = "mock.app.jwt"
 	const jwtHeader = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9" // base64url {"alg":"RS256","typ":"JWT"}
 	checkAppJWT := func(auth string) string {
@@ -288,23 +288,25 @@ func TestGitHubProviderAndJWTSigningComprehensive(t *testing.T) {
 		return ""
 	}
 	inst777 := map[string]string{"installation_id": "777"}
-	for _, tc := range []struct{ name, master, bearer string }{
-		{"composite escaped PEM", "12345:555:" + escapedPEM, ""}, // "" expects a JWT signed by privKey
-		{"composite multi-line PEM", "12345:555:" + pkcs1PEM, ""},
-		{"installation_id:jwt master", "555:" + appJWT, appJWT},
-		{"bare jwt master", appJWT, appJWT},
+	for _, tc := range []struct{ name, master, inst, bearer string }{
+		{"composite escaped PEM", "12345:555:" + escapedPEM, "555", ""}, // "" expects a JWT signed by privKey
+		{"composite multi-line PEM", "12345:555:" + pkcs1PEM, "555", ""},
+		{"unpinned composite escaped PEM", "12345::" + escapedPEM, "777", ""},
+		{"unpinned composite multi-line PEM", "12345::" + pkcs1PEM, "777", ""},
+		{"installation_id:jwt master", "555:" + appJWT, "555", appJWT},
+		{"bare jwt master", appJWT, "777", appJWT},
 	} {
 		t.Run("installation_id param with "+tc.name, func(t *testing.T) {
 			sent = nil
-			lease, err := gh.Mint(ctx, tc.master, core.MintRequest{Scope: "org/repo", Params: inst777})
+			lease, err := gh.Mint(ctx, tc.master, core.MintRequest{Scope: "org/repo", Params: map[string]string{"installation_id": tc.inst}})
 			if err != nil {
 				t.Fatalf("mint failed: %v", err)
 			}
-			if !strings.HasPrefix(lease.ID, "gh-inst-777-") || lease.RevokeSecret != "ghs_minted_777" {
-				t.Fatalf("expected a lease for installation 777, got %s", lease.ID)
+			if !strings.HasPrefix(lease.ID, "gh-inst-"+tc.inst+"-") || lease.RevokeSecret != "ghs_minted_"+tc.inst {
+				t.Fatalf("expected a lease for installation %s, got %s", tc.inst, lease.ID)
 			}
-			if len(sent) != 1 || sent[0].path != "/app/installations/777/access_tokens" {
-				t.Fatalf("expected one request to installation 777, got %d", len(sent))
+			if len(sent) != 1 || sent[0].path != "/app/installations/"+tc.inst+"/access_tokens" {
+				t.Fatalf("expected one request to installation %s, got %d", tc.inst, len(sent))
 			}
 			if strings.Contains(sent[0].dump, "-----BEGIN") {
 				t.Fatal("the request to GitHub carried PEM key material")
@@ -315,6 +317,26 @@ func TestGitHubProviderAndJWTSigningComprehensive(t *testing.T) {
 				}
 			} else if sent[0].auth != "Bearer "+tc.bearer {
 				t.Fatalf("expected %q, got %q", "Bearer "+tc.bearer, sent[0].auth)
+			}
+		})
+	}
+	// An agent cannot swap a pinned installation: the param is refused before any request, and
+	// the error quotes neither the master nor the installation ID cut from it.
+	for _, tc := range []struct{ name, master string }{
+		{"composite escaped PEM", "12345:555:" + escapedPEM},
+		{"composite multi-line PEM", "12345:555:" + pkcs1PEM},
+		{"installation_id:jwt master", "555:" + appJWT},
+	} {
+		t.Run("installation_id param cannot swap the pin of "+tc.name, func(t *testing.T) {
+			sent = nil
+			_, err := gh.Mint(ctx, tc.master, core.MintRequest{Scope: "org/repo", Params: inst777})
+			if err == nil || !strings.Contains(err.Error(), "pinned") || len(sent) != 0 {
+				t.Fatalf("expected the pin refusal before any request, got %v (%d requests)", err, len(sent))
+			}
+			for _, leak := range []string{"-----BEGIN", appJWT, "555"} {
+				if strings.Contains(err.Error(), leak) {
+					t.Fatalf("the error text quotes the master (%s)", leak)
+				}
 			}
 		})
 	}
@@ -343,7 +365,7 @@ func TestGitHubProviderAndJWTSigningComprehensive(t *testing.T) {
 		params       map[string]string
 	}{
 		{"signed JWT", "12345:echo:" + escapedPEM, nil},
-		{"signed JWT with installation_id param", "12345:555:" + escapedPEM, map[string]string{"installation_id": "echo"}},
+		{"signed JWT with installation_id param", "12345::" + escapedPEM, map[string]string{"installation_id": "echo"}},
 		{"JWT from installation_id:jwt master", "echo:" + appJWT, nil},
 	} {
 		t.Run("error echo scrubs "+tc.name, func(t *testing.T) {
