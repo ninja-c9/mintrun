@@ -1,6 +1,6 @@
 # Example Plugins
 
-Three plugins you can install straight from a clone. Each is one Python script (Python 3.9 or later, standard library only) that speaks the protocol in the main README's [Polyglot Plugin SDK](../../README.md#polyglot-plugin-sdk) section: one JSON request on `stdin`, one JSON reply on `stdout`.
+Three plugins built into the `mintrun` binary: `mintrun plugin install <name>` installs one with no clone or download. Each is one Python script (Python 3.9 or later, standard library only) that speaks the protocol in the main README's [Polyglot Plugin SDK](../../README.md#polyglot-plugin-sdk) section: one JSON request on `stdin`, one JSON reply on `stdout`.
 
 | Plugin | Kind | Needs | What it does |
 |---|---|---|---|
@@ -9,13 +9,13 @@ Three plugins you can install straight from a clone. Each is one Python script (
 | [`postgres-jit`](postgres-jit/run) | provider | `psql`, PostgreSQL 14 or later | Creates a login role for each command and drops it on exit |
 
 ```bash
-mintrun plugin install ./examples/plugins/postgres-jit
+mintrun plugin install postgres-jit
 mintrun plugin list
 ```
 
-`plugin install` copies the plugin into `~/.mintrun/plugins/<name>/`, so install it again after you edit it. `mintrun plugin remove <name>` deletes that copy.
+`plugin install` copies the plugin into `~/.mintrun/plugins/<name>/`, and `mintrun plugin remove <name>` deletes that copy. A bare name always installs the copy built into the binary, never a directory of that name in the current directory. To run your own edits, install the directory by its path, and again after each edit: `mintrun plugin install ./examples/plugins/postgres-jit`.
 
-**What has been tested:** `go test ./cmd/mintrun` (`TestExamplePlugins`) installs all three through the CLI and runs them against stand-ins: a stub `bw`, a stub `psql`, and a local Vercel API. `postgres-jit` has also run against real PostgreSQL 15 and 16 servers. `bitwarden` and `vercel` have not run against a real Bitwarden account or the real Vercel API.
+**What has been tested:** `go test ./cmd/mintrun` (`TestExamplePlugins`) installs all three through the CLI and runs them against stand-ins: a stub `bw`, a stub `psql`, and a local Vercel API. `TestPluginInstallCatalog` installs each by name and checks that the installed files match this directory byte for byte. `postgres-jit` has also run against real PostgreSQL 15 and 16 servers. `bitwarden` and `vercel` have not run against a real Bitwarden account or the real Vercel API.
 
 Each plugin passes secrets to its helper on `stdin` or in its environment, never on its command line, where `ps` shows them. It never quotes a helper's `stdout`, which can hold the secret, and it removes every secret it knows from its error messages before returning them.
 

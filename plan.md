@@ -6,11 +6,11 @@
 
 ## 1. Standard Acceptance Checks (`<layer_3_tools_hooks>`)
 
-Every change to `cmd/` or `internal/` must pass the following verification pipeline before completion:
+Every change to `cmd/`, `internal/`, or `examples/` must pass the following verification pipeline before completion:
 
 1. **Format & Static Analysis:**
    ```bash
-   gofmt -s -l cmd internal && go vet ./...
+   gofmt -s -l cmd internal examples && go vet ./...   # never gofmt . (rule 17)
    ```
 2. **Hermetic Test Suite & Coverage Gate (`> 90%`):**
    ```bash
@@ -139,18 +139,61 @@ Every change to `cmd/` or `internal/` must pass the following verification pipel
   go test -count=1 -v -run 'TestTelegramApproval' ./internal/builtin
   ```
 
+### Workstream J — Install Example Plugins by Name
+- **Files:** `examples/plugins/embed.go`, `cmd/mintrun/main.go`, `cmd/mintrun/examples_test.go`, `README.md`, `examples/plugins/README.md`
+- **Deliverables:**
+  1. `[SERIAL]` `examples/plugins/embed.go` embeds the three example plugins in the binary, and `mintrun plugin install <name>` installs one through `core.InstallPlugin` from a temporary copy that it removes. A bare name built into the binary wins over a directory of that name in the working directory, which installs by its path (`./bitwarden`).
+  2. `[SERIAL]` `TestPluginInstallCatalog` installs every directory under `examples/plugins/` by name and compares the installed files with the source byte for byte.
+- **Not built:** a remote index for third-party plugins. A plugin from outside this repo still installs from a directory, or from an `https://` URL with `#sha256=`.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestPluginInstallCatalog|TestExamplePlugins' ./cmd/mintrun
+  ```
+
 ---
 
 ## 3. Deferred Backlog (Next Actionable Items)
 
-1. **OS Network Sandbox (`no_network: true`), awaiting approval:**
-   - Optional per-OS network isolation for the child: a Linux `CLONE_NEWNET` network namespace or a macOS `sandbox-exec` deny-network profile. It must fail closed when requested but unsupported on the host.
-   - Open questions before building it: every built-in provider mints a credential for a CLI that calls a network API, so the flag only fits offline commands. A macOS `(deny network*)` profile also blocks Unix sockets (`ssh-agent`, Docker). Many Linux hosts restrict the unprivileged user namespaces that `CLONE_NEWNET` needs.
+1. **Child Sandbox: Keep the Blind Command Out of the Vault, awaiting approval:**
+   - **Goal:** while the blind command runs, it cannot read `mintrun`'s home (`~/.mintrun` or `MINTRUN_HOME`: `vault.json`, `policy.json`, `audit.jsonl`, plugins) or the user's Keychain, which closes two routes README §5 lists. It is not isolation: the command still runs as the user, keeps the network and the rest of `HOME`, and can leave something behind (a shell profile line, a LaunchAgent) that runs later outside the sandbox. The docs must say so (rule 23).
+   - **Switch:** policy `"sandbox": true` per provider, and a request flag (CLI `-sandbox`, MCP `sandbox`) that can only tighten it, like `clean_env` (rule 11). The check lives in `CheckPolicy` (rule 16): a sandbox the host cannot provide is a denial before any vault opens.
+   - **macOS:** run `/usr/bin/sandbox-exec -p <profile> -D MINTRUN_DIR=<home> -D KEYCHAINS=<~/Library/Keychains> -- <argv>`, with both paths resolved by `filepath.EvalSymlinks` first, because the profile matches real paths. `sandbox-exec` is deprecated but still ships; a missing one is a denial.
+     ```
+     (version 1)
+     (allow default)
+     (deny file-read* file-write* (subpath (param "MINTRUN_DIR")))
+     (deny file-read* file-write* (subpath (param "KEYCHAINS")))
+     (deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd.xpc"))
+     ```
+   - **Spike (2026-10-16, macOS 27.0 build 26A428, a throwaway `HOME`; no real vault or Keychain item was read):**
+     - `pass` The first rule alone: reading `vault.json`, listing the directory, and writing into it fail (exit 1); other `HOME` files, a local HTTP request (200), and `git` still work.
+     - `pass` The whole profile: `security find-generic-password` can no longer start a search (a parameter error on `stderr`; the exit code stays 44, so only `stderr` tells it from a miss); TLS through Go's platform verifier and `curl` (200), `git`, and `python3` still work.
+     - `pass` The Keychain file rule without the two `mach-lookup` names changed nothing a probe could see, so those names are required.
+     - `pass` The child could not read its parent's environment: `ps -E -ww -p $PPID` and `sysctl KERN_PROCARGS2` on the parent returned 319 to 742 bytes without the canary, while the same reads of the child's own pid returned 5,012 bytes with it (the positive control), also outside the sandbox the test shell ran in. README §5 and rule 23 now say this for macOS 27.0 only; older releases and a debugger attach are untested.
+     - `unresolved` A real Keychain item becoming unreadable inside the profile: needs a throwaway item, read once outside (found) and once inside (refused), in a `-tags integration` test run with the user's go-ahead.
+   - **Cost:** inside the sandbox, tools that keep their own credential in the Keychain (`gh` with a stored token, `git` with `osxkeychain`) fail; the lease's environment (`GH_TOKEN`, `CLOUDFLARE_API_TOKEN`, …) replaces them.
+   - **Linux (design only):** Landlock only grants access, so hiding one directory means granting every other path. Instead `mintrun` re-executes itself in new user and mount namespaces (`SysProcAttr.Cloneflags`), mounts an empty `tmpfs` over its home, and then `exec`s the command. Ubuntu 24.04 blocks unprivileged user namespaces by default (`kernel.apparmor_restrict_unprivileged_userns=1`), so the check must probe and deny. libsecret answers over the D-Bus session bus, which a mount namespace does not hide, so `sandbox` is a denial on Linux until a test proves `secret-tool lookup` fails inside. `/proc/$PPID/environ` stays readable unless `mintrun` makes itself non-dumpable (`PR_SET_DUMPABLE`, untested).
+   - **Tests:** the denials (no `sandbox-exec`, Linux) pinned in `TestCheckPolicyMatchesExecBlind`; a stub `sandbox-exec` that records the profile and the resolved paths; a `-tags integration` test that runs the real profile against a throwaway home and Keychain item.
+   - **`no_network` stays open:** every built-in provider's CLI calls a network API, so it fits offline commands only, and a macOS `(deny network*)` also blocks Unix sockets (`ssh-agent`, Docker).
 2. **Linux Host Verification:**
    - Run integration tests against real `secret-tool` on Linux, and `-approve` with Telegram as the only channel (`OSApproval` is macOS-only).
-3. **Live Telegram, Bitwarden & Vercel Runs:**
-   - Telegram approval, the `bitwarden` vault, and the `vercel` provider have run only against a local Bot API, a stub `bw`, and a local Vercel API. Run each against a throwaway bot or account, with the user's go-ahead, before documenting it as verified.
+3. **Live Runs: Telegram, 1Password, Bitwarden & Vercel:**
+   - These have run only against stand-ins (a local Bot API, a mock `op`, a stub `bw`, a local Vercel API). The user runs each check below with a throwaway bot or account of their own, and `checks.md` §3 turns `pass` only on that run's output.
+   - **Telegram:** create a bot with @BotFather and send it `/start`, store `<user_id>:<bot_token>` at the hidden prompt of `./mintrun secret set approval-telegram`, then run `./mintrun exec -approve -provider <p> -scope <s> -- true` three times, with `<p>` a provider whose master secret is already stored: tap Allow (the command runs), tap Deny (it does not), and on macOS click the dialog first (the Telegram message is edited to show the outcome). `audit.jsonl` gets one entry per run, and no output holds the token.
+   - **1Password:** after `op signin`, `MINTRUN_VAULT=1password ./mintrun secret set mintrun-live-test`, then `secret check`, `secret set` again (one active item remains and the older one is archived), and `secret delete`.
+   - **Bitwarden:** `./mintrun plugin install bitwarden`, `export BW_SESSION="$(bw unlock --raw)"`, then `MINTRUN_VAULT=bitwarden ./mintrun secret set mintrun-live-test`, `secret check`, and `secret delete` (the note moves to the trash).
+   - **Vercel:** `./mintrun plugin install vercel`, store a Vercel token with `./mintrun secret set vercel`, then `./mintrun exec -provider vercel -ttl 300 -- npx vercel whoami` (the minted token works) and `-- sleep 60`: the account's token list shows the new token while the command runs, and it is gone after the command exits.
 4. **Two-Way Slack Approval:**
    - Deferred: an incoming webhook only sends, so it cannot carry an answer back. A Slack app could post with `chat.postMessage` and poll `conversations.replies` or `reactions.get` with the standard library; Socket Mode needs WebSockets, which the standard library lacks. Build it when a user asks for Slack.
 5. **GCP `token_uri` From the Service-Account Key:**
    - Deferred: only keys outside the default Google universe carry a different `token_uri`, and honoring it also means sending revocation to that universe. Add it when such a key is in use.
+6. **Team Relay (`mintrun relay`), design only, awaiting approval:**
+   - **Goal:** one server holds the master secrets, the policy, and the audit log; a developer's laptop holds no master and receives only leases.
+   - **Server:** `mintrun relay -listen <addr>` serves HTTPS only (`crypto/tls`, TLS 1.3). Each laptop authenticates with its own client certificate (mutual TLS) or bearer token, revocable one device at a time. `POST /v1/mint` takes an `ExecRequest` and runs `CheckPolicy`, approval (Telegram, or Slack once built: the server has no screen for the macOS dialog), `Mint`, and the audit entry, then returns the lease's `env`, the values to redact, the lease ID, and the expiry; `Lease.RevokeSecret` stays on the server. `POST /v1/revoke` takes the lease ID, the exit code, and `truncated`. The server also revokes each lease when it expires, so a laptop that crashes or goes offline never keeps a credential past its TTL.
+   - **Client:** `mintrun exec -relay https://<host>` (or `MINTRUN_RELAY`) mints through the server, runs the command locally with the lease, scrubs the output against the lease values, and reports the exit to the server.
+   - **Limits the docs must state:**
+     - The lease reaches the laptop: the command, and anything else running as that user, can use it until it expires or is revoked.
+     - The server sees only what the laptop says it will run, so `blocked_commands` and the approval message are only as honest as the client. The limits a laptop cannot dodge are the ones applied at mint time: provider, scope, permissions, TTL, installations.
+     - Static mode is always refused over the relay, because it would send the master itself to the laptop.
+   - **Open questions:** who enrolls and retires devices, per-device rate limits, where the server keeps masters (the Keychain on macOS, the file vault on Linux), and failing closed while the server is down.
+   - **First slice:** per-device tokens, no static mode, Telegram approval, tests against `httptest.NewTLSServer`.

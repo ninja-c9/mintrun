@@ -22,8 +22,8 @@
 - **Verification Report:** [checks.md](checks.md)
 - **Security Audit Report:** [audit.md](audit.md)
 - **Pipeline Status:**
-  - `gofmt -s -l cmd internal` and `go vet ./...`: clean (`0` issues)
-  - `go test -count=1 -cover ./...` (without build tags): **94.0%** total statement coverage (`cmd/mintrun` 95.1%, `internal/builtin` 93.7%, `internal/core` 94.2%)
+  - `gofmt -s -l cmd internal examples` and `go vet ./...`: clean (`0` issues)
+  - `go test -count=1 -cover ./...` (without build tags): **93.9%** total statement coverage (`cmd/mintrun` 94.3%, `internal/builtin` 93.7%, `internal/core` 94.2%)
   - `go test -race -count=1 ./...`: pass (`0` data races)
   - `go build -trimpath -o mintrun ./cmd/mintrun && ./mintrun plugin list`: pass (`7` built-in plugins registered, `0` local path strings in binary)
   - Cross-compilation (`GOOS=linux`, `GOOS=windows`, `GOOS=freebsd`): pass
@@ -32,10 +32,11 @@
 
 ## 3. Open Items & Next Steps
 
-- **OS Network Sandbox (`no_network: true`):** Optional fail-closed network namespace / `sandbox-exec` isolation for child processes; awaiting approval of the open questions in [plan.md](plan.md).
+- **Child Sandbox (`sandbox: true`):** keep the blind command out of `~/.mintrun` and the Keychain with a macOS `sandbox-exec` profile; designed with spike evidence in [plan.md](plan.md) §3 item 1, awaiting approval. `no_network` stays open.
+- **Team Relay (`mintrun relay`):** a server that holds the masters and hands laptops leases only; designed in [plan.md](plan.md) §3 item 6, awaiting approval.
 - **Live 1Password Verification:** Run `mintrun secret set`, `check`, and `rm` against a real 1Password account; the `stdin` item template and the archiving of older items are tested against a mock `op` only.
 - **Linux Host Verification:** Verify `secret-tool`, and `-approve` with Telegram as the only channel, on a Linux host.
-- **Live Telegram, Bitwarden & Vercel Verification:** Telegram approval, the `bitwarden` vault, and the `vercel` provider are tested against a local Bot API, a stub `bw`, and a local Vercel API only; run each against a real bot or account before calling it verified.
+- **Live Telegram, Bitwarden & Vercel Verification:** Telegram approval, the `bitwarden` vault, and the `vercel` provider are tested against a local Bot API, a stub `bw`, and a local Vercel API only; run each against a real bot or account before calling it verified. The steps are in [plan.md](plan.md) §3 item 3.
 - **Two-Way Slack Approval:** Not built, because an incoming webhook only sends. It needs a Slack app token, `chat.postMessage`, and polling for the answer; Socket Mode needs WebSockets, which the standard library lacks.
 - **Audit Read Time:** `TailAudit` bounds memory but still scans the whole log on every read; seek back from the end if it reaches gigabytes.
 
@@ -58,3 +59,13 @@
 - **Kiểm chứng:** các dòng Approval Channels, Telegram Approval, Example Plugins, `postgres-jit` on Real PostgreSQL và Hermetic Default Test Suite trong `checks.md`; 28/28 mutant đều bị test bắt.
 - **Chưa kiểm chứng:** bot Telegram, tài khoản Bitwarden và Vercel thật; máy Linux.
 - **Next step:** xong — Workstreams F, G, H, I đã được tag `v0.9.0` tại `8a873f1` (2026-10-16).
+
+## Checkpoint — Cài plugin mẫu theo tên, thiết kế sandbox & relay (2026-10-16)
+
+- **Hoàn thành:** `mintrun plugin install <tên>` cài `bitwarden`, `vercel`, `postgres-jit` từ bản đóng gói sẵn trong binary, không cần clone hay tải về; thiết kế sandbox cho tiến trình con, relay cho team và các bước kiểm thử trên tài khoản thật (đều trong `plan.md` §3).
+- **Outputs:** `examples/plugins/embed.go` (mới), `cmd/mintrun/main.go`, `cmd/mintrun/examples_test.go`, `README.md`, `examples/plugins/README.md`, `plan.md`, `checks.md`, `AGENTS.md` (rule 17, 22, 23; rule 33 mới).
+- **Quyết định:** tên trần luôn cài bản trong binary, không bao giờ cài thư mục cùng tên ở thư mục hiện tại (repo lạ có thể cài sẵn thư mục đó); muốn cài thư mục thì ghi đường dẫn (`./bitwarden`). Chưa làm danh mục plugin từ xa cho bên thứ ba. Sandbox và relay mới là thiết kế, chờ duyệt (AGENTS.md layer 1).
+- **Kiểm chứng:** dòng Install by Name, Child sandbox, Team relay và Parent environment on macOS trong `checks.md`; 5/5 mutant bị `TestPluginInstallCatalog` bắt.
+- **Phát hiện:** trên macOS 27.0, tiến trình con không đọc được biến môi trường của tiến trình cha qua `ps -E` hay `sysctl`, nên README §5 và rule 23 đã được sửa lại cho đúng phiên bản này.
+- **Chưa kiểm chứng:** sandbox chặn một item Keychain thật (cần bạn đồng ý tạo item thử); Linux; Telegram, 1Password, Bitwarden, Vercel trên tài khoản thật.
+- **Next step:** chờ bạn chọn hướng onboarding (đề xuất: `mintrun init` + `mintrun doctor` trước) và duyệt thiết kế sandbox.

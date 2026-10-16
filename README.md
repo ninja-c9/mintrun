@@ -133,7 +133,7 @@ mintrun/
 │       ├── builtin_test.go               # Comprehensive provider, vault, and MCP unit test suite
 │       ├── telegram_test.go              # Telegram approval against a local Bot API
 │       └── keychain_integration_test.go  # Real macOS Keychain round trip (`-tags integration` only)
-├── examples/plugins/                     # Ready-to-install plugins: bitwarden (vault), vercel & postgres-jit (providers)
+├── examples/plugins/                     # Plugins built into the binary (`plugin install <name>`): bitwarden (vault), vercel & postgres-jit (providers)
 └── docs/
     ├── assets/                           # SVG architectural diagrams
     └── video/                            # Self-contained HTML/MP4 motion overview & storyboard
@@ -366,9 +366,9 @@ On Unix the command runs in its own process group. A timeout (5 min by default) 
 | Store | Protects against | Does **not** protect against |
 | :--- | :--- | :--- |
 | **macOS Keychain / Linux libsecret** | Other users and a copy of the disk; the secret never touches `argv`, `ps`, or shell history | Any process running as your user while the keychain is unlocked: it can run `security find-generic-password` or `secret-tool lookup` itself |
-| **Encrypted file vault** (`~/.mintrun/vault.json`) | A copy of `vault.json` (backup, sync folder, lost disk) without the passphrase: AES-256-GCM with a key derived from `MINTRUN_VAULT_KEY` (PBKDF2-HMAC-SHA256, 210,000 iterations, per-vault random salt); a tampered file fails to decrypt | Any process running as your user that can read both `vault.json` and the passphrase (from `mintrun`'s environment, a shell profile, or an MCP config file), a keylogger, or offline guessing of a weak passphrase |
+| **Encrypted file vault** (`~/.mintrun/vault.json`) | A copy of `vault.json` (backup, sync folder, lost disk) without the passphrase: AES-256-GCM with a key derived from `MINTRUN_VAULT_KEY` (PBKDF2-HMAC-SHA256, 210,000 iterations, per-vault random salt); a tampered file fails to decrypt | Any process running as your user that can read both `vault.json` and the passphrase (from a shell profile, an MCP config file, or, on Linux, `mintrun`'s environment), a keylogger, or offline guessing of a weak passphrase |
 
-The blind command is such a process. `mintrun` never passes `MINTRUN_VAULT_KEY` to it, which stops accidental exposure (an `env` dump, a debug log), but a command written to steal secrets can still read `mintrun`'s own environment (`ps -E -p $PPID` on macOS, `/proc/$PPID/environ` on Linux) or query the keystore. `mintrun` keeps raw secrets out of the agent's context and transcripts; it does not sandbox the command it runs. Block what an agent must not run with `blocked_commands`, and use `require_approval` (macOS dialog or Telegram) to see each command before it runs.
+The blind command is such a process. `mintrun` never passes `MINTRUN_VAULT_KEY` to it, which stops accidental exposure (an `env` dump, a debug log), but a command written to steal secrets can still query the keystore, or read `vault.json` and look for the passphrase (a shell profile, an MCP config file, and on Linux `mintrun`'s own environment through `/proc/$PPID/environ`). On macOS 27.0, `ps -E` and `sysctl` showed another process's arguments but not its environment in our test; older releases are untested. `mintrun` keeps raw secrets out of the agent's context and transcripts; it does not sandbox the command it runs. Block what an agent must not run with `blocked_commands`, and use `require_approval` (macOS dialog or Telegram) to see each command before it runs.
 
 ### 6. Known Gap: No Network Sandbox
 
@@ -380,7 +380,7 @@ A blind command keeps network access, so it can send its lease credential elsewh
 
 Because **everything in `mintrun` is a plugin**, any developer can extend `mintrun` with new third-party Vaults (`lastpass`, `bitwarden`, `hashicorp-vault`) or JIT Providers (`vercel`, `supabase`, `digitalocean`, `stripe`) in **any language** (Python, Bash, Node.js, Go, Rust) without recompiling the binary. External plugins cannot override built-in plugin names.
 
-Three working plugins ship in [`examples/plugins/`](examples/plugins/README.md), ready to install from a clone: a `bitwarden` vault, and `vercel` and `postgres-jit` providers.
+Three working plugins ship in [`examples/plugins/`](examples/plugins/README.md) and are built into the binary: a `bitwarden` vault, and `vercel` and `postgres-jit` providers. `mintrun plugin install <name>` installs one with no clone or download.
 
 ### Managing Plugins
 
@@ -388,7 +388,12 @@ Three working plugins ship in [`examples/plugins/`](examples/plugins/README.md),
 # List all built-in and installed external plugins
 ./mintrun plugin list
 
-# Install from a local directory containing plugin.json + executable entrypoint
+# Install a plugin built into the binary by name: bitwarden, vercel, or postgres-jit
+./mintrun plugin install bitwarden
+
+# Install from a local directory containing plugin.json + executable entrypoint.
+# Give it as a path: a bare name built into the binary installs the built-in copy,
+# never a directory of that name in the current directory.
 ./mintrun plugin install ./examples/plugins/bitwarden
 
 # Install a single-file remote plugin bundle over HTTPS with mandatory out-of-band SHA-256 pinning
