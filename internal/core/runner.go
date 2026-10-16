@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -289,8 +290,9 @@ func OSApproval(ctx context.Context, req ExecRequest) (bool, error) {
 	if runtime.GOOS != "darwin" {
 		return false, errors.New("interactive approval requires macOS osascript or custom ApprovalFunc")
 	}
-	msg := fmt.Sprintf("mintrun HITL Security Gate\n\nAllow AI agent to execute command?\n• Provider: %s\n• Scope: %s\n• Command: %s",
-		req.Provider, req.Scope, strings.Join(req.Command, " "))
+	// %q leaves only the \n, \" and \\ escapes AppleScript reads: ApprovalText quotes every field
+	// an agent sets, so the text holds nothing unprintable but its own newlines.
+	msg := ApprovalText("mintrun HITL Security Gate\n\nAllow AI agent to execute command?", req, 1000)
 	script := fmt.Sprintf(`display dialog %q with title "mintrun Security Enclave" buttons {"Deny", "Allow"} default button "Allow" cancel button "Deny" with icon caution`, msg)
 	var stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, OsascriptPath, "-e", script)
@@ -303,6 +305,30 @@ func OSApproval(ctx context.Context, req ExecRequest) (bool, error) {
 		return false, nil
 	}
 	return false, err
+}
+
+// ApprovalText is the request an approver shows a human. Every field an agent sets is quoted, so
+// a newline or quote in an argument cannot fake a line or push the command out of view, and text
+// longer than limit bytes is cut with a warning.
+func ApprovalText(header string, req ExecRequest, limit int) string {
+	quote := func(list []string) string {
+		q := make([]string, len(list))
+		for i, s := range list {
+			q[i] = strconv.Quote(s)
+		}
+		return strings.Join(q, " ")
+	}
+	params := make([]string, 0, len(req.Params))
+	for k, v := range req.Params {
+		params = append(params, strconv.Quote(k)+"="+strconv.Quote(v))
+	}
+	slices.Sort(params)
+	text := fmt.Sprintf("%s\n\nProvider: %q\nScope: %q\nPermissions: %s\nParams: %s\nCommand: %s",
+		header, req.Provider, req.Scope, quote(req.Permissions), strings.Join(params, " "), quote(req.Command))
+	if len(text) > limit {
+		text = strings.ToValidUTF8(text[:limit], "") + "\n\n⚠️ TRUNCATED: the request is longer than this message. Deny unless you know the rest."
+	}
+	return text
 }
 
 // FirstApproval asks every approver at once. The first answer, allow or deny, wins and cancels
