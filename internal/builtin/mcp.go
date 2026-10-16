@@ -132,6 +132,11 @@ func (m *MCPBridge) handleRequest(ctx context.Context, rt *core.Runtime, req jso
 					"type":        "boolean",
 					"description": "Run the command with a minimal environment (PATH, HOME, ... plus policy allowed_env and the lease credentials) instead of inheriting the host environment",
 				},
+				"params": map[string]any{
+					"type":                 "object",
+					"additionalProperties": map[string]any{"type": "string"},
+					"description":          "Provider parameters, e.g. {\"installation_id\": \"12345678\"} to pick a github App installation; a credential that pins an installation refuses any other, and policy allowed_installations, when set, must list it",
+				},
 			},
 			"required": []string{"provider", "command"},
 		}
