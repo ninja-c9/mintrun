@@ -91,13 +91,23 @@ Every change to `cmd/` or `internal/` must pass the following verification pipel
   go test -tags integration -count=1 -v -run TestKeychainVaultRealKeychain ./internal/builtin
   ```
 
+### Workstream F — Keystore Fallback Cleanup
+- **Files:** `internal/builtin/keychain.go`, `internal/builtin/builtin_test.go`
+- **Deliverables:**
+  1. `GetSecret` reads libsecret and the macOS Keychain before the file vault, so an older keystore item used to shadow a secret that `SetSecret` had to store in the file vault. Now, once the file-vault write succeeds, `SetSecret` removes the key from the keystores that failed to store it: the libsecret entry, or the Keychain item and the parts its header names. It uses `deleteKeystores`, which `DeleteSecret` shares. A failed file-vault write deletes nothing.
+  2. A delete that finds nothing is fine. Any other delete failure returns an error saying the secret is in the file vault but an older keystore item could not be removed and still takes precedence on read. The error quotes neither the secret nor the helper's `stderr`.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestKeychainVaultLinuxSecretTool|TestKeychainVaultMacOSSecurity' ./internal/builtin
+  ```
+
 ---
 
 ## 3. Deferred Backlog (Next Actionable Items)
 
-1. **Keystore Fallback Shadowing (bug):**
-   - When a Keychain or libsecret store fails, `SetSecret` writes the file vault, but an older keystore item for the same key still wins in `GetSecret`, so reads return the stale secret. Since Workstream E, only a locked or failing keystore or a secret over 24,000 bytes reaches that path.
-   - Fix: once the file-vault write succeeds, delete the key's keystore item (the Keychain header and its parts, or the libsecret entry), report any failure other than not-found, and pin it with a test.
+1. **Stale File-Vault Copy After a Keystore Store (bug):**
+   - A keystore store that succeeds returns early and leaves any older file-vault copy of the key. `GetSecret` returns that stale copy, after a warning, when a later keystore lookup fails (a locked Keychain, no D-Bus session) and `MINTRUN_VAULT_KEY` is set.
+   - Open question: removing the copy means decrypting `vault.json`, which needs `MINTRUN_VAULT_KEY`, and a macOS Keychain user may not have it set.
 2. **OS Network Sandbox (`no_network: true`), awaiting approval:**
    - Optional per-OS network isolation for the child: a Linux `CLONE_NEWNET` network namespace or a macOS `sandbox-exec` deny-network profile. It must fail closed when requested but unsupported on the host.
    - Open questions before building it: every built-in provider mints a credential for a CLI that calls a network API, so the flag only fits offline commands. A macOS `(deny network*)` profile also blocks Unix sockets (`ssh-agent`, Docker). Many Linux hosts restrict the unprivileged user namespaces that `CLONE_NEWNET` needs.
