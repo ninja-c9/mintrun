@@ -312,6 +312,7 @@ func (k *KeychainVault) SetSecret(ctx context.Context, key, value string) error 
 	if k.SecretTool != "" {
 		_, err := k.secretTool(ctx, value, "store", key, "--label="+k.serviceName(key))
 		if err == nil {
+			k.dropFileCopy(key)
 			return nil
 		}
 		warnFallback("libsecret", "store", key, err)
@@ -319,6 +320,7 @@ func (k *KeychainVault) SetSecret(ctx context.Context, key, value string) error 
 	if !k.ForceFile {
 		err := k.keychainSet(ctx, key, value)
 		if err == nil {
+			k.dropFileCopy(key)
 			return nil
 		}
 		warnFallback("macOS Keychain", "store", key, err)
@@ -332,6 +334,15 @@ func (k *KeychainVault) SetSecret(ctx context.Context, key, value string) error 
 		return fmt.Errorf("stored %q in the encrypted file vault, but removing an older keystore item for it failed (%v); while that item exists, it takes precedence on read", key, err)
 	}
 	return nil
+}
+
+// dropFileCopy removes an older file-vault copy of a key a keystore now holds: GetSecret falls
+// back to it when a keystore lookup fails. The store already succeeded, so a copy that cannot be
+// removed (no MINTRUN_VAULT_KEY to decrypt vault.json) only warns.
+func (k *KeychainVault) dropFileCopy(key string) {
+	if err := k.deleteFileSecret(key); err != nil {
+		fmt.Fprintf(warnOut, "mintrun: warning: stored %q in the OS keystore, but an older copy may remain in the encrypted file vault (%v); a failed keystore lookup falls back to it\n", key, err)
+	}
 }
 
 // DeleteSecret removes the key from every store. A store that does not hold it is fine; any

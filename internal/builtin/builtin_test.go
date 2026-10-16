@@ -963,7 +963,8 @@ func TestGCPProviderPhase5(t *testing.T) {
 // TestKeychainVaultLinuxSecretTool drives the libsecret path through a mock `secret-tool`:
 // the secret must travel on stdin only (never argv), a failing secret-tool must fall back to
 // the encrypted file vault, deleting a libsecret-only key must not demand MINTRUN_VAULT_KEY,
-// and a store that falls back must clear the older libsecret item, which would win on read.
+// a store that falls back must clear the older libsecret item, which would win on read, and a
+// libsecret store must remove the older file-vault copy, or warn when it cannot.
 func TestKeychainVaultLinuxSecretTool(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -1061,6 +1062,37 @@ esac
 	if got, err := kv.GetSecret(ctx, "rotated"); err != nil || got != "new_file_val" {
 		t.Fatalf("an older libsecret item must not shadow the file vault: %q %v", got, err)
 	}
+
+	// The reverse: a libsecret store removes the older file-vault copy, which a failed libsecret
+	// lookup would otherwise return.
+	if err := kv.SetSecret(ctx, "rotated", "newest_libsecret_val"); err != nil {
+		t.Fatal(err)
+	}
+	kv.SecretTool = filepath.Join(dir, "missing")
+	got, err := kv.GetSecret(ctx, "rotated")
+	kv.SecretTool = tool
+	if err == nil {
+		t.Fatalf("a failed libsecret lookup must not return a stale file-vault copy: %q", got)
+	}
+	// Without MINTRUN_VAULT_KEY the copy cannot be decrypted to remove it: the store still succeeds
+	// and warns that the copy may remain, quoting neither secret.
+	t.Setenv("MOCK_SECRET_STORE_FAIL", "1")
+	if err := kv.SetSecret(ctx, "rotated", "file_copy_val"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MOCK_SECRET_STORE_FAIL", "")
+	t.Setenv("MINTRUN_VAULT_KEY", "")
+	warn.Reset()
+	if err := kv.SetSecret(ctx, "rotated", "keystore_only_val"); err != nil {
+		t.Fatalf("a libsecret store must succeed without a passphrase: %v", err)
+	}
+	if w := warn.String(); !strings.Contains(w, `"rotated"`) || !strings.Contains(w, "MINTRUN_VAULT_KEY") || strings.Contains(w, "keystore_only_val") || strings.Contains(w, "file_copy_val") {
+		t.Fatalf("expected a warning that the file-vault copy may remain, without a secret:\n%s", w)
+	}
+	t.Setenv("MINTRUN_VAULT_KEY", "mintrun-unit-test-passphrase")
+	if got, err := kv.getFileSecret("rotated"); err != nil || got != "file_copy_val" {
+		t.Fatalf("a store without a passphrase must leave vault.json as it was: %q %v", got, err)
+	}
 }
 
 // TestKeychainVaultMacOSSecurity drives the macOS Keychain path through a mock security(1): the
@@ -1068,7 +1100,7 @@ esac
 // both `-g` forms byte-exactly; a miss falls back to the file vault quietly, and a real failure
 // falls back with a warning that never carries the secret (audit M7).
 // A store that falls back removes the older item and its parts, which would win on read, or
-// reports that it could not.
+// reports that it could not; a Keychain store removes the older file-vault copy.
 func TestKeychainVaultMacOSSecurity(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -1115,6 +1147,8 @@ esac
 	defer func() { securityPath, warnOut = oldPath, oldWarn }()
 
 	kv := &KeychainVault{HomeDir: filepath.Join(dir, "home")}
+	// A Keychain-only user may not set MINTRUN_VAULT_KEY: with no vault.json, a store stays quiet.
+	t.Setenv("MINTRUN_VAULT_KEY", "")
 	secret := "{\n  \"key\": \"multi \\\\ line\",\n  \"utf8\": \"\u00fcn\u00efcode $HOME; # 'x'\"\n}"
 	if err := kv.SetSecret(ctx, "GCP", secret); err != nil {
 		t.Fatal(err)
@@ -1141,6 +1175,7 @@ esac
 
 	// A real Keychain failure falls back with a warning naming the store and key, never the secret.
 	// The delete fails too, so SetSecret reports that an older item may still win on read.
+	t.Setenv("MINTRUN_VAULT_KEY", "mintrun-unit-test-passphrase")
 	if err := kv.SetSecret(ctx, "fail-key", "fallback_val_777"); err == nil || !strings.Contains(err.Error(), `stored "fail-key" in the encrypted file vault`) || !strings.Contains(err.Error(), "takes precedence on read") || strings.Contains(err.Error(), "fallback_val_777") || strings.Contains(err.Error(), "generic-password failed") {
 		t.Fatalf("expected the precedence error without the secret or security's stderr, got %v", err)
 	}
@@ -1202,6 +1237,9 @@ esac
 		}
 		if got, err := kv.keychainGet(ctx, "huge"); err != nil || got != c.old {
 			t.Fatalf("expected the old value in the Keychain first: %v", err)
+		}
+		if _, err := kv.getFileSecret("huge"); err == nil {
+			t.Fatal("a Keychain store must remove the file-vault copy an oversize secret left")
 		}
 		if err := kv.SetSecret(ctx, "huge", c.val); err != nil {
 			t.Fatal(err)
