@@ -65,3 +65,19 @@
 | Linux HITL approval dialog | `deferred` | `-approve` / `require_approval` uses `osascript` on macOS and fails closed on Linux |
 | Audit read time | `by design` | `TailAudit` bounds memory by `limit`, but every read still scans the whole of `~/.mintrun/audit.jsonl`; seek back from the end if the log reaches gigabytes |
 | File-vault copy left without a passphrase | `by design` | Without `MINTRUN_VAULT_KEY`, a keystore store cannot decrypt an existing `vault.json`, so it only warns that an older copy of the key may remain; once the passphrase is set, a failed keystore lookup can return that copy. Running `secret set` again with the passphrase set removes it |
+
+## Video giới thiệu (`docs/video/`, 2026-10-15)
+
+> Dựng bằng skill motion video `javascript-animation` + `soundtrack` (iart-ai/javascript-animation-skills v0.4.1, MIT). Skill chỉ dùng tạm, không thêm vào repo. Không đổi file Go nào. Số liệu từ lệnh thật.
+
+| step | requirement | verdict | evidence |
+|------|-------------|---------|----------|
+| V1 | HTML tự chứa, không tải gì từ ngoài | pass | `asset-audit.mjs` → CLEAN (`mintrun-intro.html` 60 KB, "embeds and loads nothing") |
+| V2 | Không chữ đè chữ | pass | `layout-check.mjs --every 0.1 --min 4` → CLEAN, 360 khung |
+| V3 | Cut khớp nhịp, không giật tiếng | pass | `sync-check.mjs --tol 100` → 7/7 cut, lệch +10 ms, jump 1.8–4.3 dB (ngưỡng 6 dB). Lần render đầu fail ở cut 6.00 s (+7.3 dB); sửa bằng kick ×0.6 tới beat 16 |
+| V4 | File MP4 | pass | `ffprobe`: h264 1920x1080 30 fps, AAC 48 kHz stereo, 36.000 s, 13,213,715 byte |
+| V5 | Soát hình | pass | contact sheet 1 s và 0.5 s, 32 khung hành động, end card. Đã sửa: icon khóa đè chữ, nhãn vault bị cắt mép, context agent hiện `printenv` cạnh `exit_code:0`, "0 dependency" → "0 dependencies" |
+| V6 | Không lộ secret / đường dẫn local | pass | token trên màn hình đều `FAKE-…`; grep đường dẫn tuyệt đối trong `docs/video/` → 0; tag MP4 chỉ có `encoder`, `handler_name` |
+| V7 | Glyph | pass | chữ tiếng Việt chỉ dùng font sans; chuỗi mono là ASCII cộng `…` `·`; không emoji |
+| V8 | Thông tin đúng với repo | pass | mỗi thông tin trên màn hình có nguồn trong bảng cuối `docs/video/storyboard.md`; lệnh CLI khớp `README.md` (`-provider -scope -perms -ttl --`) |
+| V9 | Pipeline repo không đổi | pass | gofmt 0 file; vet ok; coverage total **93.2%** (cmd/mintrun 92.1%, internal/builtin 93.1%, internal/core 93.6%); `coverage.out` đã xóa; `build -trimpath` OK; `plugin list` → 7 builtin |

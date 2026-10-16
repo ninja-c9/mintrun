@@ -1,0 +1,834 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<title>mintrun intro</title>
+<style>html,body{margin:0;background:#090B10;display:grid;place-items:center;height:100vh}canvas{width:min(100vw,177.78vh);height:auto;max-height:100vh}</style>
+</head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+// mintrun: 36 s intro film. Everything is drawn in code; draw(frame) is a pure function of the frame number.
+// Live preview: open this file and click once to start the soundtrack. Render: append ?render.
+'use strict';
+// ---------- core: format, math, look ----------
+const W = 1920, H = 1080, FPS = 30, DUR = 36, FRAMES = FPS * DUR;
+const cv = document.getElementById('c'); cv.width = W; cv.height = H;
+let ctx = cv.getContext('2d');
+const clamp = (x, a = 0, b = 1) => Math.max(a, Math.min(b, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const ease = t => { t = clamp(t); return t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; };
+const easeOut = t => 1 - Math.pow(1 - clamp(t), 3);
+const easeIn = t => clamp(t) * clamp(t);
+const back = t => { t = clamp(t); const c = 1.7; return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2); };
+const prog = (t, a, b) => clamp((t - a) / (b - a));
+function hash2(a, b) { let n = Math.imul(a | 0, 374761393) + Math.imul(b | 0, 668265263); n = Math.imul(n ^ (n >>> 13), 1274126177); return ((n ^ (n >>> 16)) >>> 0) / 4294967295; }
+function rng(seed) { let a = seed | 0; return () => { a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+// Beat grid: 120 BPM, 1 beat = 0.5 s, 1 bar = 2 s. All choreography below is in beats (B = t / BEAT).
+const BPM = 120, BEAT = 60 / BPM, b = n => n * BEAT;
+const pr = (B, a, d = 1) => clamp((B - a) / d);          // 0 at beat a, 1 at beat a + d
+const pop = (B, a, d = .5) => back(pr(B, a, d));         // overshooting scale-in
+const pulse = (B, a, d = .5) => { const u = (B - a) / d; return u < 0 || u > 1 ? 0 : Math.sin(u * Math.PI); };
+
+// Key beats, shared by the picture and EVENTS (the soundtrack).
+const K = {
+  q: 1, typ: 2, leak: 3, cp: [3.5, 4.5, 5.5], hit: [4, 5, 6], tags: [7, 8, 9],
+  s2: 12, keyFly: 13, guides: 12.5, vault: 13.5, door: 15, stations: 15.5, title: 16, sub: 17, relief: 18, req: 19,
+  s3: 20, bump: 21, shatter: 22, dArr: 22.5, chk: [23, 23.5, 24], open: 25, pass: 26,
+  s4: 28, atVault: 29, unlock: 30, beam: 32, onward: 33, close: 34,
+  s5: 36, plate: 36.5, stamp: 38, disp: 38.5, ttl: 39, lift: 40, slide: 41,
+  s6: 44, inject: 45, frost: 45.5, cmd: 46, tokLine: 47.5, beamOut: 48, deployed: 49,
+  s7: 52, exit: 53, burn: 54, scrub: 55, audit: 56, packet: 56.5, done5: 57,
+  s8: 60, land: 61, chain: 61.5, tag1: 62, tag2: 63, cli: 64, chips: [66, 66.5, 67, 67.5]
+};
+
+const BG = '#090B10', MINT = '#34D399', MINT2 = '#10B981', MINT3 = '#6EE7B7', MINT4 = '#A7F3D0', MINTD = '#064E3B',
+  SKY = '#38BDF8', SKY2 = '#7DD3FC', SKYD = '#0C4A6E', VIO = '#A78BFA', VIO2 = '#C4B5FD', VIOD = '#2E1065', AMB = '#FBBF24', AMB2 = '#FDE68A',
+  ROSE = '#F43F5E', ROSE2 = '#FDA4AF', SL = '#94A3B8', SL2 = '#64748B', SL3 = '#334155', SL4 = '#1E293B', PANEL = '#0F172A', WHITE = '#F8FAFC', TXT = '#E2E8F0';
+const RGB = { mint: '52,211,153', sky: '56,189,248', vio: '167,139,250', amb: '251,191,36', rose: '244,63,94' };
+const SANS = '-apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", Arial, sans-serif', MONO = '"SF Mono", Menlo, monospace';
+const font = (w, s, fam = SANS) => `${w} ${s}px ${fam}`;
+const LOOK = { guideColor: 'rgba(110,231,183,.85)', wobble: 0 };
+
+// Static ground: dark field, soft vignette, fine seeded grain. Rendered once.
+const paper = document.createElement('canvas'); paper.width = W; paper.height = H;
+(() => {
+  const p = paper.getContext('2d'); p.fillStyle = BG; p.fillRect(0, 0, W, H);
+  const g = p.createRadialGradient(W * .5, H * .42, 60, W * .5, H * .5, W * .72);
+  g.addColorStop(0, 'rgba(22,52,50,.40)'); g.addColorStop(.55, 'rgba(10,18,22,.12)'); g.addColorStop(1, 'rgba(0,0,0,.55)');
+  p.fillStyle = g; p.fillRect(0, 0, W, H);
+  const r = rng(7);
+  for (let i = 0; i < 14000; i++) { p.fillStyle = `rgba(${r() < .5 ? '255,255,255' : '0,0,0'},${(.02 + r() * .035).toFixed(3)})`; p.fillRect(r() * W, r() * H, 1.5, 1.5); }
+})();
+
+// ---------- camera + layout claims ----------
+let PX = 1, CAM = { cx: 0, cy: 0, k: 1 };
+function withCamera(cam, fn) { CAM = cam; ctx.save(); ctx.translate(W / 2, H / 2); ctx.scale(cam.k, cam.k); ctx.translate(-cam.cx, -cam.cy); const px = PX; PX = 1 / cam.k; fn(); PX = px; ctx.restore(); }
+const camLerp = (c0, c1, u) => ({ cx: lerp(c0.cx, c1.cx, u), cy: lerp(c0.cy, c1.cy, u), k: Math.exp(lerp(Math.log(c0.k), Math.log(c1.k), u)) });
+const view = () => ({ x0: CAM.cx - W / 2 / CAM.k, x1: CAM.cx + W / 2 / CAM.k, y0: CAM.cy - H / 2 / CAM.k, y1: CAM.cy + H / 2 / CAM.k });
+
+let LAYOUT = [];
+function claim(id, kind, x, y, w, h) {
+  if (ctx.globalAlpha < .05) return;
+  const m = ctx.getTransform(), P = [[x, y], [x + w, y], [x, y + h], [x + w, y + h]].map(([a, c]) => [m.a * a + m.c * c + m.e, m.b * a + m.d * c + m.f]);
+  const xs = P.map(p => p[0]), ys = P.map(p => p[1]), bx = Math.min(...xs), by = Math.min(...ys), bw = Math.max(...xs) - bx, bh = Math.max(...ys) - by;
+  if (bx > W || by > H || bx + bw < 0 || by + bh < 0) return; // entirely off frame
+  LAYOUT.push({ id, kind, x: bx, y: by, w: bw, h: bh });
+}
+
+// ---------- drawing helpers ----------
+function glow(x, y, r, rgb, a) { if (a <= 0) return; const g = ctx.createRadialGradient(x, y, 0, x, y, r); g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`); ctx.fillStyle = g; ctx.fillRect(x - r, y - r, 2 * r, 2 * r); }
+function rr(x, y, w, h, r, fill, stroke, lw = 2) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); if (fill) { ctx.fillStyle = fill; ctx.fill(); } if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw; ctx.stroke(); } }
+function alpha(a, fn) { if (a <= 0) return; ctx.save(); ctx.globalAlpha *= clamp(a); fn(); ctx.restore(); }
+function at(x, y, s, fn) { ctx.save(); ctx.translate(x, y); ctx.scale(s, s); fn(); ctx.restore(); }
+
+// Text, vertically centred on y. o.id claims the ink box for layout-check.
+function text(s, x, y, o = {}) {
+  ctx.save(); ctx.font = o.font || font(600, 32); ctx.textAlign = o.align || 'left'; ctx.textBaseline = 'middle';
+  if (o.alpha != null) ctx.globalAlpha *= clamp(o.alpha);
+  ctx.fillStyle = o.col || TXT; ctx.fillText(s, x, y);
+  const m = ctx.measureText(s);
+  if (o.id) claim(o.id, 'text', x - m.actualBoundingBoxLeft - 2, y - m.actualBoundingBoxAscent - 2, m.actualBoundingBoxLeft + m.actualBoundingBoxRight + 4, m.actualBoundingBoxAscent + m.actualBoundingBoxDescent + 4);
+  ctx.restore(); return m.width;
+}
+const tw = (s, f) => { ctx.save(); ctx.font = f; const w = ctx.measureText(s).width; ctx.restore(); return w; };
+const chars = s => Array.from(s.normalize('NFC'));
+const typed = (s, B, a, d) => { const c = chars(s); return c.slice(0, Math.floor(c.length * pr(B, a, d) + 1e-6)).join(''); };
+
+// Partial polyline (for guides that draw on).
+function polyTo(pts, u, closed = true) {
+  const P = closed ? [...pts, pts[0]] : pts, seg = []; let L = 0;
+  for (let i = 1; i < P.length; i++) { const l = Math.hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]); seg.push(l); L += l; }
+  let rem = L * clamp(u); ctx.beginPath(); ctx.moveTo(...P[0]);
+  for (let i = 1; i < P.length && rem > 0; i++) { const f = Math.min(1, rem / seg[i - 1]); ctx.lineTo(lerp(P[i - 1][0], P[i][0], f), lerp(P[i - 1][1], P[i][1], f)); rem -= seg[i - 1]; }
+}
+// Dashed construction guide: draws on over d beats from beat a, then fades.
+function guideRect(x, y, w, h, B, a, d) {
+  const u = pr(B, a, d), f = 1 - pr(B, a + d, .8); if (u <= 0 || f <= 0) return;
+  ctx.save(); ctx.globalAlpha *= .85 * f; ctx.strokeStyle = LOOK.guideColor; ctx.lineWidth = 1.6 * PX; ctx.setLineDash([9 * PX, 7 * PX]);
+  polyTo([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], u); ctx.stroke(); ctx.restore();
+}
+
+// Vector glyphs (no font dependency).
+function icCheck(x, y, s, col, lw, u = 1) {
+  if (u <= 0) return; ctx.save(); ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  const p = [[-.36, .02], [-.1, .28], [.38, -.3]].map(([a, c]) => [x + a * s, y + c * s]);
+  const L = Math.hypot(p[1][0] - p[0][0], p[1][1] - p[0][1]) + Math.hypot(p[2][0] - p[1][0], p[2][1] - p[1][1]);
+  ctx.setLineDash([L * clamp(u), L + 1]); ctx.beginPath(); ctx.moveTo(...p[0]); ctx.lineTo(...p[1]); ctx.lineTo(...p[2]); ctx.stroke(); ctx.restore();
+}
+function icCross(x, y, s, col, lw, u = 1) {
+  if (u <= 0) return; ctx.save(); ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.lineCap = 'round'; const h = s * .32, u1 = clamp(u * 2), u2 = clamp(u * 2 - 1);
+  ctx.beginPath(); ctx.moveTo(x - h, y - h); ctx.lineTo(x - h + 2 * h * u1, y - h + 2 * h * u1);
+  if (u2 > 0) { ctx.moveTo(x + h, y - h); ctx.lineTo(x + h - 2 * h * u2, y - h + 2 * h * u2); } ctx.stroke(); ctx.restore();
+}
+function icKey(x, y, s, col, lw = 7) { // bow centre at x,y, shaft pointing right
+  ctx.save(); ctx.translate(x, y); ctx.scale(s, s); ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.arc(0, 0, 15, 0, Math.PI * 2); ctx.moveTo(15, 0); ctx.lineTo(62, 0); ctx.moveTo(48, 0); ctx.lineTo(48, 13); ctx.moveTo(59, 0); ctx.lineTo(59, 10); ctx.stroke(); ctx.restore();
+}
+function icEyeSlash(x, y, s, col, lw = 3) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(s, s); ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(-15, 0); ctx.quadraticCurveTo(0, -13, 15, 0); ctx.quadraticCurveTo(0, 13, -15, 0); ctx.stroke();
+  ctx.beginPath(); ctx.arc(0, 0, 4, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(-13, 12); ctx.lineTo(13, -12); ctx.stroke(); ctx.restore();
+}
+function icShield(x, y, s, fill, stroke) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(s, s); ctx.beginPath(); ctx.moveTo(0, -25); ctx.lineTo(21, -17); ctx.lineTo(21, 1);
+  ctx.quadraticCurveTo(19, 18, 0, 27); ctx.quadraticCurveTo(-19, 18, -21, 1); ctx.lineTo(-21, -17); ctx.closePath();
+  ctx.fillStyle = fill; ctx.fill(); ctx.strokeStyle = stroke; ctx.lineWidth = 3; ctx.stroke(); ctx.restore();
+}
+function icArrow(x, y, s, col) { ctx.save(); ctx.strokeStyle = col; ctx.lineWidth = 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.beginPath(); ctx.moveTo(x - s / 2, y); ctx.lineTo(x + s / 2, y); ctx.moveTo(x + s / 2 - 7, y - 7); ctx.lineTo(x + s / 2, y); ctx.lineTo(x + s / 2 - 7, y + 7); ctx.stroke(); ctx.restore(); }
+function dots(x, y, n, r, gap, col) { ctx.fillStyle = col; for (let i = 0; i < n; i++) { ctx.beginPath(); ctx.arc(x + i * gap, y, r, 0, Math.PI * 2); ctx.fill(); } }
+
+// Seeded particle burst (deterministic). Particles land on the floor (y 300), never below it.
+function burst(B, a, x, y, o = {}) {
+  const life = o.life || 1.6, u = (B - a) / life; if (u < 0 || u > 1) return;
+  const dt = (B - a) * BEAT, n = o.n || 24, seed = o.seed || 1, ga = ctx.globalAlpha;
+  ctx.save(); ctx.fillStyle = o.col || ROSE;
+  for (let i = 0; i < n; i++) {
+    const ang = (o.dir ?? -Math.PI / 2) + (hash2(i, seed) - .5) * (o.spread ?? Math.PI * 2), sp = (o.sp || 420) * (.35 + .65 * hash2(seed, i + 99));
+    const sz = (o.size || 7) * (1 - .6 * u);
+    const px = x + (hash2(i, seed + 5) - .5) * (o.w || 0) + Math.cos(ang) * sp * dt;
+    const py = Math.min(300 - sz / 2, y + (hash2(i, seed + 9) - .5) * (o.h || 0) + Math.sin(ang) * sp * dt + (o.g ?? 1400) * dt * dt / 2);
+    ctx.globalAlpha = ga * (1 - u) * (o.alpha ?? 1); ctx.fillRect(px - sz / 2, py - sz / 2, sz, sz);
+  }
+  ctx.restore();
+}
+
+// World backdrop: dot grid (above the floor only) and the floor.
+function grid() {
+  const v = view(), s = 80, r = 1.6 * PX; ctx.fillStyle = 'rgba(148,163,184,.10)';
+  for (let x = Math.floor(v.x0 / s) * s; x <= v.x1; x += s) for (let y = Math.floor(v.y0 / s) * s; y < Math.min(v.y1, 300); y += s) ctx.fillRect(x - r, y - r, 2 * r, 2 * r);
+}
+function floorPlane() {
+  const v = view(); if (v.y1 <= 300) return;
+  const g = ctx.createLinearGradient(0, 300, 0, 300 + 360); g.addColorStop(0, 'rgba(18,30,38,.95)'); g.addColorStop(1, 'rgba(10,14,20,.6)');
+  ctx.fillStyle = g; ctx.fillRect(v.x0, 300, v.x1 - v.x0, v.y1 - 300);
+  ctx.fillStyle = 'rgba(52,211,153,.28)'; ctx.fillRect(v.x0, 300 - PX, v.x1 - v.x0, 2.2 * PX);
+}
+
+// ---------- the AI agent ----------
+// robot(cx, cy, s, o): (cx, cy) = head centre in world units, s = scale, standing on the floor (world y 300).
+// o = { mood: neutral|surprised|worried|relieved|happy, blink: 0..1, t: seconds, pop: 0..1 antenna flash }
+const MOOD = { neutral: [SKY, RGB.sky], surprised: [AMB, RGB.amb], worried: [AMB, RGB.amb], relieved: [MINT, RGB.mint], happy: [MINT, RGB.mint] };
+function robotBob(t) { return Math.sin(t * Math.PI) * 3; } // 2 s period
+function robot(cx, cy, s, o) {
+  const mood = o.mood || 'neutral', blink = o.blink || 0, t = o.t || 0, [mc, mrgb] = MOOD[mood];
+  const bob = robotBob(t), shiver = mood === 'worried' ? Math.sin(t * 70) * 2.2 : 0, floorY = (300 - cy) / s;
+  ctx.save(); ctx.translate(cx, cy); ctx.scale(s, s);
+  // foot on the floor, stem stretches with the bob
+  ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.beginPath(); ctx.ellipse(0, floorY, 110, 9, 0, 0, Math.PI * 2); ctx.fill();
+  rr(-86, floorY - 18, 172, 18, 9, '#1B2533', SL3, 2);
+  ctx.fillStyle = '#273244'; ctx.fillRect(-20, 270 + bob, 40, floorY - 18 - 270 - bob);
+  ctx.translate(shiver, bob);
+  // torso + neck
+  ctx.fillStyle = '#94A3B8'; ctx.fillRect(-30, 86, 60, 30);
+  rr(-150, 112, 300, 170, 60, '#CBD5E1');
+  ctx.save(); ctx.beginPath(); ctx.roundRect(-150, 112, 300, 170, 60); ctx.clip(); ctx.fillStyle = 'rgba(71,85,105,.28)'; ctx.fillRect(70, 112, 90, 170); ctx.restore();
+  rr(-62, 150, 124, 84, 22, '#0B1220');
+  glow(0, 192, 70, mrgb, .35); ctx.fillStyle = mc; ctx.beginPath(); ctx.arc(0, 192, 15, 0, Math.PI * 2); ctx.fill();
+  claim('robot-body', 'keep', -150, 86, 300, 196);
+  // ears
+  ctx.fillStyle = SL; for (const ex of [-130, 130]) { ctx.beginPath(); ctx.ellipse(ex, 0, 17, 42, 0, 0, Math.PI * 2); ctx.fill(); }
+  // antenna
+  ctx.strokeStyle = SL; ctx.lineWidth = 7; ctx.lineCap = 'round'; ctx.beginPath(); ctx.moveTo(0, -88); ctx.lineTo(0, -144); ctx.stroke();
+  const ab = 12 * (1 + .55 * (o.pop || 0));
+  glow(0, -157, 60, mrgb, .55); ctx.fillStyle = mc; ctx.beginPath(); ctx.arc(0, -157, ab, 0, Math.PI * 2); ctx.fill();
+  // head with a shaded right side
+  rr(-120, -90, 240, 180, 48, '#E2E8F0');
+  ctx.save(); ctx.beginPath(); ctx.roundRect(-120, -90, 240, 180, 48); ctx.clip(); ctx.fillStyle = 'rgba(71,85,105,.22)'; ctx.fillRect(66, -90, 60, 180); ctx.restore();
+  claim('robot-head', 'keep', -147, -171, 294, 261);
+  // visor + face
+  rr(-95, -57, 190, 105, 36, '#0B1220');
+  glow(0, -8, 110, RGB.sky, .10);
+  ctx.save(); ctx.fillStyle = SKY; ctx.strokeStyle = SKY; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  const eye = (x, w, h) => { const hh = Math.max(5, h * (1 - blink)); rr(x - w / 2, -12 - hh / 2, w, hh, w / 2, SKY); };
+  if (mood === 'neutral') { eye(-42, 26, 44); eye(42, 26, 44); }
+  if (mood === 'surprised') { eye(-42, 34, 58); eye(42, 34, 58); }
+  if (mood === 'worried') {
+    eye(-42, 26, 40); eye(42, 26, 40); ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.moveTo(-68, -40); ctx.lineTo(-28, -50); ctx.moveTo(68, -40); ctx.lineTo(28, -50); ctx.stroke();
+  }
+  if (mood === 'relieved') { ctx.lineWidth = 7; for (const x of [-42, 42]) { ctx.beginPath(); ctx.arc(x, -20, 17, .15 * Math.PI, .85 * Math.PI); ctx.stroke(); } }
+  if (mood === 'happy') { ctx.lineWidth = 8; for (const x of [-42, 42]) { ctx.beginPath(); ctx.arc(x, -2, 18, 1.12 * Math.PI, 1.88 * Math.PI); ctx.stroke(); } }
+  ctx.lineWidth = 5; ctx.beginPath();
+  if (mood === 'neutral') { ctx.moveTo(-16, 30); ctx.lineTo(16, 30); ctx.stroke(); }
+  if (mood === 'surprised') { ctx.arc(0, 30, 8, 0, Math.PI * 2); ctx.stroke(); }
+  if (mood === 'worried') { ctx.moveTo(-22, 32); for (let i = 1; i <= 4; i++) ctx.lineTo(-22 + i * 11, i % 2 ? 26 : 32); ctx.stroke(); }
+  if (mood === 'relieved') { ctx.arc(0, 18, 16, .2 * Math.PI, .8 * Math.PI); ctx.stroke(); }
+  if (mood === 'happy') { ctx.moveTo(-24, 22); ctx.arc(0, 22, 24, 0, Math.PI); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+  ctx.restore();
+  return bob;
+}
+
+// ---------- left side: the agent, its context, the leaks ----------
+const ROBOT = { x: -2180, y: -60 }, PANEL_BOX = { x: -1960, y: -300, w: 480, h: 360 };
+const LEAK_Y = [-280, -150, -20], LEAK_NAMES = ['stdout', 'transcript', 'log'];
+const TAGS = ['token sống lâu', 'toàn quyền tài khoản', 'lộ qua stdout · transcript'], TAG_Y = [90, 148, 206];
+const SECRET = 'CF_API_TOKEN=FAKE-Kx7f…9Qz', BLINKS = [.6, 10.5, 16.2, 20.5, 40, 62.5, 69];
+const KEY_FROM = { x: -1930, y: -180, s: .55 }, KEY_HOME = { x: -603, y: 130, s: 1.4 }; // bow centre in the panel, then in the vault
+
+function robotMood(B) { return B < K.leak ? 'neutral' : B < K.hit[0] ? 'surprised' : B < K.relief ? 'worried' : B < K.land ? 'relieved' : 'happy'; }
+
+function leftWorld(B, t) {
+  const bob = robotBob(t), P = PANEL_BOX;
+  // hologram cone from the right ear to the panel
+  ctx.save(); ctx.fillStyle = 'rgba(56,189,248,.06)'; ctx.strokeStyle = 'rgba(56,189,248,.20)'; ctx.lineWidth = 1.5 * PX;
+  ctx.beginPath(); ctx.moveTo(ROBOT.x + 146, ROBOT.y + bob); ctx.lineTo(P.x, P.y + 10); ctx.lineTo(P.x, P.y + P.h - 10); ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.restore();
+  const blink = Math.max(...BLINKS.map(x => pulse(B, x, .3)));
+  robot(ROBOT.x, ROBOT.y, 1, { mood: robotMood(B), blink, t, pop: Math.max(pulse(B, K.leak, .6), pulse(B, K.relief, .6), pulse(B, K.land, .6)) });
+
+  // context panel
+  rr(P.x, P.y, P.w, P.h, 18, 'rgba(15,23,42,.9)', 'rgba(56,189,248,.55)', 2);
+  ctx.fillStyle = 'rgba(56,189,248,.10)'; ctx.fillRect(P.x + 2, P.y + 44, P.w - 4, 1.5);
+  claim('panel', 'keep', P.x, P.y, P.w, P.h);
+  const M24 = font(500, 24, MONO), X0 = P.x + 22;
+  text('agent context', X0, P.y + 23, { font: font(600, 20, MONO), col: SL2 });
+  text('# .env', X0, -230, { font: M24, col: SL2 });
+  // L2: the master key, held by the agent (until it flies into the vault)
+  const gone = 1 - pr(B, 13, 3);
+  alpha(gone, () => {
+    if (B < K.keyFly) { glow(KEY_FROM.x, -180, 50, RGB.amb, .35); icKey(KEY_FROM.x, -180, KEY_FROM.s, AMB, 7); }
+    const w = text(SECRET, X0 + 54, -180, { font: M24, col: AMB });
+    strike(X0 + 54, -180, w, pr(B, 12, .8));
+  });
+  // L3: the command the agent runs
+  // printenv is refused at the gate (b21-22); from b22.5 the line is the deploy that goes through
+  const dep = B >= K.dArr, l3 = B < K.relief ? typed('$ printenv', B, K.typ, .6) : dep ? '$ mintrun exec -- wrangler deploy' : typed('$ mintrun exec -- printenv', B, K.relief, .8);
+  const w3 = text(l3, X0, -100, { font: dep ? font(500, 21, MONO) : M24, col: B < K.relief ? SKY2 : MINT3 });
+  if ((B > 1.5 && B < 3.2) || (B > 17.5 && B < 19.2)) if (Math.floor(B * 2) % 2 === 0 || (B > 2 && B < 2.6) || (B > 18 && B < 18.8)) { ctx.fillStyle = SKY2; ctx.fillRect(X0 + w3 + 4, -114, 12, 28); }
+  // L4: the leaked output, later the result handed back by mintrun
+  if (B >= K.leak && B < 17) alpha(pr(B, K.leak, .15) * (1 - pr(B, 13, 3)), () => {
+    glow(X0 + 180, -50, 200, RGB.amb, .16 * (1 + 2 * pulse(B, K.leak, .5)));
+    const w = text(SECRET, X0, -50, { font: M24, col: AMB });
+    strike(X0, -50, w, pr(B, 12.3, .8));
+  });
+  if (B >= K.land) alpha(pr(B, K.land, .4), () => text('{exit_code:0, revoked:true}', X0, -50, { font: M24, col: MINT3 }));
+
+  // leak cards: stdout / transcript / log
+  alpha(1 - pr(B, 12, 1), () => {
+    LEAK_Y.forEach((y, i) => {
+      const hit = B >= K.hit[i], x = -1460;
+      ctx.fillStyle = 'rgba(56,189,248,.35)'; ctx.fillRect(P.x + P.w, y + 50, 20, 1.5 * PX);
+      if (hit) glow(x + 95, y + 50, 150, RGB.amb, .25 * (1 + 2 * pulse(B, K.hit[i], .6)));
+      rr(x, y, 190, 100, 14, 'rgba(15,23,42,.92)', hit ? AMB : SL3, 2.5);
+      claim('leak-' + i, 'keep', x, y, 190, 100);
+      text(LEAK_NAMES[i], x + 16, y + 26, { font: font(600, 22, MONO), col: hit ? AMB2 : SL2, id: 'leak-label-' + i });
+      ctx.fillStyle = 'rgba(148,163,184,.18)'; ctx.fillRect(x + 16, y + 52, 110, 6);
+      if (hit) { ctx.save(); ctx.translate(x + 95, y + 74); const s = pop(B, K.hit[i], .5); ctx.scale(s, s); rr(-60, -9, 120, 18, 9, AMB); ctx.restore(); }
+    });
+    // copies of the secret fly out of the leaked line into each card
+    K.cp.forEach((c, i) => {
+      if (B < c || B >= K.hit[i]) return; const u = ease(pr(B, c, K.hit[i] - c));
+      const x0 = X0 + 170, y0 = -50, x1 = -1365, y1 = LEAK_Y[i] + 74, cx = lerp(x0, x1, .5), cy = Math.min(y0, y1) - 120;
+      for (let k = 3; k >= 0; k--) { const v = clamp(u - k * .06), q = 1 - v; const px = q * q * x0 + 2 * q * v * cx + v * v * x1, py = q * q * y0 + 2 * q * v * cy + v * v * y1;
+        alpha(k ? .25 : 1, () => rr(px - 60, py - 9, 120, 18, 9, AMB)); }
+    });
+    // risk tags
+    TAGS.forEach((s, i) => {
+      if (B < K.tags[i]) return; const y = TAG_Y[i], x = -1940, f = font(600, 26), w = 64 + tw(s, f), sc = pop(B, K.tags[i], .45);
+      ctx.save(); ctx.translate(x, y + 23); ctx.scale(sc, sc);
+      rr(0, -23, w, 46, 23, 'rgba(76,5,25,.75)', ROSE, 2.5);
+      ctx.fillStyle = ROSE; ctx.beginPath(); ctx.arc(26, 0, 12, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = WHITE; ctx.fillRect(24.5, -7, 3, 9); ctx.fillRect(24.5, 4, 3, 3);
+      text(s, 48, 1, { font: f, col: ROSE2 });
+      claim('tag-' + i, 'text', 0, -23, w, 46); ctx.restore();
+    });
+  });
+}
+
+function strike(x, y, w, u) { if (u <= 0) return; ctx.fillStyle = ROSE; ctx.fillRect(x - 6, y - 2, (w + 12) * u, 4); }
+
+// The master key's one trip: from the agent's context into the vault (beats 13 -> 14.8).
+function keyFlight(B) {
+  if (B < K.keyFly || B >= 14.8) return;
+  const path = v => { const q = 1 - v, cx = -1250, cy = -760; return [q * q * KEY_FROM.x + 2 * q * v * cx + v * v * KEY_HOME.x, q * q * KEY_FROM.y + 2 * q * v * cy + v * v * KEY_HOME.y, lerp(KEY_FROM.s, KEY_HOME.s, v)]; };
+  const u = ease(pr(B, K.keyFly, 1.8));
+  for (let k = 4; k >= 0; k--) { const [x, y, s] = path(clamp(u - k * .035)); alpha(k ? .18 : 1, () => { if (!k) glow(x + 20 * s, y, 90 * s, RGB.amb, .45); icKey(x, y, s, AMB, 7); }); }
+}
+
+// Request cards that slide along the floor (centre y 268, resting on y 296).
+function reqCard(x, y, label, f, w, col, o = {}) {
+  ctx.save(); ctx.translate(x, y); if (o.sx) ctx.scale(o.sx, o.sy || 1); if (o.s) ctx.scale(o.s, o.s);
+  if (o.glow) glow(0, 0, w * .75, o.glow, .3);
+  rr(-w / 2, -28, w, 56, 12, PANEL, col, 2.5); claim(o.id || 'card', 'keep', -w / 2, -28, w, 56);
+  text(label, 0, 1, { font: f, col: o.tcol || SKY2, align: 'center' }); ctx.restore();
+}
+const PRINTENV_W = 184, DEPLOY_W = 260;
+function cards(B) {
+  // 1) "$ printenv": leaves the context at b19, slams into the closed gate at b21, shatters at b22
+  if (B >= K.req && B < K.shatter) {
+    let x, y = 268, s = 1, sx = 1, col = SKY, tcol = SKY2;
+    if (B < 19.5) { const u = easeOut(pr(B, K.req, .5)); x = lerp(-1720, -1560, u); y = lerp(-100, 268, u) - Math.sin(u * Math.PI) * 120; s = lerp(.6, 1, u); }
+    else if (B < K.bump) x = lerp(-1560, -1004, easeIn(pr(B, 19.5, 1.5)));
+    else { x = lerp(-1004, -1030, easeOut(pr(B, K.bump, .3))) + Math.sin((B - K.bump) * 40) * 3 * (1 - pr(B, K.bump, .8)); sx = 1 - .12 * pulse(B, K.bump, .3); col = ROSE; tcol = ROSE2; }
+    reqCard(x, y, '$ printenv', font(600, 24, MONO), PRINTENV_W, col, { s, sx, tcol, id: 'card-printenv', glow: B >= K.bump ? RGB.rose : null });
+  }
+  burst(B, K.shatter, -1030, 268, { n: 44, col: ROSE, w: PRINTENV_W, h: 50, sp: 520, size: 9, seed: 3, life: 1.6 });
+  // 2) "$ wrangler deploy": arrives b22.5, cleared b25, visits the vault b29-33, onto the press plate b36.5
+  if (B >= K.bump && B < K.stamp) {
+    let x, y = 268; const ok = B >= K.open;
+    if (B < K.dArr) x = lerp(-1700, -1046, easeOut(pr(B, K.bump, K.dArr - K.bump)));
+    else if (B < 25.5) x = -1046;
+    else if (B < K.onward) x = lerp(-1046, -570, ease(pr(B, 25.5, K.atVault - 25.5)));
+    else { x = lerp(-570, -120, ease(pr(B, K.onward, K.plate - K.onward))); const h = pr(B, 35.5, 1); y = lerp(268, 252, h) - Math.sin(h * Math.PI) * 40; }
+    reqCard(x, y, '$ wrangler deploy', font(600, 22, MONO), DEPLOY_W, ok ? MINT : SKY, { tcol: ok ? MINT4 : SKY2, id: 'card-deploy', glow: ok && B < 26.5 ? RGB.mint : null });
+  }
+}
+
+// ---------- the enclave: walls, policy gate, vault, mint press ----------
+const ENC = { x0: -900, x1: 1360, y0: -440, y1: 300, r: 40 };
+function station(B, a, fn) { const u = easeOut(pr(B, a, .7)); if (u <= 0) return; ctx.save(); ctx.globalAlpha *= u; ctx.translate(0, (1 - u) * 30); fn(); ctx.restore(); }
+
+function enclave(B) {
+  const E = ENC; guideRect(E.x0, E.y0, E.x1 - E.x0, E.y1 - E.y0, B, K.guides, 1.5);
+  const u = pr(B, 14, 1); if (u <= 0) return;
+  alpha(u, () => {
+    ctx.fillStyle = 'rgba(52,211,153,.035)'; ctx.fillRect(E.x0, E.y0, E.x1 - E.x0, E.y1 - E.y0);
+    const wall = () => { // left wall leaves the doorway (y 120..300); right wall leaves the beam port (y -40..0)
+      ctx.beginPath(); ctx.moveTo(E.x0, 120); ctx.lineTo(E.x0, E.y0 + E.r); ctx.arcTo(E.x0, E.y0, E.x0 + E.r, E.y0, E.r); ctx.lineTo(E.x1 - E.r, E.y0);
+      ctx.arcTo(E.x1, E.y0, E.x1, E.y0 + E.r, E.r); ctx.lineTo(E.x1, -40); ctx.moveTo(E.x1, 0); ctx.lineTo(E.x1, E.y1); };
+    ctx.lineCap = 'round'; wall(); ctx.strokeStyle = 'rgba(52,211,153,.12)'; ctx.lineWidth = 16; ctx.stroke();
+    wall(); ctx.strokeStyle = MINT; ctx.lineWidth = 4; ctx.stroke();
+    ctx.fillStyle = MINT; for (const y of [-40, 0]) ctx.fillRect(E.x1 - 14, y - 2, 28, 4);
+    text('mintrun enclave', E.x0 + 30, E.y0 + 34, { font: font(700, 26), col: MINT3, id: 'enclave-label' });
+  });
+}
+
+// Policy gate in the left wall: lintel + lamp, shield badge, striped shutter.
+function gate(B) {
+  station(B, K.stations, () => {
+    const open = ease(pr(B, K.open, .5)), hitF = pulse(B, K.bump, .8), lamp = B >= K.open ? MINT : ROSE, lrgb = B >= K.open ? RGB.mint : RGB.rose;
+    rr(-930, -56, 60, 34, 10, BG); text('policy', -900, -38, { font: font(700, 28), col: MINT3, align: 'center', id: 'policy-label' });
+    ctx.fillStyle = BG; ctx.fillRect(-926, -6, 52, 60); icShield(-900, 25, .95, '#06281F', MINT); icCheck(-900, 24, 22, MINT3, 3.5);
+    rr(-940, 60, 80, 60, 10, '#111827', lamp, 3);
+    glow(-900, 90, 70 + 60 * hitF, lrgb, .45 + .4 * hitF + .3 * pulse(B, K.open, .8));
+    ctx.fillStyle = lamp; ctx.beginPath(); ctx.arc(-900, 90, 11, 0, Math.PI * 2); ctx.fill();
+    // shutter (slides up into the lintel)
+    ctx.save(); ctx.beginPath(); ctx.rect(-916, 120, 32, 180); ctx.clip();
+    ctx.translate(Math.sin((B - K.bump) * 50) * 3 * hitF, -open * 182);
+    ctx.fillStyle = ROSE; ctx.fillRect(-912, 120, 24, 180); ctx.fillStyle = WHITE;
+    for (let y = 120; y < 300; y += 36) { ctx.beginPath(); ctx.moveTo(-912, y); ctx.lineTo(-888, y - 18); ctx.lineTo(-888, y); ctx.lineTo(-912, y + 18); ctx.closePath(); ctx.fill(); }
+    if (hitF > 0) glow(-900, 230, 140, RGB.rose, .5 * hitF);
+    ctx.restore();
+  });
+  // deny chip above the blocked card
+  if (B >= K.bump && B < 23) alpha(1 - pr(B, 22.4, .6), () => {
+    const f = font(700, 26), s = 'chặn dump env', w = 66 + tw(s, f), sc = pop(B, K.bump, .45);
+    ctx.save(); ctx.translate(-1054, 193); ctx.scale(sc, sc);
+    rr(-w / 2, -23, w, 46, 23, 'rgba(76,5,25,.92)', ROSE, 2.5);
+    ctx.fillStyle = ROSE; ctx.beginPath(); ctx.arc(-w / 2 + 26, 0, 13, 0, Math.PI * 2); ctx.fill(); icCross(-w / 2 + 26, 0, 22, WHITE, 3.5);
+    text(s, -w / 2 + 50, 1, { font: f, col: ROSE2 }); claim('deny-chip', 'text', -w / 2, -23, w, 46); ctx.restore();
+  });
+  // checks on the deploy request
+  ['scope', 'lệnh', 'TTL'].forEach((s, i) => {
+    const a = K.chk[i]; if (B < a) return; const y = [-10, 50, 110][i];
+    alpha(1 - pr(B, 26.5, .8), () => {
+      const sc = pop(B, a, .45); ctx.save(); ctx.translate(-1070, y); ctx.scale(sc, sc);
+      rr(-110, -23, 220, 46, 23, 'rgba(6,78,59,.92)', MINT, 2.5);
+      text(s, -86, 1, { font: font(700, 26), col: MINT4 }); icCheck(78, 0, 30, MINT, 4.5, pr(B, a + .1, .4));
+      claim('check-' + i, 'text', -110, -23, 220, 46); ctx.restore();
+    });
+  });
+}
+
+// Vault: the master key lives here and never leaves.
+function vaultOpen(B) { return B < K.door ? 1 - ease(pr(B, 14.8, .2)) : ease(pr(B, K.unlock, .75)) * (1 - ease(pr(B, K.close, .5))); }
+function vault(B) {
+  guideRect(-700, 20, 260, 220, B, K.vault - .3, .7);
+  station(B, K.vault, () => {
+    glow(-570, 130, 260, RGB.vio, .16);
+    ctx.fillStyle = '#2A1B4A'; ctx.fillRect(-680, 236, 40, 64); ctx.fillRect(-500, 236, 40, 64);
+    rr(-700, 20, 260, 220, 24, '#1E1036', VIO, 3); claim('vault', 'keep', -700, 20, 260, 220);
+    text('vault', -570, -60, { font: font(800, 34), col: VIO2, align: 'center', id: 'vault-label' });
+    if (B < K.s5) text('Keychain · 1Password · AES-256-GCM', -570, -20, { font: font(500, 20), col: SL, align: 'center', id: 'vault-sub' });
+    // interior + key
+    ctx.fillStyle = '#0B0716'; ctx.beginPath(); ctx.arc(-570, 130, 86, 0, Math.PI * 2); ctx.fill();
+    if (B >= 14.8) { const g = .35 + .45 * pr(B, K.unlock, .5) * (1 - pr(B, 38, 1)); glow(-570, 130, 120, RGB.amb, g); icKey(KEY_HOME.x, KEY_HOME.y, KEY_HOME.s, AMB, 7); }
+    // door, hinged on its left edge
+    const op = vaultOpen(B), spin = ease(pr(B, K.atVault, 1)) * Math.PI * 4 + ease(pr(B, K.close, .5)) * -Math.PI;
+    ctx.save(); ctx.translate(-660, 0); ctx.scale(1 - .88 * op, 1); ctx.translate(660, 0);
+    ctx.fillStyle = '#2B1A52'; ctx.beginPath(); ctx.arc(-570, 130, 90, 0, Math.PI * 2); ctx.fill(); ctx.strokeStyle = VIO2; ctx.lineWidth = 4; ctx.stroke();
+    ctx.strokeStyle = 'rgba(196,181,253,.3)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(-570, 130, 74, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = '#3B2470'; ctx.beginPath(); ctx.arc(-570, 130, 34, 0, Math.PI * 2); ctx.fill();
+    ctx.save(); ctx.translate(-570, 130); ctx.rotate(spin); ctx.strokeStyle = VIO2; ctx.lineWidth = 3;
+    for (let i = 0; i < 12; i++) { const a = i * Math.PI / 6; ctx.beginPath(); ctx.moveTo(Math.cos(a) * 26, Math.sin(a) * 26); ctx.lineTo(Math.cos(a) * 33, Math.sin(a) * 33); ctx.stroke(); }
+    ctx.fillStyle = WHITE; ctx.fillRect(-2, -30, 4, 16); ctx.restore();
+    rr(-512, 122, 26, 16, 6, VIO);
+    ctx.restore();
+    if (B >= K.unlock) glow(-570, 130, 160, RGB.vio, .6 * pulse(B, K.unlock, .6));
+  });
+}
+
+// Authority (not the key) travels from the vault to the press: violet -> mint beam, b32..38.
+function authBeam(B) {
+  if (B < K.beam || B > 38.2) return;
+  const P0 = [-570, 130], C = [-330, 130], P1 = [-300, -90], pts = [];
+  for (let i = 0; i <= 40; i++) { const v = i / 40, q = 1 - v; pts.push([q * q * P0[0] + 2 * q * v * C[0] + v * v * P1[0], q * q * P0[1] + 2 * q * v * C[1] + v * v * P1[1]]); }
+  alpha(1 - pr(B, 37.5, .7), () => {
+    const g = ctx.createLinearGradient(P0[0], P0[1], P1[0], P1[1]); g.addColorStop(0, VIO); g.addColorStop(1, MINT);
+    ctx.lineCap = 'round'; polyTo(pts, easeOut(pr(B, K.beam, .6)), false); ctx.strokeStyle = 'rgba(167,139,250,.18)'; ctx.lineWidth = 22; ctx.stroke();
+    ctx.strokeStyle = g; ctx.lineWidth = 7; ctx.setLineDash([22, 14]); ctx.lineDashOffset = -B * 60; ctx.stroke(); ctx.setLineDash([]);
+  });
+}
+
+// Mint press: pillars, head with a display, piston, plate.
+function pressPos(B) { return easeIn(pr(B, 37, 1)) * (1 - ease(pr(B, K.lift, .6))); }
+function press(B) {
+  station(B, 15.8, () => {
+    ctx.fillStyle = '#1F2937'; ctx.strokeStyle = SL3; ctx.lineWidth = 2;
+    for (const x of [-290, 26]) { ctx.fillRect(x, -40, 24, 340); ctx.strokeRect(x, -40, 24, 340); }
+    rr(-250, 280, 260, 20, 6, '#1F2937', MINT2, 2.5);
+    const py = lerp(0, 174, pressPos(B));
+    ctx.fillStyle = SL2; ctx.fillRect(-130, -40, 20, py + 40);
+    rr(-200, py, 160, 50, 10, '#273244', MINT, 3); ctx.fillStyle = MINT; ctx.fillRect(-180, py + 40, 120, 4);
+    claim('piston', 'keep', -200, py, 160, 50);
+    rr(-300, -140, 360, 100, 16, '#111827', MINT2, 3);
+    rr(-270, -125, 300, 70, 10, '#04120D', 'rgba(52,211,153,.45)', 2); claim('press-display', 'keep', -270, -125, 300, 70);
+    if (B < K.disp) dots(-140, -90, 3, 4, 20, `rgba(52,211,153,${.3 + .5 * (Math.floor(B * 2) % 2)})`);
+    else { const f = font(600, 22, MONO); text(typed('example.com', B, K.disp, .4), -252, -102, { font: f, col: MINT3 }); text(typed('dns:write · 300s', B, 38.8, .5), -252, -72, { font: f, col: MINT4 }); }
+    if (B >= K.stamp) { glow(-120, 240, 300, RGB.mint, .8 * pulse(B, K.stamp, 1.2)); burst(B, K.stamp, -120, 226, { n: 30, col: MINT3, w: 220, sp: 520, size: 7, seed: 11, life: 1.4, g: 1600 }); }
+  });
+}
+
+// ---------- right side: subprocess capsule, audit log, cloud, JIT token, result packet ----------
+const SLOT = { x: 285, y: 150 };
+function capsule(B) {
+  station(B, 16.1, () => {
+    ctx.fillStyle = '#1F2937'; ctx.fillRect(290, 260, 24, 40); ctx.fillRect(646, 260, 24, 40); rr(250, 290, 460, 10, 4, '#273244');
+    glow(480, 125, 420, RGB.sky, .07);
+    rr(160, -10, 640, 270, 40, 'rgba(12,74,110,.35)', SKY, 3); claim('capsule', 'keep', 160, -10, 640, 270);
+    ctx.fillStyle = 'rgba(56,189,248,.16)'; ctx.fillRect(162, 30, 636, 2);
+    text('subprocess', 190, 10, { font: font(600, 20, MONO), col: SKY2 });
+    icEyeSlash(766, 10, .85, SKY2, 3);
+    rr(180, 50, 210, 190, 16, 'rgba(2,6,23,.6)', 'rgba(56,189,248,.5)', 2);
+    text('env', 196, 70, { font: font(600, 18, MONO), col: SL2 });
+    ctx.save(); ctx.setLineDash([7, 6]); rr(SLOT.x - 92, SLOT.y - 26, 184, 52, 12, null, 'rgba(56,189,248,.35)', 2); ctx.restore();
+    rr(410, 50, 370, 190, 16, '#05080D', 'rgba(148,163,184,.3)', 2);
+    const f = font(500, 20, MONO);
+    text(typed('$ npx wrangler deploy', B, K.cmd, 1), 428, 80, { font: f, col: TXT });
+    if (B >= K.tokLine) {
+      const scrub = pr(B, K.scrub, .8), sx = 428 + scrub * 300;
+      if (scrub < 1) { ctx.save(); ctx.beginPath(); ctx.rect(sx, 100, 800, 40); ctx.clip(); text('token=FAKE-J1t…7Pw', 428, 120, { font: f, col: AMB }); ctx.restore(); }
+      if (scrub > 0) { ctx.save(); ctx.beginPath(); ctx.rect(410, 100, sx - 410, 40); ctx.clip(); text('token=[MINTRUN:REDACTED]', 428, 120, { font: f, col: MINT3 }); ctx.restore(); }
+      if (scrub > 0 && scrub < 1) { glow(sx, 120, 60, RGB.mint, .7); ctx.fillStyle = MINT; ctx.fillRect(sx - 2, 102, 4, 36); }
+      if (B < K.scrub) glow(540, 120, 140, RGB.amb, .12 + .25 * pulse(B, K.tokLine, .6));
+    }
+    if (B >= K.deployed) { icCheck(438, 160, 22, MINT, 3.5, pr(B, K.deployed, .3)); text('deployed', 456, 160, { font: f, col: MINT }); }
+    if (B >= K.exit) text('exit 0', 428, 200, { font: f, col: SL });
+    if (B >= K.inject) glow(SLOT.x, SLOT.y, 160, RGB.mint, .5 * pulse(B, K.inject, .6));
+  });
+}
+
+// Frosted env compartment: the agent cannot see the token (drawn over the token).
+function frost(B) {
+  if (B < K.frost || B >= K.burn + 1) return;
+  alpha(pr(B, K.frost, .4) * (1 - pr(B, K.burn, 1)), () => {
+      rr(186, 96, 198, 108, 12, 'rgba(148,163,184,.30)', 'rgba(226,232,240,.35)', 1.5);
+      ctx.save(); ctx.beginPath(); ctx.roundRect(186, 96, 198, 108, 12); ctx.clip(); ctx.strokeStyle = 'rgba(255,255,255,.08)'; ctx.lineWidth = 6;
+      for (let x = 160; x < 420; x += 22) { ctx.beginPath(); ctx.moveTo(x, 210); ctx.lineTo(x + 110, 90); ctx.stroke(); } ctx.restore();
+      dots(240, 150, 4, 8, 30, WHITE); icEyeSlash(285, 184, .8, WHITE, 3);
+  });
+}
+
+function audit(B) {
+  station(B, 16.4, () => {
+    ctx.fillStyle = '#1F2937'; ctx.fillRect(1068, 240, 24, 60); rr(1000, 290, 160, 10, 4, '#273244');
+    rr(870, 40, 420, 200, 18, 'rgba(15,23,42,.94)', B >= K.audit ? MINT : SL2, 2.5); claim('audit', 'keep', 870, 40, 420, 200);
+    const f = font(500, 17, MONO);
+    text('audit.jsonl', 890, 64, { font: font(700, 17, MONO), col: SL });
+    ctx.fillStyle = 'rgba(148,163,184,.15)'; ctx.fillRect(872, 82, 416, 1.5);
+    text('{"provider":"github",...}', 890, 104, { font: f, col: 'rgba(148,163,184,.45)' });
+    text('{"provider":"aws",...}', 890, 132, { font: f, col: 'rgba(148,163,184,.45)' });
+    if (B >= K.audit) {
+      const u = easeOut(pr(B, K.audit, .5));
+      alpha(u, () => { glow(1040, 182, 220, RGB.mint, .25 * pulse(B, K.audit, .8));
+        text('{"provider":"cloudflare",', 890 + (1 - u) * 30, 170, { font: f, col: MINT3 });
+        text(' "revoked":true,"exit_code":0}', 890 + (1 - u) * 30, 196, { font: f, col: MINT3 }); });
+    }
+  });
+}
+
+function cloud(B) {
+  station(B, 16.7, () => {
+    const C = [[1640, -205, 62], [1712, -262, 82], [1806, -270, 72], [1880, -210, 58], [1760, -190, 70]];
+    const shape = () => { ctx.beginPath(); for (const [x, y, r] of C) { ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, Math.PI * 2); } };
+    const lit = pulse(B, K.beamOut + .6, 1.2);
+    glow(1760, -230, 300, RGB.sky, .14 + .3 * lit);
+    shape(); ctx.strokeStyle = SKY; ctx.lineWidth = 8; ctx.stroke(); shape(); ctx.fillStyle = '#0B2233'; ctx.fill();
+    claim('cloud', 'keep', 1574, -348, 368, 232);
+    text('Cloudflare API', 1760, -245, { font: font(700, 28), col: WHITE, align: 'center', id: 'cloud-label' });
+    if (B >= K.deployed) alpha(pr(B, K.deployed, .3), () => { icCheck(1700, -198, 26, MINT, 4, pr(B, K.deployed, .35)); text('deployed', 1720, -198, { font: font(700, 26), col: MINT, id: 'cloud-ok' }); });
+  });
+}
+
+// Process -> cloud: the deploy goes out through the wall port (b48..50).
+function deployBeam(B) {
+  if (B < K.beamOut || B > 50.5) return;
+  const pts = [[800, 30], [860, -12], [1360, -20], [1480, -50], [1600, -160]];
+  alpha(1 - pr(B, 49.8, .7), () => {
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round'; polyTo(pts, easeOut(pr(B, K.beamOut, .7)), false);
+    ctx.strokeStyle = 'rgba(56,189,248,.2)'; ctx.lineWidth = 20; ctx.stroke();
+    ctx.strokeStyle = SKY2; ctx.lineWidth = 6; ctx.setLineDash([20, 12]); ctx.lineDashOffset = -B * 60; ctx.stroke(); ctx.setLineDash([]);
+  });
+}
+
+// JIT token: born on the press plate at b38, injected into the capsule at b45, revoked (burned) at b54.
+function tokenAt(B) {
+  if (B < K.slide) return [-120, 252, 1];
+  if (B < 43.5) { const u = ease(pr(B, K.slide, 2.5)); return [lerp(-120, 40, u), lerp(252, 268, u), 1]; }
+  const u = ease(pr(B, 43.5, 1.5)), q = 1 - u, cx = 150, cy = 40;
+  return [q * q * 40 + 2 * q * u * cx + u * u * SLOT.x, q * q * 268 + 2 * q * u * cy + u * u * SLOT.y, lerp(1, .8, u)];
+}
+function token(B) {
+  if (B < K.stamp || B >= K.burn + 1.2) return;
+  const [x, y, s] = tokenAt(B), burn = pr(B, K.burn, 1.2), hidden = B >= K.frost ? .35 : 1;
+  ctx.save(); ctx.translate(x, y); ctx.scale(s * pop(B, K.stamp, .4), s * pop(B, K.stamp, .4)); ctx.globalAlpha *= (1 - burn) * hidden;
+  glow(0, 0, 170, RGB.mint, .35);
+  ctx.beginPath(); ctx.moveTo(-98, -28); ctx.lineTo(98, -28); ctx.arcTo(110, -28, 110, -16, 12); ctx.lineTo(110, -10); ctx.arc(110, 0, 10, -Math.PI / 2, Math.PI / 2, true);
+  ctx.lineTo(110, 16); ctx.arcTo(110, 28, 98, 28, 12); ctx.lineTo(-98, 28); ctx.arcTo(-110, 28, -110, 16, 12); ctx.lineTo(-110, 10); ctx.arc(-110, 0, 10, Math.PI / 2, -Math.PI / 2, true);
+  ctx.lineTo(-110, -16); ctx.arcTo(-110, -28, -98, -28, 12); ctx.closePath(); ctx.fillStyle = burn > 0 ? lerpCol(burn) : MINT; ctx.fill();
+  if (B < K.burn) claim('token', 'keep', -110, -28, 220, 56);
+  text('JIT token', -88, 1, { font: font(800, 24), col: '#03271C' });
+  const ttl = 1 - pr(B, K.ttl, K.burn - K.ttl);
+  ctx.strokeStyle = 'rgba(3,39,28,.3)'; ctx.lineWidth = 6; ctx.beginPath(); ctx.arc(72, 0, 15, 0, Math.PI * 2); ctx.stroke();
+  if (B >= K.ttl) { ctx.strokeStyle = '#03271C'; ctx.beginPath(); ctx.arc(72, 0, 15, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * ttl); ctx.stroke(); }
+  ctx.restore();
+  if (B >= K.burn) {
+    burst(B, K.burn, x, y, { n: 36, col: AMB, w: 176, h: 40, sp: 300, size: 7, seed: 21, life: 2, g: -500, dir: -Math.PI / 2, spread: 2.2 });
+    burst(B, K.burn, x, y, { n: 20, col: ROSE, w: 176, h: 40, sp: 240, size: 5, seed: 22, life: 1.6, g: -400, dir: -Math.PI / 2, spread: 2 });
+    alpha(pulse(B, K.burn + .1, 2.4) * 1.4, () => { ctx.save(); ctx.translate(x, y); ctx.rotate(-.18); const sc = pop(B, K.burn, .4);
+      ctx.scale(sc, sc); rr(-96, -24, 192, 48, 8, 'rgba(76,5,25,.9)', ROSE, 4);
+      text('REVOKED', 0, 2, { font: font(900, 28), col: ROSE2, align: 'center', id: 'revoked' }); ctx.restore(); });
+  }
+}
+function lerpCol(u) { const a = [52, 211, 153], c = [244, 63, 94]; return `rgb(${a.map((v, i) => Math.round(lerp(v, c[i], clamp(u * 2)))).join(',')})`; }
+
+// Result packet: pops above the capsule at b56.5, flies home to the agent's context b57 -> b61.
+const PACKET = '{exit_code:0, revoked:true}';
+function packet(B) {
+  if (B < K.packet || B >= K.land + .3) return;
+  const u = ease(pr(B, K.done5, K.land - K.done5)), q = 1 - u, x0 = 300, y0 = -40, x1 = -1720, y1 = -50, cx = -710, cy = -1095;
+  const x = q * q * x0 + 2 * q * u * cx + u * u * x1, y = q * q * y0 + 2 * q * u * cy + u * u * y1;
+  const f = font(600, 18, MONO), w = tw(PACKET, f) + 32, s = pop(B, K.packet, .45) * lerp(1, 2.2, Math.sin(u * Math.PI)) * (1 - pr(B, K.land, .3));
+  for (let k = 3; k >= 1; k--) { const v = clamp(u - k * .03), r = 1 - v; if (B > K.done5) alpha(.18, () => rr(r * r * x0 + 2 * r * v * cx + v * v * x1 - w * s / 2, r * r * y0 + 2 * r * v * cy + v * v * y1 - 22 * s, w * s, 44 * s, 22 * s, MINT)); }
+  ctx.save(); ctx.translate(x, y); ctx.scale(s, s); glow(0, 0, w * .8, RGB.mint, .35);
+  rr(-w / 2, -22, w, 44, 22, MINT); claim('packet', 'keep', -w / 2, -22, w, 44);
+  text(PACKET, 0, 1, { font: f, col: '#03271C', align: 'center' }); ctx.restore();
+}
+
+// ---------- HUD: screen space, drawn over the world ----------
+function wordmark(x, y, size, id) { // "mint" in mint + "run" in white, centred on x
+  const f = font(800, size), w1 = tw('mint', f), w = tw('mintrun', f), x0 = x - w / 2;
+  text('mint', x0, y, { font: f, col: MINT }); text('run', x0 + w1, y, { font: f, col: WHITE });
+  ctx.save(); ctx.font = f; ctx.textBaseline = 'middle'; const m = ctx.measureText('mintrun'); ctx.restore();
+  claim(id, 'text', x0 - 2, y - m.actualBoundingBoxAscent - 2, w + 4, m.actualBoundingBoxAscent + m.actualBoundingBoxDescent + 4);
+}
+
+function hudQuestion(B) {
+  if (B < K.q || B >= K.s2 + .5) return;
+  alpha(1 - pr(B, K.s2, .5), () => text(typed('Đưa khóa gốc cho AI agent?', B, K.q, .8), 96, 80, { font: font(800, 64), col: WHITE, id: 'question' }));
+}
+
+function hudTitle(B) {
+  if (B < K.title || B >= K.s3) return;
+  at(960, 150, pop(B, K.title, .5), () => wordmark(0, 0, 120, 'title'));
+  if (B >= K.sub) { const u = easeOut(pr(B, K.sub, .5)); alpha(u, () => text('Tách quyền hạn khỏi việc giữ khóa', 960, 780 + (1 - u) * 20, { font: font(600, 48), col: MINT3, align: 'center', id: 'subtitle' })); }
+}
+
+const CAPS = [
+  [K.s3, '1', 'Policy gate', 'Chặn lệnh dump env, giới hạn scope & TTL'],
+  [K.s4, '2', 'Vault', 'Khóa gốc ở yên trong vault, chỉ nằm trong RAM host'],
+  [K.s5, '3', 'Mint token JIT', 'Token con đúng scope, đúng quyền, hết hạn sau 300 s'],
+  [K.s6, '4', 'Blind exec', 'Token chỉ vào env của tiến trình con, agent không thấy'],
+  [K.s7, '5', 'Revoke · Scrub · Audit', 'Thu hồi token, che bí mật trong output, ghi audit.jsonl'],
+];
+function captions(B) {
+  if (B < K.s3 || B >= K.s8) return;
+  const g = ctx.createLinearGradient(0, 820, 0, H); g.addColorStop(0, 'rgba(9,11,16,0)'); g.addColorStop(1, 'rgba(9,11,16,.9)');
+  ctx.fillStyle = g; ctx.fillRect(0, 820, W, H - 820);
+  const c = CAPS.findLast(c => B >= c[0]), u = easeOut(pr(B, c[0] + .25, .6)), dy = (1 - u) * 24;
+  alpha(u, () => {
+    const f = font(800, 58), y = 905 + dy;
+    let x = 96; for (const [p, col] of [[c[1], MINT], [' · ', SL2], [c[2], WHITE]]) x += text(p, x, y, { font: f, col });
+    ctx.save(); ctx.font = f; ctx.textBaseline = 'middle'; const m = ctx.measureText(c[1] + ' · ' + c[2]); ctx.restore();
+    claim('caption', 'text', 94, y - m.actualBoundingBoxAscent - 2, x - 92, m.actualBoundingBoxAscent + m.actualBoundingBoxDescent + 4);
+    text(c[3], 96, 968 + dy, { font: font(500, 32), col: '#CBD5E1', id: 'caption-sub' });
+  });
+}
+
+// Lifecycle tracker: pending (outline) -> active (mint, pulsing) -> done (filled, check).
+const STEPS = ['Policy', 'Vault', 'Mint', 'Exec', 'Revoke · Scrub · Audit'], ST_ON = [20, 28, 36, 44, 52], ST_DONE = [25, 34, 40, 49, 57];
+let TRK = null; // [x, w] per pill, measured once
+function tracker(B) {
+  if (B < K.s3) return;
+  const f = font(700, 24);
+  if (!TRK) { const ws = STEPS.map(s => 58 + tw(s, f)); let x = 960 - (ws.reduce((a, c) => a + c) + 40 * 4) / 2; TRK = ws.map(w => { const r = [x, w]; x += w + 40; return r; }); }
+  const u = easeOut(pr(B, K.s3, .6)), y = 44 - (1 - u) * 90;
+  alpha(u, () => { const g = ctx.createLinearGradient(0, 0, 0, 150); g.addColorStop(0, 'rgba(9,11,16,.92)'); g.addColorStop(1, 'rgba(9,11,16,0)'); ctx.fillStyle = g; ctx.fillRect(0, 0, W, 150); });
+  STEPS.forEach((s, i) => {
+    const [x, w] = TRK[i], on = B >= ST_ON[i], done = B >= ST_DONE[i], cx = x + 24, cy = y + 22;
+    if (on && !done) glow(x + w / 2, cy, w * .75, RGB.mint, .16 + .12 * Math.sin(B * Math.PI));
+    rr(x, y, w, 44, 22, done ? MINT2 : on ? 'rgba(6,78,59,.92)' : 'rgba(15,23,42,.88)', done ? MINT2 : on ? MINT : SL3, 2.5);
+    if (done) icCheck(cx, cy, 26, '#03271C', 4.5, pr(B, ST_DONE[i], .4));
+    else { ctx.fillStyle = on ? MINT : SL4; ctx.beginPath(); ctx.arc(cx, cy, 13, 0, Math.PI * 2); ctx.fill(); text(String(i + 1), cx, cy + 1, { font: font(800, 17), col: on ? '#03271C' : SL, align: 'center' }); }
+    text(s, x + 44, cy + 1, { font: f, col: done ? '#03271C' : on ? WHITE : SL2 });
+    claim('step-' + i, 'text', x, y, w, 44);
+  });
+  // recap: the five steps chain together
+  for (let i = 0; i < 4; i++) { const v = pr(B, K.chain + i * .25, .3); if (v > 0) alpha(v, () => icArrow(TRK[i][0] + TRK[i][1] + 20, y + 22, 8 + 16 * v, MINT)); }
+}
+
+const CHIPS = ['100% Go stdlib', '0 dependencies', 'MCP server', 'Cloudflare · GitHub · AWS · GCP'];
+const CLI = '$ mintrun exec -provider cloudflare -scope example.com -perms dns:write -ttl 300 -- npx wrangler deploy';
+function recap(B) {
+  if (B < K.s8) return;
+  const u = easeOut(pr(B, K.s8 + .25, .6));
+  alpha(u, () => wordmark(960, 560 + (1 - u) * 24, 96, 'wordmark'));
+  [['Trao cho AI agent quyền deploy.', WHITE, 648, K.tag1], ['Không bao giờ trao khóa gốc.', MINT3, 708, K.tag2]].forEach(([s, col, y, a], i) => {
+    const v = easeOut(pr(B, a, .5)); if (v > 0) alpha(v, () => text(s, 960, y + (1 - v) * 20, { font: font(700, 46), col, align: 'center', id: 'line-' + i }));
+  });
+  if (B >= K.cli) {
+    const f = font(500, 23, MONO), w = tw(CLI, f) + 56, x = 960 - w / 2;
+    alpha(pr(B, K.cli, .3), () => { rr(x, 778, w, 52, 14, 'rgba(2,6,23,.92)', 'rgba(52,211,153,.5)', 2); claim('cli', 'keep', x, 778, w, 52);
+      text(typed(CLI, B, K.cli, 1.5), x + 28, 805, { font: f, col: MINT4, id: 'cli-text' }); });
+  }
+  const fc = font(600, 26), cw = CHIPS.map(s => tw(s, fc) + 48); let x = 960 - (cw.reduce((a, c) => a + c) + 20 * 3) / 2;
+  CHIPS.forEach((s, i) => {
+    const w = cw[i], a = K.chips[i];
+    if (B >= a) at(x + w / 2, 905, pop(B, a, .45), () => { rr(-w / 2, -24, w, 48, 24, 'rgba(6,78,59,.6)', MINT2, 2); text(s, 0, 1, { font: fc, col: MINT4, align: 'center' }); claim('chip-' + i, 'text', -w / 2, -24, w, 48); });
+    x += w + 20;
+  });
+}
+
+function hud(t) { const B = t / BEAT; hudQuestion(B); hudTitle(B); captions(B); tracker(B); recap(B); }
+
+// ---------- shots: one camera per shot (times in seconds), sound events, the frame ----------
+const SHOTS = [
+  { name: 'S1 leak', from: b(0), to: b(12), cam: B => ({ cx: -1820, cy: -20, k: lerp(1.4, 1.46, pr(B, 0, 12)) }) },
+  { name: 'S2 enclave', from: b(12), to: b(20), cam: B => { const c = camLerp({ cx: -1820, cy: -20, k: 1.46 }, { cx: -485, cy: 30, k: .47 }, ease(pr(B, 12, 6))); c.cx += 4 * Math.max(0, B - 18); return c; } },
+  { name: 'S3 policy', from: b(20), to: b(28), cam: B => ({ cx: lerp(-860, -850, pr(B, 20, 8)), cy: 160, k: 1.6 }) },
+  { name: 'S4 vault', from: b(28), to: b(36), cam: B => ({ cx: -540, cy: 130, k: lerp(1.7, 1.77, pr(B, 28, 8)) }) },
+  { name: 'S5 mint', from: b(36), to: b(44), cam: B => ({ cx: lerp(-120, -100, pr(B, 36, 8)), cy: 120, k: 1.6 }) },
+  { name: 'S6 exec', from: b(44), to: b(52), cam: B => ({ cx: lerp(1000, 1010, pr(B, 44, 8)), cy: 80, k: 1 }) },
+  { name: 'S7 revoke', from: b(52), to: b(60), cam: B => ({ cx: 820, cy: 110, k: lerp(1.45, 1.38, pr(B, 52, 8)) }) },
+  { name: 'S8 recap', from: b(60), to: b(72), cam: B => ({ cx: -210, cy: 523, k: lerp(.405, .42, pr(B, 60, 12)) }) },
+];
+
+// [beat, sound, arg]: every visible action has one; nothing within 0.6 beat after a cut.
+const EVENTS = [
+  [1, 'type'], [2, 'type'], [3, 'leak', 1], [4, 'leak', .8], [5, 'leak', .8], [6, 'leak', .8], [7, 'blip', 77], [8, 'blip', 81], [9, 'blip', 84],
+  [13, 'whoosh'], [13.5, 'build', 0], [15, 'clunk', 1], [15.5, 'build', -12], [16, 'title', [77, 81, 84]], [17, 'blip', 81], [18, 'type'], [19, 'whoosh'],
+  [21, 'deny'], [22, 'shatter'], [23, 'tick', 0], [23.5, 'tick', 2], [24, 'tick', 5], [25, 'gate'], [26, 'whoosh'],
+  [29, 'dial'], [30, 'unlock'], [32, 'beam'], [34, 'clunk', .6],
+  [38, 'stamp'], [38.5, 'type'], [39, 'tick', 0], [40, 'blip', 84], [41, 'whoosh'],
+  [45, 'inject'], [45.5, 'blip', 89], [46, 'type'], [47.5, 'leak', .5], [48, 'beam'], [49, 'deploy'],
+  [53, 'tick', 0], [54, 'burn'], [55, 'swish'], [56, 'tick', 2], [56.5, 'packet'], [57, 'tick', 5],
+  [61, 'blip', 84], [61.5, 'build', 0], [62, 'title', [77, 81, 84]], [63, 'title', [81, 84, 89]], [64, 'type'], [66, 'blip', 81], [66.5, 'blip', 84], [67, 'blip', 86], [67.5, 'blip', 89],
+];
+
+function world(t) {
+  const B = t / BEAT;
+  grid(); floorPlane(); enclave(B); leftWorld(B, t);
+  vault(B); gate(B); press(B); capsule(B); audit(B); cloud(B);
+  authBeam(B); deployBeam(B);
+  cards(B); token(B); frost(B); keyFlight(B); packet(B);
+}
+
+function draw(frame) {
+  const t = frame / FPS; LAYOUT = [];
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.filter = 'none'; ctx.globalAlpha = 1; ctx.setLineDash([]); ctx.lineDashOffset = 0;
+  ctx.drawImage(paper, 0, 0);
+  const shot = SHOTS.find(s => t >= s.from && t < s.to) || SHOTS[SHOTS.length - 1];
+  withCamera(shot.cam(t / BEAT), () => world(t));
+  hud(t);
+  window.LAYOUT = LAYOUT;
+}
+
+// ---------- score: written for this film. F major / D minor, 120 BPM (a bar = 2 s) ----------
+// Every cut lands on a downbeat with a tonic chord; layers enter one per bar; a 2-beat break sets up the recap.
+window.SCORE = ac => {
+  const T0 = ac.currentTime + (ac instanceof OfflineAudioContext ? 0 : .05), SR = ac.sampleRate;
+  const at = B => T0 + B * BEAT, mtof = m => 440 * 2 ** ((m - 69) / 12), brk = B => B >= 58 && B < 60;
+  let seed = 7; const rnd = () => (seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff) / 2147483648;
+  const gain = (dest, v = 0) => { const g = ac.createGain(); g.gain.value = v; g.connect(dest); return g; };
+  const filt = (type, f, q, dest) => { const n = ac.createBiquadFilter(); n.type = type; n.frequency.value = f; n.Q.value = q; n.connect(dest); return n; };
+  const osc = (type, f, t0, t1, dest, det = 0) => { const o = ac.createOscillator(); o.type = type; o.frequency.value = f; o.detune.value = det; o.connect(dest); o.start(t0); o.stop(t1); return o; };
+  const perc = (g, t, peak, d) => { g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(peak, t + .004); g.gain.setTargetAtTime(0, t + .004, d / 4); };
+  const sweep = (p, t, a, b, d) => { p.setValueAtTime(a, t); p.exponentialRampToValueAtTime(b, t + d); };
+
+  // bus: music + sfx -> compressor -> master (fade at the end); the music bus drops out for the break
+  const comp = ac.createDynamicsCompressor(); comp.threshold.value = -12; comp.ratio.value = 3; comp.attack.value = .005; comp.release.value = .2;
+  const master = gain(ac.destination, .8); comp.connect(master);
+  master.gain.setValueAtTime(.8, T0 + DUR - 1.4); master.gain.linearRampToValueAtTime(0, T0 + DUR - .05);
+  const music = gain(comp, 1), sfx = gain(comp, 1);
+  music.gain.setValueAtTime(1, at(58)); music.gain.linearRampToValueAtTime(0, at(58.4)); music.gain.setValueAtTime(1, at(60) - .01);
+  // seeded reverb (its tail rides the music bus) and noise
+  const ir = ac.createBuffer(2, Math.round(SR * 2.2), SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] = (rnd() * 2 - 1) * (1 - i / d.length) ** 3; }
+  const verb = ac.createConvolver(); verb.buffer = ir; verb.connect(gain(music, .25));
+  const nbuf = ac.createBuffer(1, SR * 2, SR), nd = nbuf.getChannelData(0); for (let i = 0; i < nd.length; i++) nd[i] = rnd() * 2 - 1;
+  const hiss = (t0, t1, dest) => { const n = ac.createBufferSource(); n.buffer = nbuf; n.loop = true; n.connect(dest); n.start(t0, rnd() * 1.5); n.stop(t1); };
+
+  // harmony: [bass, ...pad] and [beat, chord, beats]
+  const CH = { Dm9: [50, 65, 69, 72, 76], Bb: [46, 58, 62, 65, 70], A7: [45, 57, 61, 64, 67], Gm7: [43, 55, 58, 62, 65], C7: [48, 55, 60, 64, 70],
+    Fadd9: [41, 53, 57, 60, 67], Dm7: [50, 60, 62, 65, 69], C: [48, 55, 60, 64, 67], Csus4: [48, 55, 60, 65, 67], 'F/A': [45, 53, 57, 60, 65],
+    Bbmaj7: [46, 58, 62, 65, 69], F: [41, 53, 57, 60, 65] };
+  const PROG = [[0, 'Dm9', 4], [4, 'Bb', 2], [6, 'A7', 2], [8, 'Gm7', 2], [10, 'C7', 2], [12, 'Fadd9', 4], [16, 'Dm7', 2], [18, 'C', 2],
+    [20, 'F', 4], [24, 'Bb', 2], [26, 'C', 2], [28, 'Dm9', 2], [30, 'Bb', 2], [32, 'Gm7', 2], [34, 'C', 2], [36, 'F', 4], [40, 'Dm7', 2],
+    [42, 'Csus4', 1], [43, 'C', 1], [44, 'F/A', 2], [46, 'Bb', 2], [48, 'Bbmaj7', 2], [50, 'C', 2], [52, 'F', 4], [56, 'Gm7', 2],
+    [60, 'Fadd9', 4], [64, 'Bbmaj7', 2], [66, 'C', 2], [68, 'Fadd9', 4]];
+
+  // pad: three detuned saws per note, slow attack, overlapping release
+  const padLP = filt('lowpass', 1400, .5, music); padLP.connect(verb);
+  for (const [b0, name, len] of PROG) {
+    const t0 = at(b0), t1 = at(b0 + len), v = gain(padLP);
+    v.gain.setValueAtTime(0, t0); v.gain.linearRampToValueAtTime(.03, t0 + .3); v.gain.setValueAtTime(.03, t1); v.gain.linearRampToValueAtTime(0, t1 + .6);
+    for (const m of CH[name].slice(1)) for (const d of [-6, 0, 6]) osc('sawtooth', mtof(m), t0, t1 + .65, v, d);
+  }
+  // drums, one layer per bar: hats b0, half-time kick b8 (soft first two bars), four-on-the-floor b24, clap b32 (soft first bar)
+  const kickAt = B => B >= 8 && B < 68 && !brk(B) && (B % 2 === 0 || B >= 24);
+  const hp = filt('highpass', 7000, .7, music), clapBP = filt('bandpass', 1500, 1.2, music); clapBP.connect(verb);
+  for (let e = 0; e < 136; e++) {
+    const B = e / 2, t = at(B); if (brk(B)) continue;
+    const h = gain(hp); perc(h, t, e % 2 ? .09 : .05, .05); hiss(t, t + .08, h);
+    if (e % 2) continue;
+    if (kickAt(B)) { const v = gain(music); perc(v, t, .8 * (B < 16 ? .6 : B < 28 && B % 2 ? .5 : 1), .4); sweep(osc('sine', 150, t, t + .5, v).frequency, t, 150, 45, .25); }
+    if (B >= 32 && B % 2) for (const [dt, p] of [[0, .6], [.012, .5], [.024, 1]]) { const v = gain(clapBP); perc(v, t + dt, p * (B < 36 ? .6 : 1), dt ? .2 : .03); hiss(t + dt, t + dt + .3, v); }
+  }
+  // pluck bass from b4: eighths, octave pattern, filter snaps shut; ducks under the kick
+  for (const [b0, name, len] of PROG) if (b0 >= 4) for (let e = 0; e < len * 2; e++) {
+    const B = b0 + e / 2, t = at(B), v = gain(music), lp = filt('lowpass', 1800, 4, v);
+    perc(v, t, .3 * (Number.isInteger(B) && kickAt(B) ? .6 : 1), .22); sweep(lp.frequency, t, 1800, 300, .2);
+    osc('sawtooth', mtof(CH[name][0] + [0, 0, 12, 0, 0, 12, 0, 12][(B * 2) % 8]), t, t + .3, lp);
+  }
+  // arp from b16: 16ths over the pad voicing an octave up, dotted-eighth echo
+  const dly = ac.createDelay(1); dly.delayTime.value = .375; dly.connect(gain(dly, .3)); dly.connect(gain(music, .5));
+  const arp = gain(music, 1); arp.connect(dly);
+  for (const [b0, name, len] of PROG) if (b0 >= 16 && b0 < 68) {
+    const v = CH[name].slice(1), n = v.length;
+    for (let i = 0; i < len * 4; i++) { const B = b0 + i / 4, k = [0, 1, 2, 3, 2, 1, 2, 3][Math.round(B * 4) % 8], t = at(B), g = gain(arp);
+      perc(g, t, .07, .14); osc('triangle', mtof(v[k % n] + 12 * Math.floor(k / n) + 12), t, t + .2, g); }
+  }
+  // FM bell (ratio 3.5, index decays)
+  const bell = (t, m, pk = .1, d = 1.6, dest = sfx) => {
+    const f = mtof(m), v = gain(dest); v.connect(verb); perc(v, t, pk, d);
+    const car = osc('sine', f, t, t + d * 1.3, v), mg = gain(car.frequency); sweep(mg.gain, t, f * 2.5, f * .1, d * .6); osc('sine', f * 3.5, t, t + d * 1.3, mg);
+  };
+  [77, 84, 89].forEach((m, i) => bell(at(68 + i * .5), m, .09, 2.4, music)); // last bar: pad + bass + bells, then the fade
+
+  // sound effects, one per visible action (EVENTS)
+  const tone = (t, type, f0, f1, pk, d) => { const v = gain(sfx); perc(v, t, pk, d); const o = osc(type, f0, t, t + d * 1.5, v); if (f1 !== f0) sweep(o.frequency, t, f0, f1, d); return v; };
+  const noiseHit = (t, type, f, q, pk, d) => { const v = gain(sfx); perc(v, t, pk, d); hiss(t, t + d * 1.5, filt(type, f, q, v)); };
+  const swell = (t, d, pk, f0, f1, type = 'bandpass') => {
+    const v = gain(sfx), fl = filt(type, f0, type === 'bandpass' ? 1.5 : .7, v);
+    v.gain.setValueAtTime(0, t); v.gain.linearRampToValueAtTime(pk, t + d * .4); v.gain.linearRampToValueAtTime(0, t + d);
+    sweep(fl.frequency, t, f0, f1, d); hiss(t, t + d, fl);
+  };
+  const FX = {
+    type: (t, n = 6) => { for (let i = 0; i < n; i++) { const j = hash2(i, Math.round(t * 1e3)); noiseHit(t + i * .065 + j * .02, 'bandpass', 2000 + 2000 * j, 4, .5, .025); } },
+    blip: (t, m) => tone(t, 'sine', mtof(m), mtof(m), .12, .3).connect(verb),
+    leak: (t, lv = 1) => tone(t, 'triangle', 880, 330, .14 * lv, .32),
+    whoosh: t => swell(t, .5, .22, 400, 3000),
+    build: (t, tr = 0) => [77, 81, 84, 89].forEach((m, i) => tone(t + i * .125, 'triangle', mtof(m + tr), mtof(m + tr), .08, .25).connect(verb)),
+    clunk: (t, lv = 1) => { tone(t, 'sine', 90, 50, .5 * lv, .25); noiseHit(t, 'lowpass', 600, .7, .3 * lv, .08); },
+    title: (t, notes) => notes.forEach((m, i) => bell(t + i * .03, m, .08)),
+    deny: t => {
+      const v = gain(sfx); v.gain.setValueAtTime(0, t); v.gain.linearRampToValueAtTime(.1, t + .02); v.gain.setValueAtTime(.1, t + .4); v.gain.linearRampToValueAtTime(0, t + .55);
+      const trem = gain(v, .5), lp = filt('lowpass', 900, 1, trem); osc('square', 14, t, t + .6, gain(trem.gain, .5)); for (const f of [110, 116]) osc('sawtooth', f, t, t + .6, lp);
+    },
+    shatter: t => { tone(t, 'sine', 1400, 200, .15, .3); noiseHit(t, 'highpass', 3000, .7, .35, .25);
+      for (let i = 0; i < 5; i++) { const j = hash2(i, 77), f = 2600 + 2400 * j; tone(t + .03 + i * .05 + j * .03, 'sine', f, f, .05, .15).connect(verb); } },
+    tick: (t, a = 0) => tone(t, 'sine', mtof(96 + a), mtof(96 + a), .1, .09),
+    gate: t => { swell(t - .25, .4, .12, 800, 3000); bell(t, 81, .1); },
+    dial: t => { for (let i = 0; i < 8; i++) noiseHit(t + i * .062, 'bandpass', 3200, 3, .4, .02); },
+    unlock: t => { for (const dt of [0, .09]) { noiseHit(t + dt, 'lowpass', 1500, 1, .35, .05); tone(t + dt, 'square', 220, 160, .05, .06); } },
+    beam: t => { const v = gain(sfx); v.connect(verb); v.gain.setValueAtTime(0, t); v.gain.linearRampToValueAtTime(.08, t + .3); v.gain.linearRampToValueAtTime(0, t + .8);
+      sweep(osc('triangle', 300, t, t + .85, v).frequency, t, 300, 900, .6); },
+    stamp: t => { tone(t, 'sine', 120, 40, .6, .3); noiseHit(t, 'lowpass', 1200, .7, .25, .1); bell(t + .02, 89, .07); },
+    inject: t => { noiseHit(t, 'highpass', 2000, .7, .25, .015); tone(t, 'sine', 1200, 2400, .07, .15); },
+    deploy: t => { bell(t, 84, .1); bell(t + .15, 89, .1); },
+    burn: t => swell(t, .8, .16, 6000, 800, 'lowpass'),
+    swish: t => swell(t, .4, .18, 1000, 6000),
+    packet: t => { swell(t, .25, .15, 800, 3000); FX.blip(t + .1, 89); },
+  };
+  for (const [B, name, arg] of EVENTS) FX[name](at(B), arg);
+  // the break: a soft riser (well under the mix) into the recap downbeat
+  { const t0 = at(58), t1 = at(60), v = gain(sfx), fl = filt('bandpass', 300, 2, v);
+    v.gain.setValueAtTime(0, t0); v.gain.linearRampToValueAtTime(.12, t1 - .04); v.gain.linearRampToValueAtTime(0, t1); sweep(fl.frequency, t0, 300, 2500, t1 - t0); hiss(t0, t1, fl); }
+};
+
+// ---------- exports + live preview (click once for sound) ----------
+window.draw = draw; window.FRAMES = FRAMES; window.FPS = FPS; window.CUES = SHOTS.slice(1).map(s => s.from);
+window.BPM = BPM; window.SHOTS = SHOTS; window.EVENTS = EVENTS; window.K = K;
+draw(0);
+if (!new URLSearchParams(location.search).has('render')) {
+  let start = performance.now();
+  const loop = () => { draw(Math.max(0, Math.floor((performance.now() - start) / 1000 * FPS)) % FRAMES); requestAnimationFrame(loop); };
+  loop();
+  addEventListener('click', () => { window.SCORE(new AudioContext()); start = performance.now() + 50; }, { once: true });
+}
+</script>
+</body>
+</html>
