@@ -63,14 +63,15 @@ type AuditEntry struct {
 
 // PolicyRule controls which scopes, permissions, and commands are permitted for a provider.
 type PolicyRule struct {
-	AllowedScopes      []string `json:"allowed_scopes,omitempty"`      // Empty = allow all scopes (supports '*' wildcard)
-	AllowedPermissions []string `json:"allowed_permissions,omitempty"` // Empty = allow all permissions (supports '*' wildcard)
-	BlockedCommands    []string `json:"blocked_commands,omitempty"`    // Substrings or binary names to reject
-	MaxTTLSeconds      int      `json:"max_ttl_seconds,omitempty"`     // Caps requested TTL
-	RequireApproval    bool     `json:"require_approval,omitempty"`    // Prompt human via native OS dialog before minting
-	AllowStatic        bool     `json:"allow_static,omitempty"`        // Permit non-JIT static mode (params.mode=static or "static" perm)
-	CleanEnv           bool     `json:"clean_env,omitempty"`           // Force clean-env for every exec of this provider (audit M1)
-	AllowedEnv         []string `json:"allowed_env,omitempty"`         // Host env names (globs) a clean-env child keeps; non-empty implies clean_env
+	AllowedScopes        []string `json:"allowed_scopes,omitempty"`        // Empty = allow all scopes (supports '*' wildcard)
+	AllowedPermissions   []string `json:"allowed_permissions,omitempty"`   // Empty = allow all permissions (supports '*' wildcard)
+	BlockedCommands      []string `json:"blocked_commands,omitempty"`      // Substrings or binary names to reject
+	MaxTTLSeconds        int      `json:"max_ttl_seconds,omitempty"`       // Caps requested TTL
+	RequireApproval      bool     `json:"require_approval,omitempty"`      // Prompt human via native OS dialog before minting
+	AllowStatic          bool     `json:"allow_static,omitempty"`          // Permit non-JIT static mode (params.mode=static or "static" perm)
+	CleanEnv             bool     `json:"clean_env,omitempty"`             // Force clean-env for every exec of this provider (audit M1)
+	AllowedEnv           []string `json:"allowed_env,omitempty"`           // Host env names (globs) a clean-env child keeps; non-empty implies clean_env
+	AllowedInstallations []string `json:"allowed_installations,omitempty"` // Exact params.installation_id values; non-empty requires a listed one
 }
 
 func matchPattern(pattern, value string) bool {
@@ -221,6 +222,12 @@ func (rt *Runtime) CheckPolicy(req ExecRequest) PolicyDecision {
 					return deny("policy denied: permission %q is not in allowed_permissions for provider %q", perm, req.Provider)
 				}
 			}
+		}
+		// Fail closed and exact (no wildcards): params.installation_id picks the installation a
+		// token is minted for. The gate never sees the master, so a request must name a listed ID
+		// even when the master pins one.
+		if inst := req.Params["installation_id"]; len(rule.AllowedInstallations) > 0 && !hasToken(rule.AllowedInstallations, inst) {
+			return deny("policy denied: params.installation_id %q is not in allowed_installations for provider %q", inst, req.Provider)
 		}
 		if len(rule.BlockedCommands) > 0 && len(req.Command) > 0 {
 			cmdLine := strings.ToLower(strings.Join(req.Command, " "))

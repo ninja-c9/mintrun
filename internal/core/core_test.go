@@ -883,7 +883,7 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 	ctx := context.Background()
 	t.Setenv("MINTRUN_APPROVE", "")
 	home, badHome := t.TempDir(), t.TempDir()
-	policy := `{"probe":{"allowed_scopes":["ok.com"],"allowed_permissions":["dns:*"],"blocked_commands":["rm -rf"],"max_ttl_seconds":120,"allowed_env":["MINTRUN_TEST_*"]},"gated":{"require_approval":true}}`
+	policy := `{"probe":{"allowed_scopes":["ok.com"],"allowed_permissions":["dns:*"],"blocked_commands":["rm -rf"],"max_ttl_seconds":120,"allowed_env":["MINTRUN_TEST_*"],"allowed_installations":["555"]},"gated":{"require_approval":true}}`
 	if err := os.WriteFile(filepath.Join(home, "policy.json"), []byte(policy), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -902,7 +902,12 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 	approvals := 0
 	rt.ApprovalFunc = func(context.Context, core.ExecRequest) (bool, error) { approvals++; return false, nil }
 	probe := func(scope string, perms []string, cmd ...string) core.ExecRequest {
-		return core.ExecRequest{MintRequest: core.MintRequest{Provider: "probe", Scope: scope, Permissions: perms}, Command: cmd}
+		return core.ExecRequest{MintRequest: core.MintRequest{Provider: "probe", Scope: scope, Permissions: perms, Params: map[string]string{"installation_id": "555"}}, Command: cmd}
+	}
+	inst := func(id string) core.ExecRequest {
+		req := probe("ok.com", []string{"dns:read"}, "true")
+		req.Params = map[string]string{"installation_id": id}
+		return req
 	}
 
 	for _, c := range []struct {
@@ -918,6 +923,9 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 		{rt, probe("ok.com", []string{"workers:write"}, "true")},
 		{rt, probe("ok.com", []string{"static"}, "true")},
 		{rt, probe("ok.com", []string{"dns:read"}, "sh", "-c", "RM -RF /tmp/x")},
+		{rt, inst("")},
+		{rt, inst("777")},
+		{rt, inst("555/../777")},
 	} {
 		d := c.rt.CheckPolicy(c.req)
 		if _, err := c.rt.ExecBlind(ctx, c.req); d.Allowed || d.Reason == "" || err == nil || err.Error() != d.Reason {
@@ -925,7 +933,8 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 		}
 	}
 
-	// Allowed: max_ttl_seconds caps the TTL (also an unset one), allowed_env forces clean mode.
+	// Allowed: the listed installation mints, max_ttl_seconds caps the TTL (also an unset one),
+	// allowed_env forces clean mode.
 	for _, tc := range []struct{ ttl, want int }{{0, 120}, {300, 120}, {60, 60}} {
 		req := probe("ok.com", []string{"dns:read"}, "true")
 		req.TTLSeconds = tc.ttl
