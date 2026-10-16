@@ -1,0 +1,217 @@
+package builtin
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+	"unicode/utf8"
+
+	"github.com/ninja-c9/mintrun/internal/core"
+)
+
+func TestTelegramApproval(t *testing.T) {
+	const user, token = int64(4242), "123456:TEST-bot_tokenABC"
+	oldAPI, oldTimeout, oldPoll, oldRetry := telegramAPI, telegramTimeout, telegramPoll, telegramRetry
+	t.Cleanup(func() {
+		telegramAPI, telegramTimeout, telegramPoll, telegramRetry = oldAPI, oldTimeout, oldPoll, oldRetry
+	})
+	telegramPoll, telegramRetry = 0, 10*time.Millisecond
+
+	t.Setenv("MINTRUN_VAULT_KEY", "telegram-test-passphrase")
+	home := t.TempDir()
+	kv := &KeychainVault{HomeDir: home, ForceFile: true}
+	reg := core.NewRegistry()
+	if err := reg.Register(kv); err != nil {
+		t.Fatal(err)
+	}
+	approve := TelegramApproval(core.NewRuntime(home, "keychain", reg))
+	req := core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "github", Scope: "owner/repo", Permissions: []string{"contents:read"}, Params: map[string]string{"installation_id": "7"}},
+		Vault:       "agent-chosen", // never where the approval config is read from
+		Command:     []string{"gh", "pr", "list", "x\n✅ Allowed"},
+	}
+	ctx := context.Background()
+
+	if _, err := approve(ctx, req); err == nil || !strings.Contains(err.Error(), "not configured") {
+		t.Fatalf("no config: got %v, want a not-configured error", err)
+	}
+	for _, bad := range []string{"SECRETVALUE", "abc:123:SECRETVALUE", "0:123:SECRETVALUE", "4242:SECRETVALUE", "4242:123:SECRET/VALUE"} {
+		if err := kv.SetSecret(ctx, TelegramApprovalKey, bad); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := approve(ctx, req); err == nil || !strings.Contains(err.Error(), "must be <user_id>:<bot_token>") || strings.Contains(err.Error(), "SECRET") {
+			t.Fatalf("config %q: got %v, want a format error that quotes no secret", bad, err)
+		}
+	}
+	if err := kv.SetSecret(ctx, TelegramApprovalKey, fmt.Sprintf("%d:%s\n", user, token)); err != nil {
+		t.Fatal(err)
+	}
+
+	tap := func(id, from int64, data string, date int64) map[string]any {
+		return map[string]any{"update_id": id, "callback_query": map[string]any{
+			"id": fmt.Sprint("cb", id), "data": data, "from": map[string]any{"id": from}, "message": map[string]any{"date": date}}}
+	}
+	type taps = func(nonce string, now int64) []map[string]any // queued when the message is sent at now
+	pending := func(_ string, now int64) []map[string]any { return []map[string]any{tap(1, user, "allow:LIVE", now)} }
+	cases := []struct {
+		name         string
+		timeout      time.Duration
+		cancelOnPoll bool   // the caller cancels once polling starts, as FirstApproval does
+		reply        string // raw 409 reply to every getUpdates
+		taps         taps
+		ok           bool
+		err          string
+		outcome      string
+		offset       int64 // highest getUpdates offset: every update below it is confirmed
+	}{
+		{name: "allow", taps: func(n string, now int64) []map[string]any { return []map[string]any{tap(1, user, "allow:"+n, now)} },
+			ok: true, outcome: "✅ Allowed", offset: 2},
+		{name: "other users', stale and malformed taps are dropped", taps: func(n string, now int64) []map[string]any {
+			return []map[string]any{
+				{"update_id": int64(1), "message": map[string]any{"text": "/start"}},
+				tap(2, 999, "allow:"+n, now),               // another user
+				tap(3, user, "allow:OLDREQUEST", now-3600), // a request long gone
+				tap(4, user, "allow", now),                 // malformed
+				tap(5, user, "allow:LIVE", 0),              // inaccessible message: no date
+				tap(6, user, "deny:"+n, now),
+			}
+		}, outcome: "⛔ Denied", offset: 7},
+		{name: "a tap on another pending request is never confirmed", taps: func(n string, now int64) []map[string]any {
+			return []map[string]any{tap(1, user, "allow:OLDREQUEST", now-3600), tap(2, user, "allow:LIVE", now), tap(3, user, "deny:"+n, now)}
+		}, outcome: "⛔ Denied", offset: 2},
+		{name: "no answer", timeout: 100 * time.Millisecond, taps: pending,
+			err: "telegram: no answer within 100ms", outcome: "⌛ Expired", offset: 0},
+		{name: "answered elsewhere", cancelOnPoll: true, taps: pending,
+			err: "context canceled", outcome: "⌛ Closed", offset: 0},
+		{name: "webhook", reply: `{"ok":false,"description":"Conflict: can't use getUpdates method while webhook is active"}`,
+			err: "webhook is active", outcome: "⚠️ Not approved", offset: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			telegramTimeout = 5 * time.Second
+			if tc.timeout > 0 {
+				telegramTimeout = tc.timeout
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var (
+				mu       sync.Mutex
+				queue    []map[string]any
+				sent     string
+				nonces   []string
+				offsets  []int64
+				answered []string
+				edits    []string
+			)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					ChatID      int64  `json:"chat_id"`
+					Text        string `json:"text"`
+					Offset      int64  `json:"offset"`
+					CallbackID  string `json:"callback_query_id"`
+					ReplyMarkup struct {
+						InlineKeyboard [][]struct {
+							CallbackData string `json:"callback_data"`
+						} `json:"inline_keyboard"`
+					} `json:"reply_markup"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				method, ok := strings.CutPrefix(r.URL.Path, "/bot"+token+"/")
+				if !ok || r.Method != http.MethodPost || body.ChatID != 0 && body.ChatID != user {
+					t.Errorf("unexpected request %s %s for chat %d", r.Method, r.URL.Path, body.ChatID)
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				result := any(true)
+				switch method {
+				case "sendMessage":
+					sent = body.Text
+					for _, b := range body.ReplyMarkup.InlineKeyboard[0] {
+						nonces = append(nonces, b.CallbackData)
+					}
+					_, nonce, _ := strings.Cut(nonces[0], ":")
+					if tc.taps != nil {
+						queue = tc.taps(nonce, time.Now().Unix())
+					}
+					result = map[string]any{"message_id": 77}
+				case "getUpdates":
+					if tc.cancelOnPoll {
+						cancel()
+					}
+					if tc.reply != "" {
+						w.WriteHeader(http.StatusConflict)
+						_, _ = w.Write([]byte(tc.reply))
+						return
+					}
+					offsets = append(offsets, body.Offset)
+					for len(queue) > 0 && queue[0]["update_id"].(int64) < body.Offset {
+						queue = queue[1:]
+					}
+					result = queue
+				case "answerCallbackQuery":
+					answered = append(answered, body.CallbackID)
+				case "editMessageText":
+					if len(body.ReplyMarkup.InlineKeyboard) != 0 {
+						t.Errorf("edit kept the buttons: %+v", body.ReplyMarkup)
+					}
+					edits = append(edits, body.Text)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": result})
+			}))
+			defer srv.Close()
+			telegramAPI = srv.URL
+
+			ok, err := approve(ctx, req)
+			if ok != tc.ok || (err == nil) != (tc.err == "") || err != nil && !strings.Contains(err.Error(), tc.err) {
+				t.Fatalf("got (%v, %v), want (%v, %q)", ok, err, tc.ok, tc.err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			want := "🔐 mintrun approval request\n\nProvider: \"github\"\nScope: \"owner/repo\"\nPermissions: \"contents:read\"\n" +
+				"Params: \"installation_id\"=\"7\"\nCommand: \"gh\" \"pr\" \"list\" \"x\\n✅ Allowed\""
+			if sent != want {
+				t.Errorf("message:\n%s\nwant:\n%s", sent, want)
+			}
+			if len(nonces) != 2 || !strings.HasPrefix(nonces[0], "allow:") || nonces[1] != "deny:"+strings.TrimPrefix(nonces[0], "allow:") || len(nonces[0]) != len("allow:")+26 {
+				t.Errorf("buttons carry %q, want allow:<nonce> and deny:<nonce>", nonces)
+			}
+			if len(edits) != 1 || !strings.HasPrefix(edits[0], want+"\n\n"+tc.outcome) {
+				t.Errorf("edits %q, want one that appends %q", edits, tc.outcome)
+			}
+			if m := slices.Max(append(offsets, 0)); m != tc.offset {
+				t.Errorf("highest offset %d, want %d (offsets %v)", m, tc.offset, offsets)
+			}
+			if wantAnswered := tc.err == ""; (len(answered) == 1) != wantAnswered {
+				t.Errorf("answered callbacks %q, want one: %v", answered, wantAnswered)
+			}
+		})
+	}
+
+	// The token rides in the URL path: no error may quote it, whether net/http or the API wrote it.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"ok":false,"description":"Unauthorized"}`))
+	}))
+	telegramAPI = srv.URL
+	if _, err := approve(ctx, req); err == nil || !strings.Contains(err.Error(), "telegram sendMessage: HTTP 401: Unauthorized") {
+		t.Fatalf("401: got %v", err)
+	}
+	srv.Close()
+	_, err := approve(ctx, req)
+	if err == nil || strings.Contains(err.Error(), token) || !strings.Contains(err.Error(), "/bot"+core.RedactedPlaceholder+"/sendMessage") {
+		t.Fatalf("unreachable: got %v, want the token scrubbed from the URL", err)
+	}
+
+	// A long request is cut on a rune boundary and says so.
+	long := telegramText(core.ExecRequest{Command: []string{strings.Repeat("é", 3000)}})
+	if len(long) > 3700 || !utf8.ValidString(long) || !strings.HasSuffix(long, "Deny unless you know the rest.") {
+		t.Fatalf("long request: %d bytes, valid UTF-8 %v, tail %q", len(long), utf8.ValidString(long), long[len(long)-40:])
+	}
+}
