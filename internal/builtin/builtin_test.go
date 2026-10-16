@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -455,9 +456,12 @@ func TestKeychainAndOnePasswordVaults(t *testing.T) {
 		t.Fatalf("expected re-created vault to hold 'recovered', got %q %v", got, err)
 	}
 
-	// Test OnePasswordVault using a mock `op` CLI binary in PATH
+	// Test OnePasswordVault using a mock `op` CLI binary in PATH. It logs its argv and keeps the
+	// create template it read on stdin.
 	binDir := t.TempDir()
+	opLog, opStdin := filepath.Join(binDir, "argv.log"), filepath.Join(binDir, "stdin.json")
 	opScript := `#!/bin/sh
+echo "$*" >> "$MOCK_OP_LOG"
 case "$*" in
   *"fail"*)
     echo "op error" >&2
@@ -469,11 +473,24 @@ case "$*" in
   "item get mintrun:cloudflare --fields label=credential --reveal --vault TeamVault")
     echo "op_item_secret_val"
     ;;
-  "item create"*)
-    echo "created"
+  "item create --format json --vault TeamVault -")
+    in=$(cat)
+    printf '%s' "$in" > "$MOCK_OP_STDIN"
+    case "$in" in
+      *mintrun:bad*) echo "invalid template: $in" >&2; exit 1 ;;
+      *mintrun:garbled*) echo "created" ;;
+      *) echo '{"id":"new1","title":"x","vault":{"id":"vlt1","name":"TeamVault"}}' ;;
+    esac
     ;;
-  "item delete"*)
+  "item list --vault vlt1 --format json")
+    echo '[{"id":"old1","title":"mintrun:cloudflare"},{"id":"new1","title":"mintrun:cloudflare"},{"id":"old2","title":"mintrun:github"}]'
+    ;;
+  "item delete old1 --archive --vault vlt1"|"item delete mintrun:cloudflare --vault TeamVault")
     echo "deleted"
+    ;;
+  *)
+    echo "unexpected op call" >&2
+    exit 2
     ;;
 esac
 `
@@ -483,6 +500,12 @@ esac
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("MINTRUN_OP_VAULT", "TeamVault")
+	t.Setenv("MOCK_OP_LOG", opLog)
+	t.Setenv("MOCK_OP_STDIN", opStdin)
+	var warn bytes.Buffer
+	oldWarn := warnOut
+	warnOut = &warn
+	defer func() { warnOut = oldWarn }()
 
 	opv := NewOnePasswordVault()
 	if opv.Manifest().Name != "1password" || opv.VaultName != "TeamVault" {
@@ -491,8 +514,33 @@ esac
 	if err := opv.SetSecret(ctx, "cloudflare", ""); err == nil {
 		t.Fatal("expected empty secret error")
 	}
-	if err := opv.SetSecret(ctx, "cloudflare", "val123"); err != nil {
+	// The secret reaches op only in the stdin template, then only the older same-title item in
+	// the new item's vault is archived.
+	if err := opv.SetSecret(ctx, "cloudflare", ` val"123\ `); err != nil {
 		t.Fatalf("op SetSecret failed: %v", err)
+	}
+	var tmpl struct {
+		Title, Category string
+		Fields          []map[string]string
+	}
+	if raw, _ := os.ReadFile(opStdin); json.Unmarshal(raw, &tmpl) != nil || tmpl.Title != "mintrun:cloudflare" || tmpl.Category != "PASSWORD" ||
+		len(tmpl.Fields) != 1 || tmpl.Fields[0]["label"] != "credential" || tmpl.Fields[0]["type"] != "CONCEALED" || tmpl.Fields[0]["value"] != `val"123\` {
+		t.Fatalf("unexpected create template: %+v", tmpl)
+	}
+	if got, _ := os.ReadFile(opLog); string(got) != "item create --format json --vault TeamVault -\nitem list --vault vlt1 --format json\nitem delete old1 --archive --vault vlt1\n" {
+		t.Fatalf("unexpected op calls:\n%s", got)
+	}
+	if warn.Len() != 0 {
+		t.Fatalf("unexpected warning: %s", warn.String())
+	}
+	// A failed create quotes op's stderr with the secret scrubbed, raw and JSON-escaped.
+	err := opv.SetSecret(ctx, "bad", `leak"me_123`)
+	if err == nil || strings.Contains(err.Error(), "leak") || !strings.Contains(err.Error(), "invalid template") || !strings.Contains(err.Error(), core.RedactedPlaceholder) {
+		t.Fatalf("expected a scrubbed op item create error, got %v", err)
+	}
+	// Output op cannot parse still stores the secret, with a warning that older items were kept.
+	if err := opv.SetSecret(ctx, "garbled", "val123"); err != nil || !strings.Contains(warn.String(), `stored "mintrun:garbled", but archiving older 1Password items`) {
+		t.Fatalf("expected an archive warning, got %v %q", err, warn.String())
 	}
 	if got, err := opv.GetSecret(ctx, "op://Private/cf/token"); err != nil || got != "op_uri_secret_val" {
 		t.Fatalf("op:// GetSecret failed: %q %v", got, err)
@@ -507,14 +555,21 @@ esac
 	if _, err := opv.GetSecret(ctx, "op://fail"); err == nil {
 		t.Fatal("expected op read error")
 	}
-	if _, err := opv.GetSecret(ctx, "fail"); err == nil {
-		t.Fatal("expected op item get error")
-	}
-	if err := opv.SetSecret(ctx, "fail", "v"); err == nil {
-		t.Fatal("expected op item create error")
+	if _, err := opv.GetSecret(ctx, "fail"); err == nil || !strings.Contains(err.Error(), "op error") {
+		t.Fatalf("expected op item get error, got %v", err)
 	}
 	if err := opv.DeleteSecret(ctx, "fail"); err == nil {
 		t.Fatal("expected op item delete error")
+	}
+	// exec.Command refuses an op found through a relative PATH entry, so a planted ./op never runs.
+	_ = os.Remove(opLog)
+	t.Chdir(binDir)
+	t.Setenv("PATH", ".")
+	if err := opv.SetSecret(ctx, "cloudflare", "val123"); err == nil || !strings.Contains(err.Error(), exec.ErrDot.Error()) {
+		t.Fatalf("expected exec.ErrDot for a relative-PATH op, got %v", err)
+	}
+	if _, err := os.Stat(opLog); !os.IsNotExist(err) {
+		t.Fatalf("relative-PATH op ran: %v", err)
 	}
 }
 
@@ -1001,7 +1056,7 @@ printf '%s\n' "$*" >> "$MOCK_SEC_LOG"
 if [ "$1" = "-i" ]; then
   IFS= read -r line
   svc=${line#*-s \"}; svc=${svc%%\"*}
-  case "$svc" in *fail*) echo "add-generic-password failed" >&2; exit 45 ;; esac
+  case "$svc" in *fail*|*flaky*.1) echo "add-generic-password failed" >&2; exit 45 ;; esac
   printf '%s' "${line##*-X }" > "$MOCK_SEC_STORE/$svc"
   exit 0
 fi
@@ -1050,7 +1105,7 @@ esac
 	}
 	logged, _ := os.ReadFile(argLog)
 	if strings.Contains(string(logged), "multi") || strings.Contains(string(logged), hex.EncodeToString([]byte(secret))) ||
-		!strings.HasPrefix(string(logged), "-i\n") || !strings.Contains(string(logged), "find-generic-password -a mintrun -s mintrun:gcp -g") {
+		!strings.HasPrefix(string(logged), "find-generic-password -a mintrun -s mintrun:gcp -g\n-i\n") {
 		t.Fatalf("unexpected security argv (secret must go via stdin):\n%s", logged)
 	}
 	// A miss (exit 44) falls back to the file vault quietly.
@@ -1076,29 +1131,93 @@ esac
 		}
 	}
 
-	// `security -i` reads 4095-byte lines: a secret that fits is sent; one byte more is refused
-	// before anything is sent (a split line stores a corrupted item) and lands in the file vault.
+	// `security -i` reads 4095-byte lines: a 2019-byte secret fits in one item. A longer one is
+	// split into 1,500-byte parts behind a header, and replacing it removes the old parts.
+	stored := func(svc string) string {
+		b, _ := os.ReadFile(filepath.Join(store, svc))
+		v, _ := hex.DecodeString(string(b))
+		return string(v)
+	}
+	parts := func(key string) []string {
+		m, _ := filepath.Glob(filepath.Join(store, "mintrun:"+key+":*"))
+		return m
+	}
+	warn.Reset()
 	edge, big := strings.Repeat("e", 2019), strings.Repeat("b", 2020)
-	for key, val := range map[string]string{"edge": edge, "big": big} {
-		if err := kv.SetSecret(ctx, key, val); err != nil {
+	for _, c := range []struct {
+		key, val string
+		parts    int
+	}{{"edge", edge, 0}, {"big", big, 2}, {"big", strings.Repeat("c", 3001), 3}, {"big", "short_val", 0}, {"lookalike", chunkPrefix + "not:a:header", 1}} {
+		if err := kv.SetSecret(ctx, c.key, c.val); err != nil {
 			t.Fatal(err)
 		}
-		if got, err := kv.GetSecret(ctx, key); err != nil || got != val {
-			t.Fatalf("%s: round trip failed: %v", key, err)
+		if got, err := kv.GetSecret(ctx, c.key); err != nil || got != c.val || len(parts(c.key)) != c.parts {
+			t.Fatalf("%s: round trip failed: %v, parts %v", c.key, err, parts(c.key))
+		}
+		if c.val == big {
+			gen, n, _, ok := parseChunkHeader(stored("mintrun:big"))
+			if !ok || n != 2 || stored("mintrun:big:"+gen+".0") != big[:1500] || stored("mintrun:big:"+gen+".1") != big[1500:] {
+				t.Fatalf("expected a header naming two parts, got %q", stored("mintrun:big"))
+			}
 		}
 	}
-	if _, err := os.Stat(filepath.Join(store, "mintrun:edge")); err != nil {
-		t.Fatalf("a 4095-byte line must reach security: %v", err)
+	if stored("mintrun:edge") != edge || stored("mintrun:big") != "short_val" || warn.Len() != 0 {
+		t.Fatalf("expected single items and no warnings, got %q", warn.String())
 	}
-	if _, err := os.Stat(filepath.Join(store, "mintrun:big")); !os.IsNotExist(err) || !strings.Contains(warn.String(), "too long for `security -i`") {
-		t.Fatalf("an oversize line must never reach security: %v, warnings %q", err, warn.String())
+	// Past 16 parts a secret is refused before anything is sent and lands in the file vault.
+	huge := strings.Repeat("h", maxChunks*chunkSize+1)
+	if err := kv.SetSecret(ctx, "huge", huge); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := kv.GetSecret(ctx, "huge"); err != nil || got != huge || len(parts("huge")) != 0 || !strings.Contains(warn.String(), "too long for the Keychain") {
+		t.Fatalf("an oversize secret must land in the file vault with a warning: %v, warnings %q", err, warn.String())
+	}
+	if _, err := os.Stat(filepath.Join(store, "mintrun:huge")); !os.IsNotExist(err) {
+		t.Fatalf("an oversize secret must never reach security: %v", err)
+	}
+	// A part that fails to store removes the parts written before it and leaves the old item intact.
+	if err := kv.SetSecret(ctx, "flaky", "old_flaky_val"); err != nil {
+		t.Fatal(err)
+	}
+	if err := kv.SetSecret(ctx, "flaky", big); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := kv.keychainGet(ctx, "flaky"); err != nil || got != "old_flaky_val" || len(parts("flaky")) != 0 || !strings.Contains(warn.String(), `macOS Keychain store for "flaky" failed`) {
+		t.Fatalf("a failed part must leave the old item and no parts: %q %v, parts %v, warnings %q", got, err, parts("flaky"), warn.String())
 	}
 	// A service name `security -i` cannot quote is refused the same way.
 	if err := kv.SetSecret(ctx, `bad"key`, "quoted_val"); err != nil || !strings.Contains(warn.String(), "cannot be quoted") {
 		t.Fatalf("expected refusal of an unquotable service name: %v, warnings %q", err, warn.String())
 	}
-	if strings.Contains(warn.String(), "bbbb") || strings.Contains(warn.String(), "quoted_val") {
-		t.Fatalf("warnings must never carry a secret:\n%s", warn.String())
+	for _, s := range []string{"bbbb", "hhhh", "quoted_val"} {
+		if strings.Contains(warn.String(), s) {
+			t.Fatalf("warnings must never carry a secret:\n%s", warn.String())
+		}
+	}
+	// A header whose parts are missing, altered, or out of range fails loudly, never as a quiet miss.
+	sum := sha256.Sum256([]byte("part0part1"))
+	head := "mintrun-chunks:v1:G:2:" + hex.EncodeToString(sum[:])
+	for svc, v := range map[string]string{
+		"mintrun:whole": head, "mintrun:whole:G.0": "part0", "mintrun:whole:G.1": "part1",
+		"mintrun:torn": head, "mintrun:torn:G.0": "part0",
+		"mintrun:altered": head, "mintrun:altered:G.0": "part0", "mintrun:altered:G.1": "PART1",
+		"mintrun:range": strings.Replace(head, ":2:", ":17:", 1),
+	} {
+		if err := os.WriteFile(filepath.Join(store, svc), []byte(hex.EncodeToString([]byte(v))), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := kv.GetSecret(ctx, "whole"); err != nil || got != "part0part1" {
+		t.Fatalf("hand-built header: %q %v", got, err)
+	}
+	for key, reason := range map[string]string{"torn": "Keychain part 2 of 2", "altered": "do not match their checksum", "range": "unparseable Keychain chunk header"} {
+		warn.Reset()
+		if _, err := kv.GetSecret(ctx, key); err == nil || !strings.Contains(warn.String(), reason) {
+			t.Fatalf("%s: expected a warning naming %q, got %v, warnings %q", key, reason, err, warn.String())
+		}
+	}
+	if err := kv.DeleteSecret(ctx, "whole"); err != nil || len(parts("whole")) != 0 || stored("mintrun:whole") != "" {
+		t.Fatalf("delete must remove the header and its parts: %v, parts %v", err, parts("whole"))
 	}
 
 	// Delete: a Keychain miss is fine; a real failure is reported, and the file vault still cleared.

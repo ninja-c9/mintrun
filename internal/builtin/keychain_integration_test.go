@@ -39,16 +39,38 @@ func TestKeychainVaultRealKeychain(t *testing.T) {
 		}
 	}
 
-	// An oversize secret is refused before `security -i` sees it and lands in the file vault.
-	big := strings.Repeat("b", 2100)
-	if err := kv.SetSecret(ctx, bigKey, big); err != nil {
+	// A secret one `security -i` line cannot carry is split into parts behind a header. Part 1 is
+	// printable with quotes (-g's raw form), part 2 holds backslashes and ends mid-rune, and part 3
+	// starts with the rest of that rune. Replacing the secret, then deleting it, leaves no parts.
+	big := strings.Repeat(`q"q `, 375) + strings.Repeat(`a\b `, 374) + "ccc\u00fc\nend"
+	svc := kv.serviceName(bigKey)
+	gens := map[string]int{}
+	for _, val := range []string{big, big[:2501]} {
+		if err := kv.SetSecret(ctx, bigKey, val); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := kv.keychainGet(ctx, bigKey); err != nil || got != val {
+			t.Fatalf("chunked round trip: %v", err)
+		}
+		head, err := kv.keychainRead(ctx, svc)
+		gen, n, _, ok := parseChunkHeader(head)
+		if err != nil || !ok || n != (len(val)+chunkSize-1)/chunkSize {
+			t.Fatalf("expected a header, got %q %v", head, err)
+		}
+		gens[gen] = n
+	}
+	if err := kv.DeleteSecret(ctx, bigKey); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := kv.keychainGet(ctx, bigKey); !errors.Is(err, errNotFound) {
-		t.Fatalf("oversize secret must not reach the Keychain: %v", err)
+	for gen, n := range gens {
+		for i := range n {
+			if _, err := kv.keychainRead(ctx, partService(svc, gen, i)); !errors.Is(err, errNotFound) {
+				t.Fatalf("part %s.%d left in the Keychain: %v", gen, i, err)
+			}
+		}
 	}
-	if got, err := kv.GetSecret(ctx, bigKey); err != nil || got != big || !strings.Contains(warn.String(), "too long") {
-		t.Fatalf("oversize secret must land in the file vault with a warning: %v, warnings %q", err, warn.String())
+	if warn.Len() != 0 {
+		t.Fatalf("unexpected warnings:\n%s", warn.String())
 	}
 
 	if err := kv.DeleteSecret(ctx, key); err != nil {

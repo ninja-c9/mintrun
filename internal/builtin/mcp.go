@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/ninja-c9/mintrun/internal/core"
 )
@@ -258,37 +257,29 @@ func (m *MCPBridge) handleToolCall(ctx context.Context, rt *core.Runtime, id jso
 // argv[0]: policy-denied entries keep the raw argv (no secret is loaded yet to scrub against),
 // and a secret a human typed into argv is one the runner never holds, so arguments never reach
 // an agent. The on-disk log keeps the full argv for the operator.
-// ponytail: reads the whole log per call; seek from the end if audit.jsonl grows large.
 func readAudit(home, provider string, failedOnly bool, limit int) ([]core.AuditEntry, error) {
 	if limit <= 0 {
 		limit = 20
 	}
-	limit = min(limit, 100)
-	raw, err := os.ReadFile(filepath.Join(home, "audit.jsonl"))
+	f, err := os.Open(filepath.Join(home, "audit.jsonl"))
 	if os.IsNotExist(err) {
 		return []core.AuditEntry{}, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("read audit log: %v", err)
 	}
+	defer f.Close()
 	entries := []core.AuditEntry{}
-	for _, line := range strings.Split(string(raw), "\n") {
-		var e core.AuditEntry
-		if json.Unmarshal([]byte(line), &e) != nil {
-			continue
-		}
-		if provider != "" && !strings.EqualFold(e.Provider, provider) {
-			continue
-		}
-		if failedOnly && e.ExitCode == 0 && e.Error == "" {
-			continue
-		}
+	err = core.TailAudit(f, provider, failedOnly, min(limit, 100), func(_ string, e core.AuditEntry) {
 		if len(e.Command) > 1 {
 			e.Command = []string{e.Command[0], core.RedactedPlaceholder}
 		}
 		entries = append(entries, e)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read audit log: %v", err)
 	}
-	return entries[max(0, len(entries)-limit):], nil
+	return entries, nil
 }
 
 func toolTextResult(id json.RawMessage, text string, isError bool) jsonRPCResponse {
