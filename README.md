@@ -298,6 +298,7 @@ mintrun secret set approval-telegram    # enter <user_id>:<bot_token>
 - **Ten minutes, then no.** Telegram gives up after 10 minutes and the request is not approved, while the macOS dialog, which has no timeout, keeps waiting. On Linux, where there is no dialog, Telegram is the only channel. With neither, `-approve` fails closed.
 - **A bot of its own.** `mintrun` reads taps with `getUpdates`, which Telegram refuses while the bot has a webhook.
 - **The default vault only.** The setting is read from the default vault (`MINTRUN_VAULT`, or `keychain`), never from the vault a request names, so an agent cannot send approvals to a bot it controls.
+- **Every field quoted.** The dialog and the message show each field an agent sets in quotes, so a line break in an argument shows as `\n` and cannot pose as a line of the request. A request too long to show ends in a TRUNCATED warning: deny it unless you know the rest.
 - **What Telegram sees.** The message carries the provider, scope, permissions, params, and command through Telegram's servers. It holds no secret, because approval comes before any secret is loaded, but a secret typed into the command's arguments would be in it.
 - **No Slack.** A Slack incoming webhook only sends, so it cannot carry your answer back.
 

@@ -150,6 +150,16 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
   go test -count=1 -v -run 'TestPluginInstallCatalog|TestExamplePlugins' ./cmd/mintrun
   ```
 
+### Workstream K — Quoted Approval Text
+- **Files:** `internal/core/runner.go`, `internal/core/core_test.go`, `internal/builtin/telegram.go`
+- **Deliverables:**
+  1. `[SERIAL]` `core.ApprovalText` builds the text every approver shows: provider, scope, permissions, params (sorted), and each argv element `strconv.Quote`d, cut on a UTF-8 boundary with a TRUNCATED warning. `OSApproval` passes it, cut at 1,000 bytes, to `display dialog` through `%q`, so a newline in an argument no longer fakes a line of the dialog, and permissions and params now show. `telegramText` calls it with its 3,500-byte cap and sends the same message as before.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestOSApproval' ./internal/core
+  go test -count=1 -v -run 'TestTelegramApproval' ./internal/builtin
+  ```
+
 ---
 
 ## 3. Deferred Backlog (Next Actionable Items)

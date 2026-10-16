@@ -13,6 +13,7 @@
 | **`v0.7.0` — GitHub Installation Binding** | ✅ Done | Consistent GitHub master secret parsing with `params.installation_id`; `github` refuses a `params.installation_id` that differs from the installation pinned in the stored credential; policy `allowed_installations` (exact, fail-closed, enforced in `CheckPolicy` for both `ExecBlind` and `mintrun_policy_check`); `params` in the MCP input schema; `92.7%` verified statement coverage |
 | **`v0.8.0` — Secrets Off argv, Bounded Audit Reads & Long Keychain Secrets** | ✅ Done | 1Password `secret set` pipes the secret to `op item create` on `stdin` and archives older items with the same title; `mintrun audit` and MCP `mintrun_audit` stream `audit.jsonl` through `core.TailAudit`, so memory no longer grows with the log; macOS Keychain secrets too long for one `security -i` line are stored as up to 16 checksummed parts (24,000 bytes); the hidden `secret set` prompt is tested with a stub `stty`; `93.6%` verified statement coverage |
 | **`v0.9.0` — Keystore Cleanup, Example Plugins & Phone Approval** | ✅ Done | A `secret set` that falls back to the file vault after a failed Keychain or libsecret store removes the older keystore item for the key, which used to shadow the new secret on read, or fails with an error saying that item still wins; a successful Keychain or libsecret store removes the older file-vault copy of the key, which a failed keystore lookup used to return, or warns that it may remain when `MINTRUN_VAULT_KEY` is not set to decrypt `vault.json`; README documents `MINTRUN_FILE_VAULT=1` for a host whose keystore cannot be reached; Three plugins in `examples/plugins/` that install from a clone (a `bitwarden` vault; `vercel` and `postgres-jit` providers; Python 3.9+ standard library), tested through the CLI against a stub `bw`, a stub `psql`, and a local Vercel API, with `postgres-jit` also run against real PostgreSQL 15 and 16; `-approve` and `require_approval` ask the macOS dialog and a Telegram bot at once and the first answer wins (`approval-telegram` in the default vault; no answer within 10 minutes is not an approval); `94.0%` verified statement coverage, measured in a `git archive v0.9.0` export |
+| **Unreleased — Quoted Approval Text** | ⏳ Untagged | The macOS approval dialog and the Telegram message show the same text, built by `core.ApprovalText`: every field an agent sets (provider, scope, permissions, params, argv) is quoted, so a line break in an argument shows as `\n` and cannot fake a `Command:` line or push the command out of view, and a control character no longer stops the dialog from opening; the dialog now shows permissions and params and cuts a long request with a TRUNCATED warning; `94.0%` verified statement coverage |
 
 ---
 
@@ -23,7 +24,7 @@
 - **Security Audit Report:** [audit.md](audit.md)
 - **Pipeline Status:**
   - `gofmt -s -l cmd internal examples` and `go vet ./...`: clean (`0` issues)
-  - `go test -count=1 -cover ./...` (without build tags): **93.9%** total statement coverage (`cmd/mintrun` 94.3%, `internal/builtin` 93.7%, `internal/core` 94.2%)
+  - `go test -count=1 -cover ./...` (without build tags): **93.9%** total statement coverage (`cmd/mintrun` 94.3%, `internal/builtin` 93.6%, `internal/core` 94.3%)
   - `go test -race -count=1 ./...`: pass (`0` data races)
   - `go build -trimpath -o mintrun ./cmd/mintrun && ./mintrun plugin list`: pass (`7` built-in plugins registered, `0` local path strings in binary)
   - Cross-compilation (`GOOS=linux`, `GOOS=windows`, `GOOS=freebsd`): pass
@@ -39,6 +40,7 @@
 - **Live Telegram, Bitwarden & Vercel Verification:** Telegram approval, the `bitwarden` vault, and the `vercel` provider are tested against a local Bot API, a stub `bw`, and a local Vercel API only; run each against a real bot or account before calling it verified. The steps are in [plan.md](plan.md) §3 item 3.
 - **Two-Way Slack Approval:** Not built, because an incoming webhook only sends. It needs a Slack app token, `chat.postMessage`, and polling for the answer; Socket Mode needs WebSockets, which the standard library lacks.
 - **Audit Read Time:** `TailAudit` bounds memory but still scans the whole log on every read; seek back from the end if it reaches gigabytes.
+- **Approval Text Gaps:** The macOS dialog's default button is "Allow", so Return approves; `strconv.Quote` keeps look-alike letters and combining marks as written (the look-alike row in [checks.md](checks.md)); neither approver shows `Vault` or `WorkingDir`, both of which an agent sets.
 
 ---
 
@@ -69,3 +71,11 @@
 - **Phát hiện:** trên macOS 27.0, tiến trình con không đọc được biến môi trường của tiến trình cha qua `ps -E` hay `sysctl`, nên README §5 và rule 23 đã được sửa lại cho đúng phiên bản này.
 - **Chưa kiểm chứng:** sandbox chặn một item Keychain thật (cần bạn đồng ý tạo item thử); Linux; Telegram, 1Password, Bitwarden, Vercel trên tài khoản thật.
 - **Next step:** chờ bạn chọn hướng onboarding (đề xuất: `mintrun init` + `mintrun doctor` trước) và duyệt thiết kế sandbox.
+
+## Checkpoint — Yêu cầu duyệt trích dẫn mọi trường (2026-10-16)
+
+- **Hoàn thành:** Workstream K. Hộp thoại macOS và tin nhắn Telegram dựng văn bản bằng cùng một hàm `core.ApprovalText`: mọi trường do agent đặt đều nằm trong dấu ngoặc kép, nên dấu xuống dòng trong một đối số hiện thành `\n` và không giả được dòng `Command:`. Hộp thoại hiện thêm permissions và params, cắt ở 1.000 byte kèm cảnh báo TRUNCATED; tin nhắn Telegram giữ nguyên từng byte.
+- **Outputs:** sửa `internal/core/runner.go`, `internal/core/core_test.go`, `internal/builtin/telegram.go`.
+- **Kiểm chứng:** dòng Approval Text trong `checks.md`; 7/7 mutant đều bị `TestOSApproval` bắt; `osascript` thật đọc literal của hộp thoại ra đúng văn bản từng byte.
+- **Chưa xử lý:** mục Approval Text Gaps ở phần 3.
+- **Next step:** tag bản mới khi bạn đồng ý.
