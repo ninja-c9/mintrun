@@ -78,11 +78,7 @@ Every change to `cmd/` or `internal/` must pass the following verification pipel
   go test -count=1 -v -run 'TestCheckPolicyMatchesExecBlind|TestGitHubProviderAndJWTSigningComprehensive' ./internal/core ./internal/builtin
   ```
 
----
-
-## 3. Active Workstream
-
-### Workstream E — Secrets Off argv, Bounded Audit Reads & Long Keychain Secrets (`v0.8.0`)
+### Workstream E — Secrets Off argv, Bounded Audit Reads & Long Keychain Secrets
 - **Files:** `internal/builtin/keychain.go`, `internal/builtin/mcp.go`, `internal/core/runner.go`, `cmd/mintrun/main.go`, and their tests (`internal/builtin/builtin_test.go`, `internal/builtin/keychain_integration_test.go`, `internal/core/core_test.go`, `cmd/mintrun/main_test.go`)
 - **Deliverables:**
   1. `OnePasswordVault.SetSecret` pipes a JSON item template to `op item create -`, so the secret travels on `stdin` instead of `argv`. It scrubs the secret from any `op` output it quotes, and archives older items with the same title so `op item get` stays unambiguous. `exec.Command` already refuses an `op` found through a relative `PATH` entry, and a test pins that.
@@ -97,12 +93,15 @@ Every change to `cmd/` or `internal/` must pass the following verification pipel
 
 ---
 
-## 4. Deferred Backlog (Next Actionable Items)
+## 3. Deferred Backlog (Next Actionable Items)
 
-1. **OS Network Sandbox (`no_network: true`), awaiting approval:**
+1. **Keystore Fallback Shadowing (bug):**
+   - When a Keychain or libsecret store fails, `SetSecret` writes the file vault, but an older keystore item for the same key still wins in `GetSecret`, so reads return the stale secret. Since Workstream E, only a locked or failing keystore or a secret over 24,000 bytes reaches that path.
+   - Fix: once the file-vault write succeeds, delete the key's keystore item (the Keychain header and its parts, or the libsecret entry), report any failure other than not-found, and pin it with a test.
+2. **OS Network Sandbox (`no_network: true`), awaiting approval:**
    - Optional per-OS network isolation for the child: a Linux `CLONE_NEWNET` network namespace or a macOS `sandbox-exec` deny-network profile. It must fail closed when requested but unsupported on the host.
    - Open questions before building it: every built-in provider mints a credential for a CLI that calls a network API, so the flag only fits offline commands. A macOS `(deny network*)` profile also blocks Unix sockets (`ssh-agent`, Docker). Many Linux hosts restrict the unprivileged user namespaces that `CLONE_NEWNET` needs.
-2. **Linux Host Verification & HITL Support:**
+3. **Linux Host Verification & HITL Support:**
    - Run integration tests against real `secret-tool` on Linux and evaluate `zenity`/`kdialog` or terminal confirmation for `-approve` on Linux.
-3. **GCP `token_uri` From the Service-Account Key:**
+4. **GCP `token_uri` From the Service-Account Key:**
    - Deferred: only keys outside the default Google universe carry a different `token_uri`, and honoring it also means sending revocation to that universe. Add it when such a key is in use.

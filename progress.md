@@ -11,6 +11,7 @@
 | **`v0.5.0` — Security Remediation, Env Isolation, GCP, Linux Vault & MCP Governance** | ✅ Done | Full exit-path scrubbing and opaque lease IDs; fail-closed policy evaluation and `allow_static` gate; plugin path/shadowing isolation and salted PBKDF2-HMAC-SHA256 file vault (`MINTRUN_VAULT_KEY`); child `clean_env` / `allowed_env` isolation; built-in `gcp` OAuth2 JWT provider; Linux `secret-tool` vault; MCP `mintrun_policy_check` and `mintrun_audit` governance tools |
 | **`v0.6.0` — Operational Hardening** | ✅ Done | macOS Keychain secrets over `security -i` `stdin`, loud keystore fallback warnings, CLI `argv` secret warnings and echo-off prompt; 4 MiB child output cap with straddle-safe secret scrubbing and Unix process-group kill on timeout or `SIGINT`/`SIGTERM`/`SIGHUP`; SigV4 `x-amz-security-token` signing and expires-only AWS STS lease reporting (`revoked: false`); explicit static mode required for `github` and `aws`; hermetic default `go test ./...` (`-tags integration` for real Keychain); `92.6%` verified statement coverage |
 | **`v0.7.0` — GitHub Installation Binding** | ✅ Done | Consistent GitHub master secret parsing with `params.installation_id`; `github` refuses a `params.installation_id` that differs from the installation pinned in the stored credential; policy `allowed_installations` (exact, fail-closed, enforced in `CheckPolicy` for both `ExecBlind` and `mintrun_policy_check`); `params` in the MCP input schema; `92.7%` verified statement coverage |
+| **`v0.8.0` — Secrets Off argv, Bounded Audit Reads & Long Keychain Secrets** | ⏳ Untagged | 1Password `secret set` pipes the secret to `op item create` on `stdin` and archives older items with the same title; `mintrun audit` and MCP `mintrun_audit` stream `audit.jsonl` through `core.TailAudit`, so memory no longer grows with the log; macOS Keychain secrets too long for one `security -i` line are stored as up to 16 checksummed parts (24,000 bytes); the hidden `secret set` prompt is tested with a stub `stty`; `93.6%` verified statement coverage |
 
 ---
 
@@ -21,7 +22,7 @@
 - **Security Audit Report:** [audit.md](audit.md)
 - **Pipeline Status:**
   - `gofmt -s -l cmd internal` and `go vet ./...`: clean (`0` issues)
-  - `go test -count=1 -cover ./...` (without build tags): **92.7%** total statement coverage (`cmd/mintrun` 86.9%, `internal/builtin` 93.7%, `internal/core` 93.5%)
+  - `go test -count=1 -cover ./...` (without build tags): **93.6%** total statement coverage (`cmd/mintrun` 95.1%, `internal/builtin` 93.1%, `internal/core` 93.8%)
   - `go test -race -count=1 ./...`: pass (`0` data races)
   - `go build -trimpath -o mintrun ./cmd/mintrun && ./mintrun plugin list`: pass (`7` built-in plugins registered, `0` local path strings in binary)
   - Cross-compilation (`GOOS=linux`, `GOOS=windows`, `GOOS=freebsd`): pass
@@ -30,7 +31,9 @@
 
 ## 3. Open Items & Next Steps
 
-- **OS Network Sandbox (`no_network: true`):** Optional fail-closed network namespace / `sandbox-exec` isolation for child processes.
-- **1Password CLI (`op item create`) `stdin` Secret Passing:** Move secret creation off `argv` onto `stdin`.
-- **Linux Host Verification & TTY Coverage:** Verify `secret-tool` and HITL behavior on a Linux host, and add PTY test coverage for `setEcho`.
-- **Audit Log Tail-Reading:** Read `~/.mintrun/audit.jsonl` from the tail for bounded memory usage on large logs.
+- **`v0.8.0` Tag:** Workstream E is untagged; tag it once approved.
+- **Keystore Fallback Shadowing (bug):** After a failed Keychain or libsecret store, an older keystore item for the same key still wins over the file vault's new secret on read; delete the stale item once the file-vault write succeeds ([plan.md](plan.md) backlog item 1).
+- **OS Network Sandbox (`no_network: true`):** Optional fail-closed network namespace / `sandbox-exec` isolation for child processes; awaiting approval of the open questions in [plan.md](plan.md).
+- **Live 1Password Verification:** Run `mintrun secret set`, `check`, and `rm` against a real 1Password account; the `stdin` item template and the archiving of older items are tested against a mock `op` only.
+- **Linux Host Verification:** Verify `secret-tool` and HITL behavior on a Linux host.
+- **Audit Read Time:** `TailAudit` bounds memory but still scans the whole log on every read; seek back from the end if it reaches gigabytes.
