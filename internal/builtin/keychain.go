@@ -323,12 +323,26 @@ func (k *KeychainVault) SetSecret(ctx context.Context, key, value string) error 
 		}
 		warnFallback("macOS Keychain", "store", key, err)
 	}
-	return k.setFileSecret(key, value)
+	if err := k.setFileSecret(key, value); err != nil {
+		return err
+	}
+	// GetSecret reads the keystores first, so an older item left in one that failed to store the
+	// new value would shadow it: remove that item, or report that it still wins.
+	if err := k.deleteKeystores(ctx, key); err != nil {
+		return fmt.Errorf("stored %q in the encrypted file vault, but removing an older keystore item for it failed (%v); while that item exists, it takes precedence on read", key, err)
+	}
+	return nil
 }
 
 // DeleteSecret removes the key from every store. A store that does not hold it is fine; any
 // other failure is reported, so a secret is never silently left behind.
 func (k *KeychainVault) DeleteSecret(ctx context.Context, key string) error {
+	return errors.Join(k.deleteKeystores(ctx, key), k.deleteFileSecret(key))
+}
+
+// deleteKeystores removes the key from libsecret and the macOS Keychain: the item, and the parts
+// its header names. A keystore that does not hold the key is fine.
+func (k *KeychainVault) deleteKeystores(ctx context.Context, key string) error {
 	var errs []error
 	if k.SecretTool != "" {
 		if _, err := k.secretTool(ctx, "", "clear", key); err != nil && !errors.Is(err, errNotFound) {
@@ -347,7 +361,7 @@ func (k *KeychainVault) DeleteSecret(ctx context.Context, key string) error {
 			}
 		}
 	}
-	return errors.Join(append(errs, k.deleteFileSecret(key))...)
+	return errors.Join(errs...)
 }
 
 func (k *KeychainVault) vaultFilePath() string {

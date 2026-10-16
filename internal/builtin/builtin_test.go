@@ -962,7 +962,8 @@ func TestGCPProviderPhase5(t *testing.T) {
 
 // TestKeychainVaultLinuxSecretTool drives the libsecret path through a mock `secret-tool`:
 // the secret must travel on stdin only (never argv), a failing secret-tool must fall back to
-// the encrypted file vault, and deleting a libsecret-only key must not demand MINTRUN_VAULT_KEY.
+// the encrypted file vault, deleting a libsecret-only key must not demand MINTRUN_VAULT_KEY,
+// and a store that falls back must clear the older libsecret item, which would win on read.
 func TestKeychainVaultLinuxSecretTool(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -978,7 +979,7 @@ case "$1" in --label=*) shift ;; esac
 case "$2" in *fail*) echo "secret-tool: cannot connect to the secret service" >&2; exit 1 ;; esac
 f="$MOCK_SECRET_STORE/$2"
 case "$action" in
-  store) cat > "$f" ;;
+  store) [ -z "$MOCK_SECRET_STORE_FAIL" ] || { echo "secret-tool: prompt dismissed" >&2; exit 1; }; cat > "$f" ;;
   lookup) cat "$f" 2>/dev/null || exit 1 ;;
   clear) rm -f "$f" ;;
 esac
@@ -1016,13 +1017,14 @@ esac
 
 	// A failing secret-tool (no D-Bus session, locked keyring) falls back to the file vault, and
 	// says so on stderr without the secret (audit M7); a plain miss above stayed quiet.
+	// The clear fails too, so SetSecret reports that an older libsecret item may still win on read.
 	var warn bytes.Buffer
 	oldWarn := warnOut
 	warnOut = &warn
 	defer func() { warnOut = oldWarn }()
 	t.Setenv("MINTRUN_VAULT_KEY", "mintrun-unit-test-passphrase")
-	if err := kv.SetSecret(ctx, "fail-key", "file_fallback_val"); err != nil {
-		t.Fatal(err)
+	if err := kv.SetSecret(ctx, "fail-key", "file_fallback_val"); err == nil || !strings.Contains(err.Error(), `stored "fail-key" in the encrypted file vault`) || !strings.Contains(err.Error(), "takes precedence on read") || strings.Contains(err.Error(), "file_fallback_val") || strings.Contains(err.Error(), "cannot connect") {
+		t.Fatalf("expected the precedence error without the secret or secret-tool's stderr, got %v", err)
 	}
 	if got, err := kv.GetSecret(ctx, "fail-key"); err != nil || got != "file_fallback_val" {
 		t.Fatalf("expected file-vault fallback, got %q %v", got, err)
@@ -1037,12 +1039,36 @@ esac
 	if _, err := kv.GetSecret(ctx, "fail-key"); err == nil {
 		t.Fatal("expected fallback secret to be gone after delete")
 	}
+
+	// When only the store fails, the fallback clears the older libsecret item, but only once the
+	// file vault holds the new secret: without a passphrase the old item stays.
+	if err := kv.SetSecret(ctx, "rotated", "old_libsecret_val"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MOCK_SECRET_STORE_FAIL", "1")
+	t.Setenv("MINTRUN_VAULT_KEY", "")
+	if err := kv.SetSecret(ctx, "rotated", "new_file_val"); err == nil || !strings.Contains(err.Error(), "MINTRUN_VAULT_KEY") {
+		t.Fatalf("expected the file vault to refuse without a passphrase, got %v", err)
+	}
+	if got, err := kv.GetSecret(ctx, "rotated"); err != nil || got != "old_libsecret_val" {
+		t.Fatalf("a failed fallback must leave the old item: %q %v", got, err)
+	}
+	t.Setenv("MINTRUN_VAULT_KEY", "mintrun-unit-test-passphrase")
+	if err := kv.SetSecret(ctx, "rotated", "new_file_val"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MOCK_SECRET_STORE_FAIL", "")
+	if got, err := kv.GetSecret(ctx, "rotated"); err != nil || got != "new_file_val" {
+		t.Fatalf("an older libsecret item must not shadow the file vault: %q %v", got, err)
+	}
 }
 
 // TestKeychainVaultMacOSSecurity drives the macOS Keychain path through a mock security(1): the
 // secret travels hex-encoded on `security -i` stdin, so argv is only `-i` (audit M5); reads parse
 // both `-g` forms byte-exactly; a miss falls back to the file vault quietly, and a real failure
 // falls back with a warning that never carries the secret (audit M7).
+// A store that falls back removes the older item and its parts, which would win on read, or
+// reports that it could not.
 func TestKeychainVaultMacOSSecurity(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -1114,8 +1140,9 @@ esac
 	}
 
 	// A real Keychain failure falls back with a warning naming the store and key, never the secret.
-	if err := kv.SetSecret(ctx, "fail-key", "fallback_val_777"); err != nil {
-		t.Fatal(err)
+	// The delete fails too, so SetSecret reports that an older item may still win on read.
+	if err := kv.SetSecret(ctx, "fail-key", "fallback_val_777"); err == nil || !strings.Contains(err.Error(), `stored "fail-key" in the encrypted file vault`) || !strings.Contains(err.Error(), "takes precedence on read") || strings.Contains(err.Error(), "fallback_val_777") || strings.Contains(err.Error(), "generic-password failed") {
+		t.Fatalf("expected the precedence error without the secret or security's stderr, got %v", err)
 	}
 	if got, err := kv.GetSecret(ctx, "fail-key"); err != nil || got != "fallback_val_777" {
 		t.Fatalf("expected file-vault fallback, got %q %v", got, err)
@@ -1164,32 +1191,50 @@ esac
 	if stored("mintrun:edge") != edge || stored("mintrun:big") != "short_val" || warn.Len() != 0 {
 		t.Fatalf("expected single items and no warnings, got %q", warn.String())
 	}
-	// Past 16 parts a secret is refused before anything is sent and lands in the file vault.
-	huge := strings.Repeat("h", maxChunks*chunkSize+1)
-	if err := kv.SetSecret(ctx, "huge", huge); err != nil {
-		t.Fatal(err)
+	// Past 16 parts a secret is refused before anything is sent and lands in the file vault. The
+	// item and parts it replaces are removed, since GetSecret would read them first.
+	for _, c := range []struct{ old, val string }{
+		{"old_short_val", strings.Repeat("h", maxChunks*chunkSize+1)},
+		{strings.Repeat("c", 3001), strings.Repeat("i", maxChunks*chunkSize+1)},
+	} {
+		if err := kv.SetSecret(ctx, "huge", c.old); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := kv.keychainGet(ctx, "huge"); err != nil || got != c.old {
+			t.Fatalf("expected the old value in the Keychain first: %v", err)
+		}
+		if err := kv.SetSecret(ctx, "huge", c.val); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := kv.GetSecret(ctx, "huge"); err != nil || got != c.val || len(parts("huge")) != 0 || !strings.Contains(warn.String(), "too long for the Keychain") {
+			t.Fatalf("an oversize secret must replace the old item from the file vault, with a warning: %v, parts %v, warnings %q", err, parts("huge"), warn.String())
+		}
+		if _, err := os.Stat(filepath.Join(store, "mintrun:huge")); !os.IsNotExist(err) {
+			t.Fatalf("an oversize secret must never reach security: %v", err)
+		}
 	}
-	if got, err := kv.GetSecret(ctx, "huge"); err != nil || got != huge || len(parts("huge")) != 0 || !strings.Contains(warn.String(), "too long for the Keychain") {
-		t.Fatalf("an oversize secret must land in the file vault with a warning: %v, warnings %q", err, warn.String())
-	}
-	if _, err := os.Stat(filepath.Join(store, "mintrun:huge")); !os.IsNotExist(err) {
-		t.Fatalf("an oversize secret must never reach security: %v", err)
-	}
-	// A part that fails to store removes the parts written before it and leaves the old item intact.
+	// A part that fails to store removes the parts written before it and leaves the old item intact;
+	// SetSecret then falls back to the file vault and removes the old item.
 	if err := kv.SetSecret(ctx, "flaky", "old_flaky_val"); err != nil {
 		t.Fatal(err)
+	}
+	if err := kv.keychainSet(ctx, "flaky", big); err == nil {
+		t.Fatal("expected the second part to fail")
+	}
+	if got, err := kv.keychainGet(ctx, "flaky"); err != nil || got != "old_flaky_val" || len(parts("flaky")) != 0 {
+		t.Fatalf("a failed part must leave the old item and no parts: %q %v, parts %v", got, err, parts("flaky"))
 	}
 	if err := kv.SetSecret(ctx, "flaky", big); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := kv.keychainGet(ctx, "flaky"); err != nil || got != "old_flaky_val" || len(parts("flaky")) != 0 || !strings.Contains(warn.String(), `macOS Keychain store for "flaky" failed`) {
-		t.Fatalf("a failed part must leave the old item and no parts: %q %v, parts %v, warnings %q", got, err, parts("flaky"), warn.String())
+	if got, err := kv.GetSecret(ctx, "flaky"); err != nil || got != big || stored("mintrun:flaky") != "" || !strings.Contains(warn.String(), `macOS Keychain store for "flaky" failed`) {
+		t.Fatalf("a failed part must fall back and remove the old item: %v, warnings %q", err, warn.String())
 	}
 	// A service name `security -i` cannot quote is refused the same way.
 	if err := kv.SetSecret(ctx, `bad"key`, "quoted_val"); err != nil || !strings.Contains(warn.String(), "cannot be quoted") {
 		t.Fatalf("expected refusal of an unquotable service name: %v, warnings %q", err, warn.String())
 	}
-	for _, s := range []string{"bbbb", "hhhh", "quoted_val"} {
+	for _, s := range []string{"bbbb", "hhhh", "iiii", "quoted_val"} {
 		if strings.Contains(warn.String(), s) {
 			t.Fatalf("warnings must never carry a secret:\n%s", warn.String())
 		}
