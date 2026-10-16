@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -146,27 +145,10 @@ func telegramApprove(ctx context.Context, token string, user int64, req core.Exe
 	return false, fmt.Errorf("telegram: no answer within %s", telegramTimeout)
 }
 
-// telegramText quotes every agent-supplied field, so no argument can fake a line or a verdict,
-// and goes out as plain text (no parse_mode), so nothing in it is markup.
+// telegramText quotes every agent-supplied field (core.ApprovalText), so no argument can fake a
+// line or a verdict, and goes out as plain text (no parse_mode), so nothing in it is markup.
 func telegramText(req core.ExecRequest) string {
-	quote := func(list []string) string {
-		q := make([]string, len(list))
-		for i, s := range list {
-			q[i] = strconv.Quote(s)
-		}
-		return strings.Join(q, " ")
-	}
-	params := make([]string, 0, len(req.Params))
-	for k, v := range req.Params {
-		params = append(params, strconv.Quote(k)+"="+strconv.Quote(v))
-	}
-	sort.Strings(params)
-	text := fmt.Sprintf("🔐 mintrun approval request\n\nProvider: %q\nScope: %q\nPermissions: %s\nParams: %s\nCommand: %s",
-		req.Provider, req.Scope, quote(req.Permissions), strings.Join(params, " "), quote(req.Command))
-	if len(text) > 3500 { // Telegram caps a message at 4096 characters
-		text = strings.ToValidUTF8(text[:3500], "") + "\n\n⚠️ TRUNCATED: the request is longer than this message. Deny unless you know the rest."
-	}
-	return text
+	return core.ApprovalText("🔐 mintrun approval request", req, 3500) // Telegram caps a message at 4096 characters
 }
 
 // telegramCall POSTs one Bot API method and decodes its result into out (when non-nil). The token
