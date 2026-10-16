@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""mintrun provider plugin: mints a Vercel token that expires with the lease and deletes it on revoke.
+
+The master secret is a Vercel access token. -scope is empty, <project_id>, or <team_id>/<project_id>;
+a project ID limits the new token to that project. The child gets the token as VERCEL_TOKEN.
+mintrun sends one JSON request on stdin and reads one JSON reply on stdout.
+"""
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+REDACTED = "[MINTRUN:REDACTED]"
+API = "https://api.vercel.com"
+ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+SECRETS = []  # scrubbed from every error this plugin returns
+
+
+class Fail(Exception):
+    """An error written for the user. main() still scrubs SECRETS from it."""
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args):
+        return None  # a redirect would carry the Authorization header to wherever it points
+
+
+def scrub(text):
+    for s in sorted(SECRETS, key=len, reverse=True):
+        for form in (s, json.dumps(s)[1:-1]):
+            if form:
+                text = text.replace(form, REDACTED)
+    return text
+
+
+def call(method, path, master, query=None, body=None):
+    base = os.environ.get("VERCEL_API_BASE", API)
+    handlers = [NoRedirect()]
+    if base != API:
+        # Only a local test server may stand in for the API, so the master never leaves in plaintext.
+        if not re.fullmatch(r"http://127\.0\.0\.1:[0-9]+", base):
+            raise Fail("VERCEL_API_BASE must be unset or http://127.0.0.1:<port>")
+        handlers.append(urllib.request.ProxyHandler({}))
+    url = base + path + ("?" + urllib.parse.urlencode(query) if query else "")
+    req = urllib.request.Request(url, method=method, data=None if body is None else json.dumps(body).encode(),
+                                 headers={"Authorization": "Bearer " + master, "Content-Type": "application/json"})
+    try:
+        with urllib.request.build_opener(*handlers).open(req, timeout=30) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.load(e)["error"]["message"]
+        except Exception:
+            msg = ""
+        raise Fail("Vercel %s %s: HTTP %d %s" % (method, path, e.code, msg))
+    except urllib.error.URLError as e:
+        raise Fail("Vercel API unreachable: %s" % e.reason)
+
+
+def mint(master, mr):
+    scope = mr.get("scope") or ""
+    parts = scope.split("/") if scope else []
+    if len(parts) > 2 or not all(ID.fullmatch(p) for p in parts):
+        raise Fail("-scope must be empty, <project_id>, or <team_id>/<project_id>")
+    ttl = int(mr.get("ttl_seconds") or 600)
+    if ttl <= 0:
+        raise Fail("ttl_seconds must be positive")
+    now = int(time.time())
+    body = {"name": "mintrun-%d" % now, "expiresAt": (now + ttl) * 1000}
+    if parts:
+        body["projectId"] = parts[-1]
+    resp = call("POST", "/v3/user/tokens", master, {"teamId": parts[0]} if len(parts) == 2 else None, body)
+    bearer, token_id = resp.get("bearerToken"), (resp.get("token") or {}).get("id")
+    if not bearer or not isinstance(bearer, str) or not isinstance(token_id, str) or not ID.fullmatch(token_id):
+        raise Fail("Vercel returned no usable token")
+    SECRETS.append(bearer)
+    return {"lease": {
+        "id": token_id,  # public: Vercel lists token IDs, and revoke needs nothing else
+        "provider": "vercel",
+        "scope": scope,
+        "env": {"VERCEL_TOKEN": bearer},
+        "redact": [bearer],
+        "expires_at": datetime.fromtimestamp(now + ttl, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "ephemeral": True,
+    }}
+
+
+def revoke(master, lease):
+    token_id = (lease or {}).get("id") or ""
+    # The ID "current" means the token that signs the request: the master itself.
+    if token_id == "current" or not ID.fullmatch(token_id):
+        raise Fail("refusing to revoke: the lease id is not a minted Vercel token id")
+    call("DELETE", "/v3/user/tokens/" + token_id, master)
+    return {}
+
+
+def handle(req):
+    op = req.get("op")
+    if op not in ("mint", "revoke"):
+        raise Fail("vercel is a provider plugin and does not support %s" % op)
+    master = (req.get("master_secret") or "").strip()
+    if not master:
+        raise Fail("the master secret is empty (mintrun secret set vercel)")
+    SECRETS.append(master)
+    if op == "mint":
+        return mint(master, req.get("mint_request") or {})
+    return revoke(master, req.get("lease"))
+
+
+def main():
+    try:
+        out = handle(json.loads(sys.stdin.buffer.read()))
+    except Fail as e:
+        out = {"error": scrub(str(e))}
+    except Exception as e:  # its text can quote a secret, so only its type is reported
+        out = {"error": "unexpected %s" % type(e).__name__}
+    json.dump(out, sys.stdout)
+
+
+if __name__ == "__main__":
+    main()

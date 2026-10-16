@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""mintrun provider plugin: creates a short-lived PostgreSQL login role and drops it on revoke.
+
+The master secret is a URL for the minting role, postgres://<user>:<password>@<host>:<port>/<db>. That role
+needs CREATEROLE and ADMIN OPTION on each group role agents may join; a superuser is refused. -scope names
+the group role whose privileges the new role inherits. The child gets the new role in DATABASE_URL, which
+psql takes as its first argument. Needs psql on PATH.
+mintrun sends one JSON request on stdin and reads one JSON reply on stdout.
+"""
+import base64
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from urllib.parse import unquote, urlsplit
+
+REDACTED = "[MINTRUN:REDACTED]"
+# Lowercase only: policy allowed_scopes ignores case, but a quoted role name does not. pg_ names are built-in
+# roles, and no $, which could close the $$ quote around GUARD.
+GROUP = re.compile(r"(?!pg_)[a-z_][a-z0-9_-]{0,62}")
+ROLE = re.compile(r"mintrun_[0-9]+_[0-9a-f]{8}")
+# A superuser, or a CREATEROLE role on PostgreSQL 15 and older, can grant any role, so an agent picking -scope
+# could join one the operator never meant to hand out. The database checks what PostgreSQL 16 requires: ADMIN
+# OPTION on the group, which a role never holds on itself.
+GUARD = ("DO $$ BEGIN IF (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN RAISE EXCEPTION "
+         "'the master role is a superuser: mint with a CREATEROLE role that has ADMIN OPTION on the group role'; "
+         "END IF; IF '{g}' = current_user OR NOT pg_has_role(current_user, '{g}', 'MEMBER WITH ADMIN OPTION') THEN "
+         "RAISE EXCEPTION 'the master role has no ADMIN OPTION on the group role'; END IF; END $$;\n")
+SECRETS = []  # scrubbed from every error this plugin returns
+
+
+class Fail(Exception):
+    """An error written for the user. main() still scrubs SECRETS from it."""
+
+
+def scrub(text):
+    for s in sorted(SECRETS, key=len, reverse=True):
+        for form in (s, json.dumps(s)[1:-1]):
+            if form:
+                text = text.replace(form, REDACTED)
+    return text
+
+
+def parse(master):
+    u = urlsplit(master)
+    userinfo, _, hostport = u.netloc.rpartition("@")
+    user, _, pw = userinfo.partition(":")
+    SECRETS.extend([pw, unquote(pw)])
+    try:
+        u.port  # a second host or a port that is not a number raises ValueError
+    except ValueError:
+        raise Fail("the master URL must name one host and a numeric port")
+    if u.scheme not in ("postgres", "postgresql") or not u.hostname or not u.path[1:]:
+        raise Fail("the master secret must be a URL: postgres://<user>:<password>@<host>:<port>/<db>")
+    pairs = [p for p in u.query.split("&") if p]
+    if any(unquote(p.partition("=")[0]) == "password" for p in pairs):
+        raise Fail("the master URL has a password in its query: put it before the @")
+    return u, user, unquote(pw), hostport, pairs
+
+
+def psql(conn, sql):
+    u, user, pw, hostport, pairs = conn
+    path = shutil.which("psql")
+    if not path or not os.path.isabs(path):
+        raise Fail("psql not found on PATH (install the PostgreSQL client)")
+    # psql gets the password in its environment, never on argv, where ps shows it, and the SQL on stdin.
+    url = "%s://%s%s%s%s" % (u.scheme, user + "@" if user else "", hostport, u.path, "?" + "&".join(pairs) if pairs else "")
+    try:
+        p = subprocess.run([path, "-X", "-q", "-v", "ON_ERROR_STOP=1", "-At", "-d", url], input=sql,
+                           env=dict(os.environ, PGPASSWORD=pw) if pw else None, capture_output=True,
+                           encoding="utf-8", errors="replace", timeout=120)
+    except subprocess.TimeoutExpired:
+        raise Fail("psql timed out")
+    if p.returncode != 0:
+        raise Fail("psql failed: %s" % p.stderr.strip())
+    return p.stdout
+
+
+def scram(password):
+    """The SCRAM-SHA-256 verifier PostgreSQL stores. CREATE ROLE carries only this, so no statement log holds the password."""
+    salt = secrets.token_bytes(16)
+    salted = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 4096)
+    client = hmac.new(salted, b"Client Key", "sha256").digest()
+    server = hmac.new(salted, b"Server Key", "sha256").digest()
+    return "SCRAM-SHA-256$4096:%s$%s:%s" % tuple(
+        base64.b64encode(b).decode() for b in (salt, hashlib.sha256(client).digest(), server))
+
+
+def mint(master, mr):
+    group = mr.get("scope") or ""
+    if not GROUP.fullmatch(group):
+        raise Fail("-scope must name the group role to join, in lowercase, such as app_readonly")
+    ttl = int(mr.get("ttl_seconds") or 600)
+    if ttl <= 0:
+        raise Fail("ttl_seconds must be positive")
+    conn = parse(master)
+    u, _, _, hostport, pairs = conn
+    now = int(time.time())
+    role, password = "mintrun_%d_%s" % (now, secrets.token_hex(4)), secrets.token_hex(24)
+    verifier = scram(password)
+    SECRETS.extend([password, verifier])
+    until = datetime.fromtimestamp(now + ttl, timezone.utc)
+    psql(conn, GUARD.replace("{g}", group) + "CREATE ROLE \"%s\" LOGIN PASSWORD '%s' VALID UNTIL '%s' IN ROLE \"%s\";\n"
+         % (role, verifier, until.strftime("%Y-%m-%d %H:%M:%S+00"), group))
+    query = "&".join(p for p in pairs if unquote(p.partition("=")[0]) != "user")  # keeps sslmode and the rest
+    url = "%s://%s:%s@%s%s%s" % (u.scheme, role, password, hostport, u.path, "?" + query if query else "")
+    return {"lease": {
+        "id": role,  # public: pg_roles lists it to anyone connected
+        "provider": "postgres-jit",
+        "scope": group,
+        # DATABASE_URL only: mintrun redacts every env value from the output, so a PGPORT of 5432 or a PGUSER
+        # would blank that number in query results and the role in the lease id.
+        "env": {"DATABASE_URL": url},
+        "redact": [password],
+        "expires_at": until.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "ephemeral": True,
+    }}
+
+
+def revoke(master, lease):
+    role = (lease or {}).get("id") or ""
+    if not ROLE.fullmatch(role):
+        raise Fail("refusing to revoke: the lease id is not a role this plugin created")
+    # One statement at a time, not one transaction: if DROP ROLE fails, the role still cannot log in.
+    psql(parse(master), "".join(s.replace("{r}", role) + "\n" for s in (
+        'ALTER ROLE "{r}" NOLOGIN;',
+        'GRANT "{r}" TO CURRENT_USER;',  # the next three statements need the role's privileges
+        "SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE usename = '{r}';",
+        'REASSIGN OWNED BY "{r}" TO CURRENT_USER;',  # keeps what it created: dropping that could lose data
+        'DROP OWNED BY "{r}";',
+        'DROP ROLE "{r}";',
+    )))
+    return {}
+
+
+def handle(req):
+    op = req.get("op")
+    if op not in ("mint", "revoke"):
+        raise Fail("postgres-jit is a provider plugin and does not support %s" % op)
+    master = (req.get("master_secret") or "").strip()
+    if not master:
+        raise Fail("the master secret is empty (mintrun secret set postgres-jit)")
+    SECRETS.append(master)
+    if op == "mint":
+        return mint(master, req.get("mint_request") or {})
+    return revoke(master, req.get("lease"))
+
+
+def main():
+    try:
+        out = handle(json.loads(sys.stdin.buffer.read()))
+    except Fail as e:
+        out = {"error": scrub(str(e))}
+    except Exception as e:  # its text can quote a secret, so only its type is reported
+        out = {"error": "unexpected %s" % type(e).__name__}
+    json.dump(out, sys.stdout)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,8 @@
+{
+  "name": "postgres-jit",
+  "version": "0.1.0",
+  "kind": "provider",
+  "description": "Creates a short-lived PostgreSQL login role in a group role and drops it on exit",
+  "entrypoint": "run",
+  "scopes": ["<group_role>"]
+}

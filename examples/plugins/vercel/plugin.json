@@ -1,0 +1,8 @@
+{
+  "name": "vercel",
+  "version": "0.1.0",
+  "kind": "provider",
+  "description": "Mints a Vercel token that expires with the lease and deletes it on exit",
+  "entrypoint": "run",
+  "scopes": ["<project_id>", "<team_id>/<project_id>"]
+}

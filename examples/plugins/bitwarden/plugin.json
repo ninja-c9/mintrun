@@ -1,0 +1,7 @@
+{
+  "name": "bitwarden",
+  "version": "0.1.0",
+  "kind": "vault",
+  "description": "Keeps master secrets as Bitwarden secure notes named mintrun/<key> (bw CLI)",
+  "entrypoint": "run"
+}
