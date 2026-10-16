@@ -1,6 +1,6 @@
 # `mintrun` Execution Plan & Backlog
 
-> **Harness Spec:** [AGENTS.md](AGENTS.md) · **Latest Release:** `v0.7.0` · **Constraints:** 100% Go `1.24.0` standard library (`0` external dependencies), `> 90%` verified statement coverage measured without build tags.
+> **Harness Spec:** [AGENTS.md](AGENTS.md) · **Latest Release:** `v0.8.0` · **Constraints:** 100% Go `1.24.0` standard library (`0` external dependencies), `> 90%` verified statement coverage measured without build tags.
 
 ---
 
