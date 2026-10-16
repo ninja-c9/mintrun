@@ -101,17 +101,25 @@ Every change to `cmd/` or `internal/` must pass the following verification pipel
   go test -count=1 -v -run 'TestKeychainVaultLinuxSecretTool|TestKeychainVaultMacOSSecurity' ./internal/builtin
   ```
 
+### Workstream G — Stale File-Vault Copy Cleanup
+- **Files:** `internal/builtin/keychain.go`, `internal/builtin/builtin_test.go`, `README.md`
+- **Deliverables:**
+  1. `GetSecret` falls back to the file vault when a keystore lookup fails, so an older `vault.json` copy of a key that libsecret or the Keychain now holds used to come back after a failed lookup. Now a successful keystore store removes that copy through `dropFileCopy`, which calls `deleteFileSecret`. Without `vault.json`, nothing is decrypted or written, so a Keychain-only user needs no `MINTRUN_VAULT_KEY` and sees no warning.
+  2. The keystore store has already succeeded, so a copy that cannot be removed (no `MINTRUN_VAULT_KEY`, or a wrong one) only prints a warning that it may remain. The warning names the key, never the secret, and the store still succeeds, because the new keystore item wins on read.
+  3. README documents `MINTRUN_FILE_VAULT=1` (file vault only) for a host whose keystore exists but cannot be reached, where `secret set` exits non-zero after a fallback store because removing the older keystore item fails too.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestKeychainVaultLinuxSecretTool|TestKeychainVaultMacOSSecurity' ./internal/builtin
+  ```
+
 ---
 
 ## 3. Deferred Backlog (Next Actionable Items)
 
-1. **Stale File-Vault Copy After a Keystore Store (bug):**
-   - A keystore store that succeeds returns early and leaves any older file-vault copy of the key. `GetSecret` returns that stale copy, after a warning, when a later keystore lookup fails (a locked Keychain, no D-Bus session) and `MINTRUN_VAULT_KEY` is set.
-   - Open question: removing the copy means decrypting `vault.json`, which needs `MINTRUN_VAULT_KEY`, and a macOS Keychain user may not have it set.
-2. **OS Network Sandbox (`no_network: true`), awaiting approval:**
+1. **OS Network Sandbox (`no_network: true`), awaiting approval:**
    - Optional per-OS network isolation for the child: a Linux `CLONE_NEWNET` network namespace or a macOS `sandbox-exec` deny-network profile. It must fail closed when requested but unsupported on the host.
    - Open questions before building it: every built-in provider mints a credential for a CLI that calls a network API, so the flag only fits offline commands. A macOS `(deny network*)` profile also blocks Unix sockets (`ssh-agent`, Docker). Many Linux hosts restrict the unprivileged user namespaces that `CLONE_NEWNET` needs.
-3. **Linux Host Verification & HITL Support:**
+2. **Linux Host Verification & HITL Support:**
    - Run integration tests against real `secret-tool` on Linux and evaluate `zenity`/`kdialog` or terminal confirmation for `-approve` on Linux.
-4. **GCP `token_uri` From the Service-Account Key:**
+3. **GCP `token_uri` From the Service-Account Key:**
    - Deferred: only keys outside the default Google universe carry a different `token_uri`, and honoring it also means sending revocation to that universe. Add it when such a key is in use.
