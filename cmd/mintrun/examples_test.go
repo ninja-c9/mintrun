@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/pbkdf2"
@@ -429,4 +430,63 @@ DROP ROLE "{r}";
 			t.Errorf("psql failure: got %v, want the statement with the verifier and password scrubbed", err)
 		}
 	})
+}
+
+// TestPluginInstallCatalog installs every example plugin by its bare name from the copy built into
+// the binary. The bundled copy wins over a directory of the same name in the working directory,
+// which installs only by its path, and the temporary copy is removed.
+func TestPluginInstallCatalog(t *testing.T) {
+	src, err := filepath.Abs(filepath.Join("..", "..", "examples", "plugins"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, tmp := t.TempDir(), t.TempDir()
+	t.Setenv("MINTRUN_HOME", home)
+	t.Setenv("TMPDIR", tmp)
+	t.Chdir(t.TempDir())
+	if err := os.Mkdir("bitwarden", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join("bitwarden", "plugin.json"), []byte(`{"name":"bitwarden","version":"6.6.6","kind":"vault"}`), 0o600)
+	_ = os.WriteFile(filepath.Join("bitwarden", "run"), []byte("#!/bin/sh\n"), 0o700)
+
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		n++
+		if code, exited := runMainWithArgs(t, "", "plugin", "install", e.Name()); exited {
+			t.Fatalf("plugin install %s exited %d", e.Name(), code)
+		}
+		for _, f := range []string{"plugin.json", "run"} {
+			want, _ := os.ReadFile(filepath.Join(src, e.Name(), f))
+			got, err := os.ReadFile(filepath.Join(home, "plugins", e.Name(), f))
+			if err != nil || len(want) == 0 || !bytes.Equal(got, want) {
+				t.Errorf("%s/%s: the installed copy differs from examples/plugins (err %v)", e.Name(), f, err)
+			}
+		}
+		if info, err := os.Stat(filepath.Join(home, "plugins", e.Name(), "run")); err != nil || info.Mode().Perm() != 0o700 {
+			t.Errorf("%s/run: want mode 0700, got %v (err %v)", e.Name(), info, err)
+		}
+	}
+	if n == 0 {
+		t.Fatal("no example plugins found")
+	}
+	if left, _ := os.ReadDir(tmp); len(left) != 0 {
+		t.Errorf("temporary copies left behind: %v", left)
+	}
+	if code, exited := runMainWithArgs(t, "", "plugin", "install", "./bitwarden"); exited {
+		t.Fatalf("plugin install ./bitwarden exited %d", code)
+	}
+	if got, _ := os.ReadFile(filepath.Join(home, "plugins", "bitwarden", "run")); string(got) != "#!/bin/sh\n" {
+		t.Errorf("./bitwarden: got %q, want the local directory's run", got)
+	}
+	if code, exited := runMainWithArgs(t, "", "plugin", "install", "no-such-plugin"); !exited || code != 1 {
+		t.Errorf("unknown bare name: got exit %d (exited %v), want 1", code, exited)
+	}
 }

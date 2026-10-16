@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/ninja-c9/mintrun/examples/plugins"
 	"github.com/ninja-c9/mintrun/internal/builtin"
 	"github.com/ninja-c9/mintrun/internal/core"
 )
@@ -233,9 +235,10 @@ func cmdPlugin(ctx context.Context, rt *core.Runtime, args []string) {
 
 	case "install", "add":
 		if len(args) < 2 {
-			fatal("usage: mintrun plugin install <dir-or-https-url>")
+			names, _ := fs.Glob(plugins.Catalog, "*")
+			fatal("usage: mintrun plugin install <name|dir|https-url> (bundled: %s)", strings.Join(names, ", "))
 		}
-		m, err := core.InstallPlugin(ctx, rt.PluginsDir(), args[1])
+		m, err := installPlugin(ctx, rt.PluginsDir(), args[1])
 		if err != nil {
 			fatal("install plugin: %v", err)
 		}
@@ -253,6 +256,25 @@ func cmdPlugin(ctx context.Context, rt *core.Runtime, args []string) {
 	default:
 		fatal("unknown plugin action %q (use list, install, or remove)", args[0])
 	}
+}
+
+// installPlugin installs the plugin bundled under the name src, else the directory or URL src
+// names. A bundled name wins over a directory of the same name in the working directory, so a
+// planted ./bitwarden is never installed by accident; "./bitwarden" installs that directory.
+func installPlugin(ctx context.Context, pluginsDir, src string) (core.Manifest, error) {
+	if _, err := fs.Stat(plugins.Catalog, src+"/plugin.json"); err != nil {
+		return core.InstallPlugin(ctx, pluginsDir, src)
+	}
+	sub, _ := fs.Sub(plugins.Catalog, src) // src is a valid path: Stat found a file under it
+	tmp, err := os.MkdirTemp("", "mintrun-plugin-")
+	if err != nil {
+		return core.Manifest{}, err
+	}
+	defer os.RemoveAll(tmp)
+	if err := os.CopyFS(tmp, sub); err != nil {
+		return core.Manifest{}, err
+	}
+	return core.InstallPlugin(ctx, pluginsDir, tmp)
 }
 
 func cmdMCP(ctx context.Context, rt *core.Runtime, args []string) {
@@ -304,7 +326,7 @@ Usage:
   mintrun secret delete <provider>                            Delete master secret from vault
   mintrun exec -provider <name> -scope <zone> -- <cmd...>     Mint JIT token, run command blindly, scrub & revoke
   mintrun plugin list                                         List built-in and installed plugins
-  mintrun plugin install <path-or-url>                        Install an external Vault/Provider plugin
+  mintrun plugin install <name|path|url>                      Install a bundled plugin by name, or one from a directory or URL
   mintrun plugin remove <name>                                Remove an installed external plugin
   mintrun mcp                                                 Start MCP JSON-RPC 2.0 server over stdio
   mintrun audit                                               View zero-secret execution audit trail`)
