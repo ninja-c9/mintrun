@@ -50,6 +50,7 @@ func bootRuntime() (*core.Runtime, error) {
 
 	// Discover and register all externally installed plugins from ~/.mintrun/plugins.
 	rt := core.NewRuntime(home, os.Getenv("MINTRUN_VAULT"), reg)
+	rt.ApprovalFunc = core.FirstApproval(core.OSApproval, builtin.TelegramApproval(rt))
 	if err := core.LoadExternalPlugins(rt.PluginsDir(), reg); err != nil {
 		return nil, err
 	}
@@ -99,7 +100,7 @@ func cmdExec(ctx context.Context, rt *core.Runtime, args []string) {
 	vault := fs.String("vault", "", "Vault plugin override (default: keychain, or 1password)")
 	ttl := fs.Int("ttl", 600, "Ephemeral token TTL in seconds")
 	cwd := fs.String("cwd", "", "Working directory for command")
-	approve := fs.Bool("approve", false, "Prompt for interactive macOS HITL approval before minting")
+	approve := fs.Bool("approve", false, "Ask a human before minting: macOS dialog, and Telegram when approval-telegram is set")
 	cleanEnv := fs.Bool("clean-env", false, "Run the command with only PATH/HOME/TMPDIR/USER/LANG/TERM/SSL_CERT_FILE, policy allowed_env, and the lease env")
 
 	var cmdArgs []string
