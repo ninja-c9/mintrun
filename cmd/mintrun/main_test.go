@@ -264,6 +264,49 @@ func TestCLISecretArgvWarning(t *testing.T) {
 	}
 }
 
+// TestCLISecretPromptHidesEcho drives the interactive prompt (stdin is a character device) with a
+// stub stty: echo goes off before the read and back on after it, unless stty failed to turn it off.
+func TestCLISecretPromptHidesEcho(t *testing.T) {
+	t.Setenv("MINTRUN_HOME", t.TempDir())
+	t.Setenv("MINTRUN_FILE_VAULT", "1")
+	t.Setenv("MINTRUN_VAULT", "keychain")
+	dir := t.TempDir()
+	stub, sttyLog := filepath.Join(dir, "stty"), filepath.Join(dir, "stty.log")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MOCK_STTY_LOG\"\nexit \"$MOCK_STTY_EXIT\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MOCK_STTY_LOG", sttyLog)
+	null, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origStdin, origStty := os.Stdin, sttyPath
+	os.Stdin, sttyPath = null, stub
+	defer func() { os.Stdin, sttyPath = origStdin, origStty; _ = null.Close() }()
+
+	for _, c := range []struct{ exit, log, prompt string }{
+		{"0", "-echo\necho\n", "Enter master secret for \"cloudflare\": \n{"},
+		{"1", "-echo\n", "Enter master secret for \"cloudflare\": {"},
+	} {
+		t.Setenv("MOCK_STTY_EXIT", c.exit)
+		_ = os.Remove(sttyLog)
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		origErr := os.Stderr
+		os.Stderr = w
+		code, exited := runMainWithArgs(t, "", "secret", "set", "cloudflare")
+		os.Stderr = origErr
+		_ = w.Close()
+		out, _ := io.ReadAll(r)
+		got, _ := os.ReadFile(sttyLog)
+		if !exited || code != 1 || string(got) != c.log || !strings.HasPrefix(string(out), c.prompt) || !strings.Contains(string(out), "secret value cannot be empty") {
+			t.Fatalf("stty exit %s: code %d (exited %v), stty calls %q, stderr %q", c.exit, code, exited, got, out)
+		}
+	}
+}
+
 // TestMain supplies a deterministic file-vault passphrase for the suite. The
 // AES-256-GCM fallback now mandates MINTRUN_VAULT_KEY (audit C3); tests that need
 // the "no passphrase" error path override it locally with t.Setenv.

@@ -18,7 +18,11 @@ import (
 	"github.com/ninja-c9/mintrun/internal/core"
 )
 
-var exitFunc = os.Exit
+// Swapped by tests.
+var (
+	exitFunc = os.Exit
+	sttyPath = "/bin/stty"
+)
 
 func defaultHomeDir() string {
 	if env := os.Getenv("MINTRUN_HOME"); env != "" {
@@ -271,8 +275,7 @@ func cmdAudit(rt *core.Runtime, args []string) {
 	limit := fs.Int("limit", 0, "Show only the last N matching entries")
 	_ = fs.Parse(args)
 
-	p := filepath.Join(rt.HomeDir, "audit.jsonl")
-	raw, err := os.ReadFile(p)
+	f, err := os.Open(filepath.Join(rt.HomeDir, "audit.jsonl"))
 	if err != nil {
 		if os.IsNotExist(err) {
 			fmt.Println("No audit entries yet.")
@@ -280,32 +283,14 @@ func cmdAudit(rt *core.Runtime, args []string) {
 		}
 		fatal("read audit log: %v", err)
 	}
+	defer f.Close()
 	if *provider == "" && !*failedOnly && *limit <= 0 {
-		fmt.Print(string(raw))
-		return
+		_, err = io.Copy(os.Stdout, f)
+	} else {
+		err = core.TailAudit(f, *provider, *failedOnly, *limit, func(line string, _ core.AuditEntry) { fmt.Println(line) })
 	}
-	var matched []string
-	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
-		if line == "" {
-			continue
-		}
-		var e core.AuditEntry
-		if err := json.Unmarshal([]byte(line), &e); err != nil {
-			continue
-		}
-		if *provider != "" && !strings.EqualFold(e.Provider, *provider) {
-			continue
-		}
-		if *failedOnly && e.ExitCode == 0 && e.Error == "" {
-			continue
-		}
-		matched = append(matched, line)
-	}
-	if *limit > 0 && len(matched) > *limit {
-		matched = matched[len(matched)-*limit:]
-	}
-	for _, line := range matched {
-		fmt.Println(line)
+	if err != nil {
+		fatal("read audit log: %v", err)
 	}
 }
 
@@ -331,7 +316,7 @@ func setEcho(on bool) bool {
 	if on {
 		mode = "echo"
 	}
-	cmd := exec.Command("/bin/stty", mode)
+	cmd := exec.Command(sttyPath, mode)
 	cmd.Stdin = os.Stdin
 	return cmd.Run() == nil
 }
