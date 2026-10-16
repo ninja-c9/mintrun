@@ -67,17 +67,26 @@ Every change to `cmd/` or `internal/` must pass the following verification pipel
   go test -count=1 -v -run 'TestKeychainVaultMacOSSecurity|TestCLISecretArgvWarning|TestExecBlindOutputCap|TestExecBlindKillsProcessGroup|TestAWSSigV4FixedVector|TestAWSProviderComprehensive|TestGitHubProviderAndJWTSigningComprehensive' ./internal/builtin ./internal/core ./cmd/mintrun
   ```
 
+### Workstream D — GitHub Installation Binding
+- **Files:** `internal/core/runner.go`, `internal/builtin/cloudflare.go`, `internal/builtin/mcp.go`
+- **Deliverables:**
+  1. Add the policy rule `allowed_installations`, enforced in `CheckPolicy` (so `mintrun_policy_check` and `ExecBlind` agree): when set, a request must carry a listed `params.installation_id` (exact match, fail closed when missing).
+  2. `GitHubProvider.Mint` refuses a `params.installation_id` that differs from the installation pinned in the master, before any request and without quoting the master; `<app_id>::<pem>` pins none.
+  3. Advertise `params` in the MCP `mintrun_exec` / `mintrun_policy_check` input schema.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCheckPolicyMatchesExecBlind|TestGitHubProviderAndJWTSigningComprehensive' ./internal/core ./internal/builtin
+  ```
+
 ---
 
 ## 3. Deferred Backlog (Next Actionable Items)
 
-1. **Policy Binding for `params.installation_id` & MCP `params` Schema:**
-   - Currently, MCP callers can pass `params.installation_id` to `mintrun_exec` to target any installation of a GitHub App, even when the stored composite master secret pins a specific installation ID. Either reject `params.installation_id` when it differs from a pinned master ID or enforce an installation allowlist in `CheckPolicy` (Rule 16).
-2. **OS Network Sandbox (`no_network: true`):**
+1. **OS Network Sandbox (`no_network: true`):**
    - Implement optional per-OS network isolation (Linux `CLONE_NEWNET` network namespace / macOS `sandbox-exec` deny-network profile) that fails closed when requested but unsupported on the host.
-3. **1Password CLI (`op item create`) `stdin` Secret Passing:**
+2. **1Password CLI (`op item create`) `stdin` Secret Passing:**
    - Replace `credential=<secret>` on `argv` in `OnePasswordVault.SetSecret` with a JSON template passed over `stdin`.
-4. **Linux Host Verification & HITL Support:**
+3. **Linux Host Verification & HITL Support:**
    - Run integration tests against real `secret-tool` on Linux and evaluate `zenity`/`kdialog` or terminal confirmation for `-approve` on Linux.
-5. **Tail-Reading `~/.mintrun/audit.jsonl`:**
+4. **Tail-Reading `~/.mintrun/audit.jsonl`:**
    - Read from the end of `audit.jsonl` in `mintrun audit` and `mintrun_audit` so memory usage stays bounded as the audit log grows.
