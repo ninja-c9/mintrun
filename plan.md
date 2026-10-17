@@ -247,10 +247,24 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
 - **Deliverables:**
   1. `[SERIAL]` `setupHint` in the file vault, and the callers' hints removed.
   2. `[SERIAL]` `TestSecretNotFoundHint` and the exact not-configured errors in `TestTelegramApproval` and `TestSlackApproval`; mutants run on a copy of the repo.
-- **Not built:** `secret check` still prints only `NOT configured` and drops the error, so it shows neither the hint nor a vault failure; `init` and `secret set` store into the default vault, so with `MINTRUN_VAULT` naming another vault, a request that picks `keychain` gets a command that stores elsewhere.
+- **Not built:** `init` and `secret set` store into the default vault, so with `MINTRUN_VAULT` naming another vault, a request that picks `keychain` gets a command that stores elsewhere. (`secret check` dropped the error and showed neither the hint nor a vault failure; Workstream P fixes it.)
 - **Verification:**
   ```bash
   go test -count=1 -v -run 'TestSecretNotFoundHint|TestTelegramApproval|TestSlackApproval' ./internal/builtin
+  ```
+
+### Workstream P — `secret check` Shows the Vault's Error
+- **Files:** `cmd/mintrun/main.go`, `cmd/mintrun/main_test.go`
+- **Design:**
+  - A miss (`errors.Is(err, builtin.ErrSecretNotFound)`) still says `NOT configured` and adds the vault's error, so the hint from Workstream O shows once.
+  - Any other error says the vault could not be read and adds its error, so a wrong `MINTRUN_VAULT_KEY` is no longer reported as a missing secret. An empty value still says `NOT configured`. All three exit 1.
+  - The vault's error holds no secret: the file vault's quotes no stored value (a keystore failure only warns, rule 18), 1Password's quotes `op`'s `stderr` and never its `stdout`, and a plugin vault's is the plugin's own (rule 32). `ExecBlind` already returns the same error to agents. A 1Password miss reads as a vault that could not be read, because `op` fails the same way for a miss and a locked account.
+- **Deliverables:**
+  1. `[SERIAL]` the `check` branch in `cmd/mintrun/main.go`.
+  2. `[SERIAL]` `TestCLISecretCheckReportsVaultError` (a miss, a file vault opened with a wrong `MINTRUN_VAULT_KEY`, an empty value from a plugin vault); mutants run on a copy of the repo.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCLISecretCheckReportsVaultError' ./cmd/mintrun
   ```
 
 ---

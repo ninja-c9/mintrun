@@ -184,6 +184,8 @@ Store your master credential in the OS keystore yourself. `mintrun` never modifi
 # Verify existence without ever printing the secret value:
 ./mintrun secret check cloudflare
 # -> Secret "cloudflare" is configured in vault "keychain" (length=40 chars, value hidden).
+# A missing secret prints the command that stores it, and a vault that cannot be read
+# (such as a wrong MINTRUN_VAULT_KEY) says so with the vault's error. Both exit 1.
 
 # Piped or redirected input is read whole, so multi-line secrets such as a GCP
 # service-account JSON key or a GitHub App PEM survive intact (and stay off argv):
