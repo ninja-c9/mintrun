@@ -18,6 +18,31 @@ import (
 	"github.com/ninja-c9/mintrun/internal/core"
 )
 
+// expiringCtx stands in for a caller's context with the approval deadline: Err is
+// context.DeadlineExceeded once expire runs. A test expires it at a chosen request, because a
+// 100ms timer ran out before the message was sent under -race, where the vault's key derivation
+// is slow.
+type expiringCtx struct {
+	context.Context
+	done chan struct{}
+	once sync.Once
+}
+
+func newExpiringCtx() *expiringCtx {
+	return &expiringCtx{Context: context.Background(), done: make(chan struct{})}
+}
+
+func (c *expiringCtx) expire()               { c.once.Do(func() { close(c.done) }) }
+func (c *expiringCtx) Done() <-chan struct{} { return c.done }
+func (c *expiringCtx) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
 func TestTelegramApproval(t *testing.T) {
 	const user, token = int64(4242), "123456:TEST-bot_tokenABC"
 	oldAPI, oldTimeout, oldPoll, oldRetry := telegramAPI, telegramTimeout, telegramPoll, telegramRetry
@@ -67,6 +92,7 @@ func TestTelegramApproval(t *testing.T) {
 	cases := []struct {
 		name         string
 		timeout      time.Duration
+		expireOnPoll bool   // the approval deadline, which FirstApproval's ctx inherits, passes while a poll's reply is on its way
 		cancelOnPoll bool   // the caller cancels while a poll's reply is on its way, as FirstApproval may
 		lateReply    bool   // each poll's reply comes only once the deadline passed
 		reply        string // raw 409 reply to every getUpdates
@@ -92,6 +118,8 @@ func TestTelegramApproval(t *testing.T) {
 		}, outcome: "⛔ Denied", offset: 2},
 		{name: "no answer", timeout: 100 * time.Millisecond, taps: pending,
 			err: "telegram: no answer within 100ms", outcome: "⌛ Expired", offset: 0},
+		{name: "approval deadline", expireOnPoll: true, taps: allowed,
+			err: "context deadline exceeded", outcome: "⌛ Expired: no answer in time, so not approved.", offset: 0},
 		{name: "answered elsewhere", cancelOnPoll: true, taps: allowed,
 			err: "context canceled", outcome: "⌛ Closed", offset: 0},
 		{name: "an answer after the deadline", timeout: 100 * time.Millisecond, lateReply: true, taps: allowed,
@@ -108,6 +136,10 @@ func TestTelegramApproval(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			switch {
+			case tc.expireOnPoll:
+				deadline := newExpiringCtx()
+				ctx = deadline
+				lateReplies(t, "getUpdates", deadline.expire)
 			case tc.cancelOnPoll:
 				lateReplies(t, "getUpdates", cancel)
 			case tc.lateReply:

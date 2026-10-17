@@ -155,8 +155,11 @@ func telegramApprove(ctx context.Context, token string, user int64, req core.Exe
 		"reply_markup": map[string]any{"inline_keyboard": keyboard}}, &sent); err != nil {
 		return false, err
 	}
-	outcome := "⌛ Closed: answered on another channel, or canceled."
+	outcome := "" // empty while nobody answered here
 	defer func() {
+		if outcome == "" {
+			outcome = endedOutcome(ctx)
+		}
 		// Best effort, even once ctx is done: show the outcome and drop the buttons.
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
@@ -218,6 +221,16 @@ func telegramApprove(ctx context.Context, token string, user int64, req core.Exe
 	}
 	outcome = fmt.Sprintf("⌛ Expired: no answer within %s, so not approved.", telegramTimeout)
 	return false, fmt.Errorf("telegram: no answer within %s", telegramTimeout)
+}
+
+// endedOutcome is what a channel's message says when ctx ended before its user answered. Only the
+// approval deadline (Runtime.ApprovalTimeout) ends it with DeadlineExceeded; then nobody answered
+// anywhere, so the message must not claim that another channel did.
+func endedOutcome(ctx context.Context) string {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return "⌛ Expired: no answer in time, so not approved."
+	}
+	return "⌛ Closed: answered on another channel, or canceled."
 }
 
 // telegramText quotes every agent-supplied field (core.ApprovalText), so no argument can fake a

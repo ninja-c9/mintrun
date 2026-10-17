@@ -80,8 +80,11 @@ func slackApprove(ctx context.Context, token, user string, req core.ExecRequest)
 		"mrkdwn": {"false"}, "parse": {"none"}, "link_names": {"false"}, "unfurl_links": {"false"}, "unfurl_media": {"false"}}, &sent); err != nil {
 		return false, err
 	}
-	outcome := "⌛ Closed: answered on another channel, or canceled."
+	outcome := "" // empty while nobody answered here
 	defer func() {
+		if outcome == "" {
+			outcome = endedOutcome(ctx)
+		}
 		// Best effort, even once ctx is done: replace the prompt with the outcome.
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()

@@ -73,6 +73,7 @@ func TestSlackApproval(t *testing.T) {
 		name         string
 		cfgUser      string // the user ID in the config; user when empty
 		timeout      time.Duration
+		expireOnPoll bool                  // the approval deadline, which FirstApproval's ctx inherits, passes while a poll's reply is on its way
 		cancelOnPoll bool                  // the caller cancels while a poll's reply is on its way, as FirstApproval may
 		lateReply    bool                  // each poll's reply comes only once the deadline passed
 		polls        []map[string][]string // each answered reactions.get's reactions besides the bot's; the last repeats
@@ -94,6 +95,7 @@ func TestSlackApproval(t *testing.T) {
 			"reactions.get 4": {status: http.StatusTooManyRequests, retryAfter: 1, body: `{"ok":false,"error":"ratelimited"}`},
 		}, ok: true, outcome: "✅ Allowed"},
 		{name: "no answer", timeout: 100 * time.Millisecond, err: "slack: no answer within 100ms", outcome: "⌛ Expired"},
+		{name: "approval deadline", expireOnPoll: true, polls: allow, err: "context deadline exceeded", outcome: "⌛ Expired: no answer in time, so not approved."},
 		{name: "answered elsewhere", cancelOnPoll: true, polls: allow, err: "context canceled", outcome: "⌛ Closed"},
 		{name: "an answer after the deadline", timeout: 100 * time.Millisecond, lateReply: true, polls: allow,
 			err: "slack: no answer within 100ms", outcome: "⌛ Expired"},
@@ -113,6 +115,10 @@ func TestSlackApproval(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			switch {
+			case tc.expireOnPoll:
+				deadline := newExpiringCtx()
+				ctx = deadline
+				lateReplies(t, "reactions.get", deadline.expire)
 			case tc.cancelOnPoll:
 				lateReplies(t, "reactions.get", cancel)
 			case tc.lateReply:
