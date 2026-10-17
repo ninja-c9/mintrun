@@ -1870,8 +1870,8 @@ func TestExecBlindStop(t *testing.T) {
 		}
 	}
 	// The background sleep holds stdout, so only killing the whole group frees it before
-	// PipeWaitDelay (5 s). mark comes after the last fork: on macOS a child forked while its
-	// group is killed can survive the kill (1 or 2 runs in 100 when touch came first).
+	// PipeWaitDelay (5 s). mark comes after the last fork, so the stop never lands mid-fork:
+	// TestKillProcessGroupFork pins a kill during a fork.
 	sleeper := core.ExecRequest{MintRequest: core.MintRequest{Provider: "leased"}, Command: []string{"sh", "-c", `sleep 60 & touch "$0"; wait`, mark}}
 	run := func(name string, ctx context.Context, req core.ExecRequest, outcome string) core.AuditEntry {
 		t.Helper()
