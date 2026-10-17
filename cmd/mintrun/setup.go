@@ -186,6 +186,7 @@ func cmdDoctor(ctx context.Context, rt *core.Runtime, args []string) {
 	}
 	self := doctorBinary(report)
 	doctorPolicy(rt, doctorVault(ctx, rt, report), report)
+	doctorShims(rt, self, os.Getenv("PATH"), report)
 	doctorIDEs(self, report)
 	if failed {
 		exitFunc(1)

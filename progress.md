@@ -176,3 +176,20 @@
 - **Kiểm chứng:** dòng Approval Channels, Approval Text và dòng Return trong `checks.md`; `TestOSApproval`, `TestTelegramApproval` và `TestSlackApproval` chạy với `-v` đều hiện `--- PASS`. Trên bản sao của `d71e85b`, 13/13 mutant đều làm `TestOSApproval` trượt (Allow là nút mặc định; bỏ dòng vault; bỏ dòng thư mục làm việc; vault, thư mục làm việc, argv, provider hay params không quote; bỏ chữ not set; hộp thoại cũ không quote, kể cả khi test bỏ U+202E; không giới hạn; không cắt theo UTF-8; `%+q` trong hộp thoại), 8 mutant trong số đó cũng làm `TestTelegramApproval` và `TestSlackApproval` trượt, còn bản sao không đổi thì pass; trước khi có byte đệm, mutant không cắt theo UTF-8 qua được `TestOSApproval`. `osacompile` của script mới thoát 0. Trong bản `git archive` của `d71e85b`: gofmt và vet sạch, test pass, độ phủ `94.4%` (`cmd/mintrun` 94.7%, `internal/builtin` 94.0%, `internal/core` 94.6%), `-race` pass, build và `plugin list` (7 plugin) pass, binary `-trimpath` chứa 0 đường dẫn home (đối chứng không `-trimpath`: 760), build chéo linux, windows, freebsd pass. Quét rò rỉ: 0 hit (đối chứng 25/25 và 10/10).
 - **Chưa xử lý:** chưa ai bấm Return trên một hộp thoại thật (dòng Return trong `checks.md` §3 có lệnh để tự thử); `strconv.Quote` vẫn giữ nguyên chữ trông giống nhau và dấu kết hợp (dòng look-alike); input schema của `mintrun_exec` và bảng MCP trong README nêu `cwd` mà không nêu `vault`, dù agent vẫn gửi được (mục MCP `vault` Field ở phần 3).
 - **Next step:** push lên `main` khi bạn đồng ý.
+
+---
+
+## 23. Workstream T — CLI Shims (`mintrun shim`: Block & Redirect + Transparent Auto-Wrap)
+
+- **Hoàn thành:** Bước T1 → T4 trong `plan.md`.
+- **Files thay đổi:** `cmd/mintrun/shim.go`, `cmd/mintrun/shim_test.go`, `cmd/mintrun/main.go`, `cmd/mintrun/setup.go`, `README.md`, `AGENTS.md`, `plan.md`, `checks.md`, `progress.md`.
+- **Quyết định:**
+  - **Nhận diện qua `os.Args[0]` (`invokedShimName`):** khi `mintrun` được gọi qua symlink mang tên `gh`, `aws`, `gcloud`, `wrangler`, `vercel`, hoặc `psql` (kể cả hậu tố `.exe`), `main()` chuyển thẳng vào `runShim` trước khi phân tích subcommand của `mintrun`.
+  - **2 chế độ hoạt động (`block` mặc định & `auto`):**
+    - `block`: từ chối chạy trực tiếp với mã thoát `126` (không mở vault, không chạy binary thật) và in thông báo hướng dẫn gọi MCP tool `"mintrun_exec"` kèm câu lệnh `mintrun exec -provider <provider> -scope <scope> -perms <perms> -- <tool> ...` để AI agent tự sửa ở lượt kế tiếp.
+    - `auto`: tự động loại `<home>/shims` khỏi `PATH` (`withoutShimsOnPath`), tìm binary thật tuyệt đối ngoài `<home>/shims` (`lookPathSkippingDir`, từ chối mọi mục `PATH` tương đối theo Luật 14), suy luận scope cho `gh` từ `-R`/`--repo` hoặc `git remote get-url origin` (không in URL), hoặc lấy từ 1 rule cụ thể trong `policy.json`, rồi gọi `rt.ExecBlind`.
+  - **Biến môi trường chỉ thắt chặt (Luật 11 & 39):** `MINTRUN_SHIM_MODE=block` siết `auto` thành `block`, còn `MINTRUN_SHIM_MODE=auto` không bao giờ nới lỏng `block` thành `auto`.
+  - **Chống đệ quy vô tận:** `cmdExec`, `cmdMCP` và `runShim` đều gọi `withoutShimsOnPath(rt.HomeDir)` để `ExecBlind` luôn chạy binary thật.
+  - **`doctorShims`:** kiểm tra `<home>/shims/config.json`, đích symlink và thứ tự `PATH` khi thư mục `<home>/shims` tồn tại.
+- **Kiểm chứng:** `go test -count=1 -v -run 'TestCLIShim|TestCLIDoctor' ./cmd/mintrun` pass toàn bộ subtest; 12/12 mutant trên bản sao đều bị bắt; `gofmt` & `go vet` 0 lỗi; độ phủ toàn repo đạt **94.3%** (`cmd/mintrun` 94.4%, `internal/builtin` 94.0%, `internal/core` 94.6%).
+- **Next step:** merge / push nhánh `claude/cli-shims` khi bạn đồng ý.

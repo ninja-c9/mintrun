@@ -68,6 +68,19 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer cancel()
 
+	if len(os.Args) > 0 {
+		if tool := invokedShimName(os.Args[0]); tool != "" {
+			rt, err := bootRuntime()
+			if err != nil {
+				fatal("boot runtime: %v", err)
+			}
+			origPath := os.Getenv("PATH")
+			defer withoutShimsOnPath(rt.HomeDir)()
+			runShim(ctx, rt, origPath, tool, os.Args[1:])
+			return
+		}
+	}
+
 	if len(os.Args) < 2 {
 		printUsage()
 		exitFunc(1)
@@ -94,6 +107,8 @@ func main() {
 		cmdInit(ctx, rt, os.Args[2:])
 	case "doctor":
 		cmdDoctor(ctx, rt, os.Args[2:])
+	case "shim":
+		cmdShim(rt, os.Getenv("PATH"), os.Args[2:])
 	case "-h", "--help", "help":
 		printUsage()
 	default:
@@ -102,6 +117,7 @@ func main() {
 }
 
 func cmdExec(ctx context.Context, rt *core.Runtime, args []string) {
+	defer withoutShimsOnPath(rt.HomeDir)()
 	fs := flag.NewFlagSet("exec", flag.ExitOnError)
 	provider := fs.String("provider", "cloudflare", "Provider plugin name (e.g. cloudflare, github)")
 	scope := fs.String("scope", "", "Target resource scope (e.g. domain 'example.com' or repo 'owner/repo')")
@@ -292,6 +308,7 @@ func installPlugin(ctx context.Context, pluginsDir, src string) (core.Manifest, 
 }
 
 func cmdMCP(ctx context.Context, rt *core.Runtime, args []string) {
+	defer withoutShimsOnPath(rt.HomeDir)()
 	bridgeName := "mcp"
 	if len(args) > 0 {
 		bridgeName = args[0]
@@ -337,6 +354,7 @@ func printUsage() {
 Usage:
   mintrun init [step]                                         Set up secrets, approval, policy and IDEs step by step
   mintrun doctor                                              Check the setup without changing anything
+  mintrun shim [list|install|remove] [tool...]                Intercept bare CLI calls (gh, aws, gcloud, wrangler, vercel, psql)
   mintrun secret set <provider> [secret]                      Store master secret in OS Keychain vault
   mintrun secret check <provider>                             Verify secret exists without exposing value
   mintrun secret delete <provider>                            Delete master secret from vault
@@ -346,6 +364,12 @@ Usage:
   mintrun plugin remove <name>                                Remove an installed external plugin
   mintrun mcp                                                 Start MCP JSON-RPC 2.0 server over stdio
   mintrun audit                                               View zero-secret execution audit trail`)
+}
+
+func withoutShimsOnPath(homeDir string) func() {
+	orig := os.Getenv("PATH")
+	_ = os.Setenv("PATH", stripDirFromPath(orig, shimsDir(homeDir)))
+	return func() { _ = os.Setenv("PATH", orig) }
 }
 
 // setEcho turns terminal echo on or off so a typed secret is not shown (the stdlib has no termios
@@ -361,7 +385,11 @@ func setEcho(on bool) bool {
 }
 
 func fatal(format string, a ...any) {
+	fatalExit(1, format, a...)
+}
+
+func fatalExit(code int, format string, a ...any) {
 	out, _ := json.Marshal(map[string]string{"error": fmt.Sprintf(format, a...)})
 	fmt.Fprintf(os.Stderr, "%s\n", out)
-	exitFunc(1)
+	exitFunc(code)
 }

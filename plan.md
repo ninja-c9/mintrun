@@ -309,6 +309,30 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
   go test -count=1 -v -run 'TestTelegramApproval|TestSlackApproval' ./internal/builtin
   ```
 
+### Workstream T — CLI Shims (`mintrun shim`: Block & Redirect + Auto-Wrap)
+- **Files:** `cmd/mintrun/main.go`, `cmd/mintrun/setup.go`, `cmd/mintrun/shim.go` (new), `cmd/mintrun/shim_test.go` (new), `README.md`, `AGENTS.md`, `plan.md`, `checks.md`, `progress.md`
+- **Design:**
+  - AI agents in a shell invoke `gh`, `aws`, `gcloud`, `wrangler`, `vercel`, and `psql` by bare name, bypassing `mintrun_exec` and `mintrun exec`. `mintrun shim` places symlinks to this `mintrun` binary in `<home>/shims/{gh,aws,gcloud,wrangler,vercel,psql,mintrun}` (`0700`) and stores per-tool settings in `<home>/shims/config.json` (`0600`, written atomically via `builtin.WriteFileAtomic`, decoded strictly with `DisallowUnknownFields`).
+  - When `filepath.Base(os.Args[0])` (without `.exe`) is one of the six shimmed CLI names (`gh`, `aws`, `gcloud`, `wrangler`, `vercel`, `psql`), `main` dispatches directly to `runShim(ctx, rt, tool, os.Args[1:])`:
+    - **Fail-closed config loading:** Only a missing `<home>/shims/config.json` (checked via `os.Lstat` for `fs.ErrNotExist`, rule 36) means default settings (`mode: "block"` for every tool). An unreadable file (a directory, a dangling symlink, `chmod 000`), malformed JSON, an unknown field (`DisallowUnknownFields`), an unknown tool key, or a `mode` other than `""`, `"block"`, or `"auto"` refuses execution with exit 126, quoting only the `*fs.PathError` cause and never a local path.
+    - **Environment tightening only:** `MINTRUN_SHIM_MODE=block` forces `block` mode even when `config.json` sets `"mode": "auto"`, whereas `MINTRUN_SHIM_MODE=auto` never loosens `"block"` to `"auto"` (an agent running in bash controls its own environment; rule 11).
+    - **Mode 1 — `block` (default):** refuses direct execution with exit 126 without opening a vault, minting, or running the underlying CLI, and prints a JSON error on `stderr` that names both the `mintrun_exec` MCP tool and the exact `mintrun exec -provider <provider> -scope <scope> -perms <perms> -- <tool> ...` command (using the inferred `owner/repo` scope for `gh` when available, never printing the git remote URL).
+    - **Mode 2 — `auto` (`"mode": "auto"` in `config.json`):** resolves the real `<tool>` binary from `PATH` skipping `<home>/shims` (both raw and `EvalSymlinks`-resolved) and rejecting any relative `PATH` entry (rule 14). Strips `<home>/shims` from `PATH`, infers `scope` (configured `scope`, else `-R`/`--repo` flag or `git remote get-url origin` for `gh`, else a single non-wildcard `allowed_scopes[0]` from `rt.Policies[provider]`) and `permissions` (configured `permissions`, else read-only defaults for read subcommands, else non-wildcard `allowed_permissions` from `rt.Policies[provider]`), and runs `rt.ExecBlind` with `Command: append([]string{realBin}, args...)` and `Approve: cfg.Approve`.
+  - **No recursion under `mintrun exec` or `mintrun mcp`:** `main` saves the caller's original `PATH` for `doctor` and `shim list`, and strips `<home>/shims` from `os.Getenv("PATH")` before `cmdExec`, `cmdMCP`, or `runShim` invokes `ExecBlind`, so `ExecBlind` always resolves the real underlying CLI binary instead of re-entering `<home>/shims/<tool>`.
+  - **Subcommands:**
+    - `mintrun shim` / `mintrun shim list` (`ls`): prints a table of the six tools (`TOOL`, `PROVIDER`, `SHIM`, `MODE`, `TARGET`) without changing any file.
+    - `mintrun shim install [-mode block|auto] [-scope <s >] [-perms <p1,p2>] [-approve] [tool...]`: validates flags and tool names, refuses a `go run` binary (`mintrunPath`, rule 35), refuses `-scope` or `-perms` when installing multiple tools at once, creates `<home>/shims`, atomically links `mintrun` and each selected tool to `self`, updates `<home>/shims/config.json`, and prints the `export PATH="<home>/shims:$PATH"` instruction.
+    - `mintrun shim remove [tool...]` (`rm`): removes the named tool symlinks (or all six when none are given) and their entries in `<home>/shims/config.json`.
+  - **`mintrun doctor` (`doctorShims`):** when `<home>/shims` exists, checks `config.json` and each tool symlink (`FAIL` on broken/unreadable `config.json` or missing symlink target; `warn` when a symlink points to another binary or when `<home>/shims` is not ahead of the real binary's directory on `PATH`; `ok` when active).
+- **Deliverables:**
+  1. `[SERIAL]` `cmd/mintrun/shim.go`, `cmd/mintrun/main.go`, and `cmd/mintrun/setup.go` (`doctorShims`).
+  2. `[SERIAL]` `cmd/mintrun/shim_test.go`: hermetic tests for `mintrun shim install|list|remove`, `block` mode (exit 126, redirect hint, `MINTRUN_SHIM_MODE=auto` cannot loosen `block`), `auto` mode (`ExecBlind` delegation, `MINTRUN_SHIM_MODE=block` tightens `auto` to `block`, `gh` scope/perm inference, non-recursive `mintrun exec -- gh ...` with `<home>/shims` first on `PATH`, relative `PATH` rejection, fail-closed `shims/config.json`), and `doctorShims`.
+  3. `[SERIAL]` Mutants run on a copy of the worktree, one per security condition.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCLIShim|TestCLIDoctor' ./cmd/mintrun
+  ```
+
 ---
 
 ## 3. Deferred Backlog (Next Actionable Items)
