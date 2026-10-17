@@ -1725,6 +1725,108 @@ func TestMCPBridgeExecUnreadable(t *testing.T) {
 	}
 }
 
+// TestMCPBridgeExecPluginHomes runs mintrun_exec against a plugin that fails as a crashing script
+// does: its stderr names its own path, a file under the user's home, and its master secret, which
+// holds a home path too; or its error field names both homes. The agent and audit.jsonl see the
+// user's home as ~ and the mintrun home as $MINTRUN_HOME, and the secret redacted whole (rule 8).
+// A relative or root HOME is left alone: a root HOME would win over the mintrun home and spell it
+// out with ~ for every /.
+func TestMCPBridgeExecPluginHomes(t *testing.T) {
+	t.Setenv("MINTRUN_VAULT_KEY", "mintrun-mcp-plugin-homes-test-passphrase")
+	t.Setenv("MINTRUN_APPROVE", "")
+	crash := "#!/bin/sh\n" +
+		`printf 'File "%s", line 2\nFile "%s/lib/site.py", line 9\n' "$0" "$HOME" >&2` + "\n" +
+		`sed -n 's/.*"master_secret":"\([^"]*\)".*/master: \1/p' >&2` + "\n" +
+		"exit 1\n"
+	field := "#!/bin/sh\n" + `printf '{"error":"cannot read %s/.config/key (%s)"}' "$HOME" "$0"` + "\n"
+	const vaultFailed = `vault "canary" could not load master secret for "canary": plugin "canary" failed: exit status 1 (`
+	cases := []struct {
+		name, vault, user, run string // user "" is a temporary directory
+		inUser                 bool   // the default layout: the mintrun home is ~/.mintrun
+		want                   string
+	}{
+		{"provider stderr", "keychain", "", crash, true, `provider "canary" mint failed: plugin "canary" failed: exit status 1 (` +
+			`File "~/.mintrun/plugins/canary/run", line 2` + "\n" + `File "~/lib/site.py", line 9` + "\n" + `master: [MINTRUN:REDACTED])`},
+		{"vault stderr", "canary", "", crash, false, vaultFailed +
+			`File "$MINTRUN_HOME/plugins/canary/run", line 2` + "\n" + `File "~/lib/site.py", line 9)`},
+		{"provider error field", "keychain", "", field, false,
+			`provider "canary" mint failed: plugin "canary" error: cannot read ~/.config/key ($MINTRUN_HOME/plugins/canary/run)`},
+		{"relative user home", "canary", "lib", crash, false, vaultFailed +
+			`File "$MINTRUN_HOME/plugins/canary/run", line 2` + "\n" + `File "lib/lib/site.py", line 9)`},
+		{"root user home", "canary", "/", crash, false, vaultFailed +
+			`File "$MINTRUN_HOME/plugins/canary/run", line 2` + "\n" + `File "//lib/site.py", line 9)`},
+	}
+	req := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mintrun_exec","arguments":{"provider":"canary","command":["echo"]}}}` + "\n"
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			user := c.user
+			if user == "" {
+				user = t.TempDir()
+			}
+			home := filepath.Join(user, ".mintrun")
+			if !c.inUser {
+				home = t.TempDir()
+			}
+			t.Setenv("HOME", user)
+			leaks := func(s string) bool {
+				return strings.Contains(s, home) || strings.Contains(s, "canary_master_secret") ||
+					c.user == "" && strings.Contains(s, user)
+			}
+			src := t.TempDir()
+			if err := os.WriteFile(filepath.Join(src, "plugin.json"), []byte(`{"name":"canary","version":"0.1.0","entrypoint":"run"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(src, "run"), []byte(c.run), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			reg := core.NewRegistry()
+			vault := &KeychainVault{HomeDir: home, ForceFile: true}
+			_ = reg.Register(vault)
+			rt := core.NewRuntime(home, c.vault, reg)
+			rt.ApprovalFunc = func(context.Context, core.ExecRequest) (bool, error) {
+				t.Error("an exec without require_approval must never ask a human")
+				return false, nil
+			}
+			if _, err := core.InstallPlugin(ctx, rt.PluginsDir(), src); err != nil {
+				t.Fatal(err)
+			}
+			if err := core.LoadExternalPlugins(rt.PluginsDir(), reg); err != nil {
+				t.Fatal(err)
+			}
+			// The runner scrubs only the whole master, so replacing the home inside it first would leak the rest.
+			if err := vault.SetSecret(ctx, "canary", "canary_master_secret ca="+user+"/.kube/ca.crt"); err != nil {
+				t.Fatal(err)
+			}
+			var out bytes.Buffer
+			if err := NewMCPBridge().Serve(ctx, rt, strings.NewReader(req), &out); err != nil {
+				t.Fatal(err)
+			}
+			var resp struct {
+				Result struct {
+					IsError bool                    `json:"isError"`
+					Content []struct{ Text string } `json:"content"`
+				} `json:"result"`
+			}
+			if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+				t.Fatal(err)
+			}
+			if want := "mintrun execution error: " + c.want; !resp.Result.IsError || len(resp.Result.Content) != 1 ||
+				resp.Result.Content[0].Text != want || leaks(out.String()) {
+				t.Fatalf("got %s, want the tool error %q and no home or secret", out.String(), want)
+			}
+			audit, err := os.ReadFile(filepath.Join(home, "audit.jsonl"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			quoted, _ := json.Marshal(c.want)
+			if !strings.Contains(string(audit), `"error":`+string(quoted)) || leaks(string(audit)) {
+				t.Fatalf("expected the audited error %s and no home or secret, got:\n%s", quoted, audit)
+			}
+		})
+	}
+}
+
 // TestMCPBridgeExecCleanEnv runs a successful mintrun_exec with clean_env over JSON-RPC. The
 // policy allows static mode but does not force clean mode, so only the request's clean_env can
 // strip the host variable. The child prints the lease token: the agent must see only the

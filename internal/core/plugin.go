@@ -206,6 +206,7 @@ func (r *Registry) Manifests() []Manifest {
 type ExternalPlugin struct {
 	manifest Manifest
 	execPath string
+	home     string // the mintrun home, which quoted plugin text shows as $MINTRUN_HOME
 }
 
 type rpcRequest struct {
@@ -242,7 +243,7 @@ func (e *ExternalPlugin) call(ctx context.Context, req rpcRequest) (*rpcResponse
 		if errors.As(err, &pe) {
 			err = pe.Err
 		}
-		return nil, fmt.Errorf("plugin %q failed: %v (%s)", e.manifest.Name, err, strings.TrimSpace(stderr.String()))
+		return nil, fmt.Errorf("plugin %q failed: %v (%s)", e.manifest.Name, err, e.quote(strings.TrimSpace(stderr.String()), req))
 	}
 	var resp rpcResponse
 	if json.Unmarshal(stdout.Bytes(), &resp) != nil {
@@ -250,9 +251,27 @@ func (e *ExternalPlugin) call(ctx context.Context, req rpcRequest) (*rpcResponse
 		return nil, fmt.Errorf("plugin %q returned an invalid JSON response", e.manifest.Name)
 	}
 	if resp.Error != "" {
-		return nil, fmt.Errorf("plugin %q error: %s", e.manifest.Name, resp.Error)
+		return nil, fmt.Errorf("plugin %q error: %s", e.manifest.Name, e.quote(resp.Error, req))
 	}
 	return &resp, nil
+}
+
+// quote returns text the plugin wrote (a traceback names its own path) fit for an error that
+// reaches agents and audit.jsonl: scrubbed of the master first, because the runner scrubs only
+// the whole master and a replaced home inside it would leak the rest, then with the user's home
+// shown as ~ and the mintrun home as $MINTRUN_HOME (rule 36).
+// ponytail: only the paths as given are replaced, so a resolved symlink or an escaped form
+// (JSON's \u, Windows' \\) still gets through; match those if a plugin is seen printing them.
+func (e *ExternalPlugin) quote(text string, req rpcRequest) string {
+	text = Scrub(text, []string{req.MasterSecret})
+	userHome, _ := os.UserHomeDir()
+	var oldnew []string
+	for _, p := range [][2]string{{userHome, "~"}, {e.home, "$MINTRUN_HOME"}} { // ~ wins inside the user home
+		if dir := filepath.Clean(p[0]); filepath.IsAbs(dir) && filepath.Dir(dir) != dir {
+			oldnew = append(oldnew, dir, p[1])
+		}
+	}
+	return strings.NewReplacer(oldnew...).Replace(text)
 }
 
 func (e *ExternalPlugin) GetSecret(ctx context.Context, key string) (string, error) {
@@ -307,6 +326,7 @@ func LoadExternalPlugins(pluginsDir string, reg *Registry) error {
 		if err != nil {
 			continue
 		}
+		p.home = filepath.Dir(filepath.Clean(pluginsDir))
 		_ = reg.Register(p)
 	}
 	return nil
