@@ -15,7 +15,7 @@ Engineered with **100% Go standard library**, **zero external dependencies**, an
   <a href="https://github.com/ninja-c9/mintrun/blob/main/go.mod"><img src="https://img.shields.io/badge/Go-1.24.0-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go 1.24.0" /></a>
   <a href="#architecture-everything-is-a-plugin"><img src="https://img.shields.io/badge/Dependencies-Zero_(100%25_stdlib)-10B981?style=flat-square" alt="Zero Dependencies" /></a>
   <a href="#ai-agent-integration-mcp"><img src="https://img.shields.io/badge/MCP-JSON--RPC_2.0_Ready-38BDF8?style=flat-square" alt="MCP Ready" /></a>
-  <a href="#verification--testing"><img src="https://img.shields.io/badge/Coverage-94.3%25_Verified-A78BFA?style=flat-square" alt="94.3% Coverage" /></a>
+  <a href="#verification--testing"><img src="https://img.shields.io/badge/Coverage-94.4%25_Verified-A78BFA?style=flat-square" alt="94.4% Coverage" /></a>
 </p>
 
 <p align="center">
@@ -121,7 +121,7 @@ mintrun/
 │   ├── shim.go                           # PATH shims (mintrun shim): block-and-redirect or transparent auto-wrap
 │   ├── main_test.go                      # End-to-end CLI & subcommand test suite
 │   ├── setup_test.go                     # Hermetic init and doctor test suite
-│   ├── shim_test.go                      # Hermetic CLI shim (block, auto, env-tightening, doctor) test suite
+│   ├── shim_test.go                      # Hermetic CLI shim (block, auto, env-tightening, shell profiles, doctor) test suite
 │   └── examples_test.go                  # Installs and runs the example plugins against stand-ins
 ├── internal/
 │   ├── core/
@@ -275,9 +275,9 @@ Coding agents often default to running `gh`, `aws`, `gcloud`, `wrangler`, `verce
 
 ```bash
 # 1. Block & Redirect mode (default): refuse direct CLI runs (exit 126) and print
-# the exact `mintrun_exec` MCP call + `mintrun exec` command so the agent self-corrects:
+# the exact `mintrun_exec` MCP call + `mintrun exec` command so the agent self-corrects.
+# `shim install` then asks before it adds the PATH line to your shell profiles (see below):
 ./mintrun shim install gh aws gcloud wrangler
-export PATH="$HOME/.mintrun/shims:$PATH"
 
 # 2. Transparent Auto-Wrap mode: intercept `gh ...` and route it through ExecBlind
 # (policy gate -> JIT token mint -> 5-encoding scrub -> instant revoke on exit):
@@ -291,6 +291,7 @@ export PATH="$HOME/.mintrun/shims:$PATH"
 - **Mode 1 (`block`, default):** Exits `126` before opening any vault or spawning the binary, and prints a redirect message naming both the `mintrun_exec` MCP tool and the exact `mintrun exec -provider <provider> -scope <scope> -perms <perms> -- <tool> ...` command.
 - **Mode 2 (`auto`):** Resolves the real binary on `PATH` (skipping `~/.mintrun/shims` and rejecting relative `PATH` entries), determines the target scope and permissions (from `shims/config.json`, `-R`/`--repo` or `git remote get-url origin` for `gh` without printing the remote URL, or a single concrete rule in `policy.json`), and runs the command through `ExecBlind`.
 - **Environment tightening only:** Setting `MINTRUN_SHIM_MODE=block` forces even an `auto` shim into `block` mode for an agent subshell, whereas `MINTRUN_SHIM_MODE=auto` never loosens a `block` shim.
+- **Shell profiles change only after you say yes:** `shim install` shows one line, `export PATH='<home>/shims':"$PATH" # mintrun-shim`, and the profiles it would go last in: `~/.zshenv` and `~/.zshrc` (created if missing), plus `~/.zprofile` and `~/.bashrc` if they exist. It goes last because Homebrew's line in `~/.zprofile` puts its own directory first. Then it asks `[y/N]`. Any answer but `y` or `yes` (Enter and EOF included) changes nothing, so you can add the line yourself. On a yes, each existing profile is first copied to `<file>.bak-<YYYYMMDD-HHMMSS>` with the same permissions. A profile that is a symlink (from a dotfiles repo, say) is edited where it points; a broken link is left alone. A profile that changed while the question was open is left unchanged, and `mintrun` stops and asks you to run the command again. Ctrl-C at the question stops `mintrun`. Open a new shell to use the shims. Once no shim is left, `shim remove` asks the same way and takes out only that exact line, so a line of your own that mentions `# mintrun-shim` stays. When the line already comes last in each profile, nothing is asked; `shim install` prints the `export` line if the current shell's `PATH` does not put the shims first.
 
 ### Inspect the Zero-Secret Audit Trail
 
@@ -552,7 +553,7 @@ A reply that does not decode, such as text that is not JSON or an `expires_at` t
 
 ## Verification & Testing
 
-`mintrun` ships with a deterministic, offline unit and integration test suite (**94.3%** total statement coverage, measured without build tags) that mocks Cloudflare, GitHub App RS256, AWS STS SigV4 (plus a fixed AWS signing vector), Google OAuth2 JWT-bearer, Telegram Bot, and Slack Web APIs plus the macOS `security` and `osascript`, Linux `secret-tool`, 1Password `op`, and `stty` CLIs, checks child environment isolation, the output cap, and the process-group kill, verifies AES-256-GCM encryption at rest, tests multi-encoding leak scrubbing, enforces policy guardrails, validates external plugin execution and the governance tools over MCP, installs and runs the [example plugins](examples/plugins/README.md) against a stub `bw`, a stub `psql`, and a local Vercel API (skipped without `python3`), and runs `mintrun init`, `mintrun doctor`, and `mintrun shim` in a throwaway home directory against stub `git`, `claude`, and `open`. It never touches the real Keychain, Telegram, Slack, Bitwarden, Vercel, a database, or your IDE configs:
+`mintrun` ships with a deterministic, offline unit and integration test suite (**94.4%** total statement coverage, measured without build tags) that mocks Cloudflare, GitHub App RS256, AWS STS SigV4 (plus a fixed AWS signing vector), Google OAuth2 JWT-bearer, Telegram Bot, and Slack Web APIs plus the macOS `security` and `osascript`, Linux `secret-tool`, 1Password `op`, and `stty` CLIs, checks child environment isolation, the output cap, and the process-group kill, verifies AES-256-GCM encryption at rest, tests multi-encoding leak scrubbing, enforces policy guardrails, validates external plugin execution and the governance tools over MCP, installs and runs the [example plugins](examples/plugins/README.md) against a stub `bw`, a stub `psql`, and a local Vercel API (skipped without `python3`), and runs `mintrun init`, `mintrun doctor`, and `mintrun shim` in a throwaway home directory against stub `git`, `claude`, and `open`. It never touches the real Keychain, Telegram, Slack, Bitwarden, Vercel, a database, or your IDE configs:
 
 ```bash
 go test -v -cover ./...

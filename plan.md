@@ -369,6 +369,25 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
   go test -count=1 -v -run 'TestMCPBridgeRefusesVault|TestMCPBridgeRefusesTimeout|TestMCPExecSchema|TestMCPBridgeGovernanceTools' ./internal/builtin
   ```
 
+### Workstream W — Shim Profile Edits Ask First
+- **Files:** `cmd/mintrun/main.go`, `cmd/mintrun/shim.go`, `cmd/mintrun/shim_test.go`, `README.md`, `AGENTS.md`, `plan.md`, `checks.md`, `progress.md`
+- **Gap:** `c5cea73` made `shim install` add its PATH line to `~/.zshenv` and `~/.zshrc` (and to `~/.zprofile` and `~/.bashrc` when they exist), and `shim remove` take it out, with no question and no backup, which rule 35 requires before writing a user's file. It replaced a linked profile (dotfiles) with a regular file, removal dropped any line that held the marker, nothing documented the edits, and `cmd/mintrun` coverage fell from 94.4% to 93.8%.
+- **Design:**
+  - `shim install` reads the profiles before it links anything, then shows the line and the profiles and asks `[y/N]` through `wizard.confirm`; `shim remove` asks the same way once no shim is left. Any answer but `y` or `yes` changes nothing, and the line is already on screen to add by hand.
+  - On a yes, each profile is read again, and one changed while the question waited stops `mintrun`. Each existing profile is copied to `<file>.bak-<time>` with its mode, then written atomically with its mode (`0600` when new).
+  - A profile is resolved with `filepath.EvalSymlinks` and written where it lives; a link that cannot be followed is skipped.
+  - Only the exact `shimProfileLine` moves or goes. The line goes last, after a newline when the file's last line has none.
+  - `main` passes its signal context to `cmdShim`, so Ctrl-C at the question stops `mintrun`.
+- **Deliverables:**
+  1. `[SERIAL]` Subtests in `cmd/mintrun/shim_test.go` that fail on `c5cea73`.
+  2. `[SERIAL]` `cmd/mintrun/shim.go` and `cmd/mintrun/main.go`.
+  3. `[SERIAL]` 25 mutants on a copy, each failing `TestCLIShim`, with controls: an unchanged copy and a comment-only change pass, and a planted compile error reports a build failure.
+  4. `[SERIAL]` README, AGENTS.md rule 40, `checks.md`, `progress.md`.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCLIShim' ./cmd/mintrun
+  ```
+
 ---
 
 ## 3. Deferred Backlog (Next Actionable Items)
