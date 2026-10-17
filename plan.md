@@ -344,11 +344,29 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
   1. `[SERIAL]` core: `FromAgent` and the denial in `CheckPolicy`; `TestCheckPolicyMatchesExecBlind` with an agent's request naming a vault (denied by both) and the same request without the flag (allowed, as the CLI's `-vault`).
   2. `[SERIAL]` builtin: the bridge sets the flag; `TestMCPBridgeRefusesVault` (`mintrun_policy_check` and `mintrun_exec` naming the vault the server already uses give the same exact reason, the exec is a tool error audited with exit 126, and the same request without `vault` runs).
   3. `[SERIAL]` Mutants on a copy of the repo, each failing a test: the denial removed, the flag left unset by `mintrun_exec` or by `mintrun_policy_check`, the check in `ExecBlind` only, the check in the bridge only (not audited), the flag ignored (the CLI's `-vault` denied).
-- **Not built:** `mintrun_exec` also decodes `timeout_seconds` and `approve`, which the schema and README do not list either; `approve` can only add a human check, but `timeout_seconds` lifts the 5-minute default (progress.md §3).
+- **Not built:** `mintrun_exec` also decodes `timeout_seconds` and `approve`, which the schema and README do not list either; `approve` can only add a human check, but `timeout_seconds` lifts the 5-minute default. Workstream V closes it.
 - **Verification:**
   ```bash
   go test -count=1 -v -run 'TestCheckPolicyMatchesExecBlind' ./internal/core
   go test -count=1 -v -run 'TestMCPBridgeRefusesVault|TestMCPBridgeGovernanceTools' ./internal/builtin
+  ```
+
+### Workstream V — An Agent Cannot Set the Timeout
+- **Files:** `internal/core/runner.go`, `internal/core/core_test.go`, `internal/builtin/mcp.go`, `internal/builtin/builtin_test.go`, `README.md`
+- **Gap:** `mintrun_exec` decodes its arguments straight into `core.ExecRequest`, so besides `vault` (Workstream U) an agent could send `timeout_seconds` and `approve`, which neither the input schema nor README's MCP table listed. `approve: true` only adds a human check, but `timeout_seconds` lifted the 5-minute limit to whatever the agent asked for.
+- **Design:**
+  - An agent's command runs with the 5-minute limit, like the CLI's: no `mintrun` command takes a time limit. `CheckPolicy` denies a request with `FromAgent` and a non-zero `TimeoutSec` right after the vault check and before the provider's `policy.json` rule is looked up, so it holds for a provider with no rule. `ExecBlind` audits the denial with exit 126 before any vault opens, and `mintrun_policy_check` returns the same reason (rule 16).
+  - A negative value is denied too, though `ExecBlind` would read it as the default: the rule is that an agent sets none, not that it may set a harmless one. The reason quotes the number the agent sent and says to omit the field.
+  - `approve` goes into both tools' schema, since it can only add a check: `MINTRUN_APPROVE=1` and policy `require_approval` ask whatever it says. The `mintrun_exec` description says the command is killed after 5 minutes.
+  - `TestMCPExecSchema` keeps the schema and the struct in step: it walks `core.ExecRequest`, the embedded `MintRequest` included, and requires both tools to list every field it decodes except `vault` and `timeout_seconds`.
+- **Deliverables:**
+  1. `[SERIAL]` core: the denial in `CheckPolicy`; `TestCheckPolicyMatchesExecBlind` with an agent's `timeout_seconds` of 3600 and -1 (denied by both), both agent refusals for a provider `policy.json` has no rule for, and a library caller's `TimeoutSec` (allowed).
+  2. `[SERIAL]` builtin: `approve` in the schema and the 5-minute limit in the tool description; `TestMCPBridgeRefusesTimeout` (both tools give the same exact reason, the exec is a tool error audited with exit 126, and the same request without `timeout_seconds` runs; it shares `mcpRefusal` with `TestMCPBridgeRefusesVault`); `TestMCPExecSchema`.
+  3. `[SERIAL]` Mutants on a copy of the repo, each failing a test: the denial removed, in `ExecBlind` only, or in the bridge only (not audited); the flag ignored; `> 0` for `!= 0`; the reason without the value; `approve` left out of the schema, or `timeout_seconds` or `vault` put in; a new `ExecRequest` or `MintRequest` field neither listed nor refused; either tool not setting the flag; `mintrun_policy_check` given its own schema; the `json:"-"` tag dropped; the timeout or the vault check moved under a provider's rule.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCheckPolicyMatchesExecBlind' ./internal/core
+  go test -count=1 -v -run 'TestMCPBridgeRefusesVault|TestMCPBridgeRefusesTimeout|TestMCPExecSchema|TestMCPBridgeGovernanceTools' ./internal/builtin
   ```
 
 ---
