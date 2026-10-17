@@ -213,8 +213,10 @@ func TestSlackApproval(t *testing.T) {
 			mu.Lock()
 			defer mu.Unlock()
 			// Every <, > and & is escaped, so no argument can mention @channel, a user, or a link.
-			want := "🔐 mintrun approval request\n\nProvider: \"github\"\nScope: \"owner/repo\"\nPermissions: \"contents:read\"\n" +
-				"Params: \"installation_id\"=\"7\"\nCommand: \"gh\" \"pr\" \"list\" \"x\\n✅ Allowed &lt;!channel&gt; &lt;@U0EVIL&gt; &lt;https://example.com|details&gt; &amp;amp;\""
+			want := "🔐 mintrun approval request\n\nProvider: \"github\"\nVault: \"agent-chosen\"\nScope: \"owner/repo\"\n" +
+				"Permissions: \"contents:read\"\nParams: \"installation_id\"=\"7\"\n" +
+				"Command: \"gh\" \"pr\" \"list\" \"x\\n✅ Allowed &lt;!channel&gt; &lt;@U0EVIL&gt; &lt;https://example.com|details&gt; &amp;amp;\"\n" +
+				"Working directory: (not set: mintrun's own)"
 			if posted != want+"\n\nReact ✅ to allow or ❌ to deny." {
 				t.Errorf("message:\n%s\nwant:\n%s", posted, want)
 			}

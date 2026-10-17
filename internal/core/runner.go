@@ -298,8 +298,9 @@ func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest) error {
 // OsascriptPath is the AppleScript runner OSApproval calls, a var so tests can stub it.
 var OsascriptPath = "/usr/bin/osascript"
 
-// OSApproval asks in a macOS dialog. Deny (or Esc) is an answer, (false, nil); a dialog that
-// could not be shown is an error, so FirstApproval keeps waiting for another channel.
+// OSApproval asks in a macOS dialog. Deny (or Esc, or Return, since Deny is also the default
+// button) is an answer, (false, nil); a dialog that could not be shown is an error, so
+// FirstApproval keeps waiting for another channel.
 func OSApproval(ctx context.Context, req ExecRequest) (bool, error) {
 	if runtime.GOOS != "darwin" {
 		return false, errors.New("interactive approval requires macOS osascript or custom ApprovalFunc")
@@ -307,7 +308,7 @@ func OSApproval(ctx context.Context, req ExecRequest) (bool, error) {
 	// %q leaves only the \n, \" and \\ escapes AppleScript reads: ApprovalText quotes every field
 	// an agent sets, so the text holds nothing unprintable but its own newlines.
 	msg := ApprovalText("mintrun HITL Security Gate\n\nAllow AI agent to execute command?", req, 1000)
-	script := fmt.Sprintf(`display dialog %q with title "mintrun Security Enclave" buttons {"Deny", "Allow"} default button "Allow" cancel button "Deny" with icon caution`, msg)
+	script := fmt.Sprintf(`display dialog %q with title "mintrun Security Enclave" buttons {"Deny", "Allow"} default button "Deny" cancel button "Deny" with icon caution`, msg)
 	var stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, OsascriptPath, "-e", script)
 	cmd.Stderr = &stderr
@@ -315,7 +316,7 @@ func OSApproval(ctx context.Context, req ExecRequest) (bool, error) {
 	if err == nil {
 		return true, nil
 	}
-	if ctx.Err() == nil && strings.Contains(stderr.String(), "(-128)") { // errAEUserCanceled: Deny or Esc
+	if ctx.Err() == nil && strings.Contains(stderr.String(), "(-128)") { // errAEUserCanceled: Deny, Esc, or Return
 		return false, nil
 	}
 	return false, err
@@ -337,8 +338,16 @@ func ApprovalText(header string, req ExecRequest, limit int) string {
 		params = append(params, strconv.Quote(k)+"="+strconv.Quote(v))
 	}
 	slices.Sort(params)
-	text := fmt.Sprintf("%s\n\nProvider: %q\nScope: %q\nPermissions: %s\nParams: %s\nCommand: %s",
-		header, req.Provider, req.Scope, quote(req.Permissions), strings.Join(params, " "), quote(req.Command))
+	// An empty Vault or WorkingDir shows what applies instead, unquoted, so no agent value can pass for it.
+	orUnset := func(s, unset string) string {
+		if s == "" {
+			return unset
+		}
+		return strconv.Quote(s)
+	}
+	text := fmt.Sprintf("%s\n\nProvider: %q\nVault: %s\nScope: %q\nPermissions: %s\nParams: %s\nCommand: %s\nWorking directory: %s",
+		header, req.Provider, orUnset(req.Vault, "(not set: the default vault)"), req.Scope, quote(req.Permissions),
+		strings.Join(params, " "), quote(req.Command), orUnset(req.WorkingDir, "(not set: mintrun's own)"))
 	if len(text) > limit {
 		text = strings.ToValidUTF8(text[:limit], "") + "\n\n⚠️ TRUNCATED: the request is longer than this message. Deny unless you know the rest."
 	}
