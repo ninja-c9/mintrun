@@ -427,7 +427,7 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
   - `pass` The child could not read its parent's environment: `ps -E -ww -p $PPID` and `sysctl KERN_PROCARGS2` on the parent returned 319 to 742 bytes without the canary, while the same reads of the child's own pid returned 5,012 bytes with it (the positive control). README §5 and rule 23 say this for macOS 27.0 only.
   - Not tested: `launchctl submit`, or any other request that has a process outside the sandbox run something.
 - **Cost:** inside the sandbox, a tool that keeps its own credential in the Keychain (`gh` with a stored token, `git` with `osxkeychain`) fails; the lease's environment (`GH_TOKEN`, `CLOUDFLARE_API_TOKEN`, …) replaces it.
-- **Not built:** Linux (§3 item 1 keeps the design; `sandbox` is a denial there); `no_network`; neither the approval text nor the audit entry says the sandbox is on; `init policy` does not suggest `sandbox`.
+- **Not built:** Linux (§3 item 1 keeps the design; `sandbox` is a denial there); `no_network`; `init policy` does not suggest `sandbox`. The approval text and the audit entry came later (Workstream Z).
 - **Deliverables:**
   1. `[SERIAL]` core: the fields, the profile, `SandboxExecPath`, `CheckPolicy`, and `ExecBlind`. `TestExecBlindSandbox`: a stub `sandbox-exec` logs its exact argv for policy only, request only, and policy on with the request off, and is never called when neither is on; a symlinked home, a relative home, and a home not created yet resolve. `TestCheckPolicyMatchesExecBlind`: no `sandbox-exec`, a missing one, no Keychain folder, an unset home, a home whose parent is missing, and a dangling symlink are denied by both, with no path in the reason.
   2. `[SERIAL]` MCP `sandbox` in both tools' schema (`TestMCPExecSchema`) and the CLI's `-sandbox` (`TestCLIExecSandbox`).
@@ -442,6 +442,24 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
   go test -count=1 -v -tags integration -run '^TestSandboxHidesHome$' ./internal/core
   # Only after the user's go-ahead: it stores and deletes a throwaway login Keychain item.
   go test -count=1 -v -tags integration -run '^TestSandboxHidesKeychainItem$' ./internal/core
+  ```
+
+### Workstream Z — The Approval Text and the Audit Log Say Whether the Sandbox Is On
+- **Files:** `internal/core/runner.go`, `internal/core/core_test.go`, `internal/builtin/telegram_test.go`, `internal/builtin/slack_test.go`, `internal/builtin/builtin_test.go`, `README.md`, `AGENTS.md`, `plan.md`, `checks.md`, `progress.md`
+- **Gap:** Workstream Y left both out. An approver saw the provider, the command, and the working directory but not whether the command would run in the sandbox, and neither `audit.jsonl` nor `mintrun_audit` told a sandboxed run from an unsandboxed one.
+- **Design:**
+  - `AuditEntry.Sandbox` (`json:"sandbox,omitempty"`). `checkPolicy` sets it from the verdict it hands the approver, before asking, and from the verdict it enforces. A request the gate blocks before asking has none, since no verdict allowed it (`PolicyDecision.Sandbox` is false on every denial, a `blocked_by: sandbox` one included). A request the gate blocks after an approval keeps what the human was shown. Every later exit (vault, provider, mint, command) keeps the enforced value. `mintrun_audit` copies booleans as they are, so it shows the field with no code change.
+  - `ApprovalText` adds `Sandbox: on` or `Sandbox: off` as the first line after the header. `mintrun` writes it, so it is not quoted, and it comes before every field an agent sets (provider, vault, scope, permissions, params, command), so no long field can push it behind the TRUNCATED warning. The approver gets the first verdict's sandbox (policy or request), and the second verdict can only add it (rule 43), so `on` is a promise and `off` means no sandbox unless a rule saved while the human decides turns it on.
+- **Deliverables:**
+  1. `[SERIAL]` core: the field, `checkPolicy`, and the line. `TestExecBlindSandbox` pins the field for every case (neither, request, policy, the symlinked, relative, and new homes, a sandbox dropped or added during approval), what the approver is shown, a denied approval, a block after an approval, and the raw `"sandbox":true` key; `TestCheckPolicyMatchesExecBlind` pins none on a `blocked_by: sandbox` entry. `TestOSApproval` pins `on` in the dialog literal and `off` for an empty request.
+  2. `[SERIAL]` `TestTelegramApproval` and `TestSlackApproval` pin the new line in their exact text; `TestMCPBridgeGovernanceTools` pins that `mintrun_audit` shows a seeded entry's `"sandbox":true` and none on the blocked one.
+  3. `[SERIAL]` Mutants on a copy of the repo (the new ones and rule 4's 13), each failing a test; the hermetic proof with logging stubs (rule 22).
+  4. `[SERIAL]` README, AGENTS.md rules 4, 16, 31, 34, and 43, `checks.md`, `progress.md`.
+- **Not built:** `AppApproval` sends the app the request's fields, not `ApprovalText`, and `appRequest` has no sandbox; X6 adds it when it wires the app into the CLI.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCheckPolicyMatchesExecBlind|TestExecBlindSandbox|TestOSApproval' ./internal/core
+  go test -count=1 -v -run 'TestTelegramApproval|TestSlackApproval|TestMCPBridgeGovernanceTools' ./internal/builtin
   ```
 
 ---
