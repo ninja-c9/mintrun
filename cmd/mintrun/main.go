@@ -109,6 +109,8 @@ func main() {
 		cmdDoctor(ctx, rt, os.Args[2:])
 	case "shim":
 		cmdShim(ctx, rt, os.Getenv("PATH"), os.Args[2:])
+	case "apps":
+		cmdApps(ctx, os.Args[2:])
 	case "-h", "--help", "help":
 		printUsage()
 	default:
@@ -357,6 +359,7 @@ Usage:
   mintrun init [step]                                         Set up secrets, approval, policy and IDEs step by step
   mintrun doctor                                              Check the setup without changing anything
   mintrun shim [list|install|remove] [tool...]                Intercept bare CLI calls (gh, aws, gcloud, wrangler, vercel, psql)
+  mintrun apps status|connect|disconnect [-app <list>]        Add mintrun to Claude Code, Claude Desktop or Cursor (JSON output)
   mintrun secret set <provider> [secret]                      Store master secret in OS Keychain vault
   mintrun secret check <provider>                             Verify secret exists without exposing value
   mintrun secret delete <provider>                            Delete master secret from vault
