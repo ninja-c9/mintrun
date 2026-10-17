@@ -221,6 +221,23 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
   go test -count=1 -v -run 'TestTelegramLink|TestTelegramApproval|TestSlackApproval' ./internal/builtin
   ```
 
+### Workstream N — Unreadable `policy.json` Fails Closed
+- **Files:** `internal/core/runner.go`, `internal/core/core_test.go`, `cmd/mintrun/setup.go`, `cmd/mintrun/setup_test.go`, `README.md`
+- **Bug:** `loadPolicyFile` returned on any `os.ReadFile` error, so a `policy.json` that exists but cannot be read (a directory, no read permission, an I/O error) left no rules and no `policyErr`, and every exec was allowed. `doctor` said so: "exec then allows every request".
+- **Design:**
+  - Only `os.Lstat` reporting `fs.ErrNotExist` means no policy. `Lstat`, because `ReadFile` reports a symlink to a missing file as `ErrNotExist` too, and that symlink is a policy the user meant to have.
+  - Any other read error sets `policyErr`, as malformed JSON does, so `CheckPolicy` (rule 16) and `ExecBlind` deny every request with the same reason. The reason and the `stderr` warning keep only the `*fs.PathError` cause, since the reason reaches agents and `audit.jsonl`.
+  - `doctorPolicy` decides "no policy" with the same `Lstat` and reports any other read error as a FAIL saying exec denies every request.
+- **Deliverables:**
+  1. `[SERIAL]` core: the `Lstat` check and the fail-closed read error; `TestCheckPolicyMatchesExecBlind` with a directory, a dangling symlink, a `chmod 000` file when not root, and a missing file that still allows.
+  2. `[SERIAL]` cli: `doctorPolicy` and `TestCLIDoctor` (a directory and a dangling symlink, each with the warning; `snapshot` records a symlink's target instead of reading it).
+  3. `[SERIAL]` Mutants on a copy of the repo: 7, one per condition (rule 36).
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCheckPolicyMatchesExecBlind' ./internal/core
+  go test -count=1 -v -run 'TestCLIDoctor' ./cmd/mintrun
+  ```
+
 ---
 
 ## 3. Deferred Backlog (Next Actionable Items)

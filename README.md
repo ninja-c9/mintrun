@@ -368,7 +368,7 @@ Restrict which domains, repositories, roles, or permissions an AI agent may touc
 }
 ```
 
-If `~/.mintrun/policy.json` exists but is malformed JSON, `mintrun` **fails closed** and denies every execution until the file is fixed.
+If `~/.mintrun/policy.json` exists but cannot be read (a directory, a file without read permission, a symlink to a missing file) or is malformed JSON, `mintrun` **fails closed**: it prints a warning and denies every execution until the file is fixed. Only a missing `policy.json` means no policy.
 
 **Child environment isolation:** `clean_env: true` (or any non-empty `allowed_env`) runs the command with only `PATH`, `HOME`, `TMPDIR`, `USER`, `LANG`, `TERM`, `SSL_CERT_FILE`, the `allowed_env` globs, and the lease env, so ambient host secrets such as `SSH_AUTH_SOCK` or other cloud keys never reach the child. A caller can request the same per run with `-clean-env` (CLI) or `clean_env` (MCP), but cannot switch off a policy that enables it. `MINTRUN_VAULT_KEY` is never passed to a child, even when allowlisted.
 
