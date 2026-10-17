@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/ninja-c9/mintrun/internal/core"
 )
 
 type exitPanic int
@@ -312,6 +315,29 @@ func TestCLISecretCheckConfigured(t *testing.T) {
 	want := `Secret "cloudflare" is configured in vault "keychain" (value hidden).` + "\n"
 	if r.code != 0 || r.out != want || r.err != "" {
 		t.Fatalf("got exit %d, stdout %q, stderr %q; want exit 0 and stdout %q", r.code, r.out, r.err, want)
+	}
+}
+
+// TestCLIExecSandbox: -sandbox runs the command behind sandbox-exec, which hands back the
+// command's exit code, and exec without it runs the command directly.
+func TestCLIExecSandbox(t *testing.T) {
+	home, _ := setupEnv(t)
+	writeFile(t, filepath.Join(home, ".mintrun", "policy.json"), `{"cloudflare":{"allow_static":true}}`)
+	setSecret(t, "cloudflare", "cf-"+leak)
+	stub := filepath.Join(home, "bin", "sandbox-exec")
+	writeFile(t, stub, stubLog+"while [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n")
+	if err := errors.Join(os.Chmod(stub, 0o755), os.MkdirAll(filepath.Join(home, "Library", "Keychains"), 0o700)); err != nil {
+		t.Fatal(err)
+	}
+	defer func(p string) { core.SandboxExecPath = p }(core.SandboxExecPath)
+	core.SandboxExecPath = stub
+	for _, flags := range [][]string{{"-sandbox"}, nil} {
+		r := runCLI(t, "", nil, append(append([]string{"exec"}, flags...), "-provider", "cloudflare", "-perms", "static", "--", "/bin/sh", "-c", "exit 7")...)
+		calls := takeCalls(t, home)
+		sandboxed := strings.HasPrefix(calls, "sandbox-exec -p (version 1)\n") && strings.HasSuffix(calls, " -- /bin/sh -c exit 7\n")
+		if r.code != 7 || !r.exited || sandboxed != (flags != nil) || flags == nil && calls != "" {
+			t.Errorf("%v: exit %d (exited %v), stderr %q, stub calls %q", flags, r.code, r.exited, r.err, calls)
+		}
 	}
 }
 

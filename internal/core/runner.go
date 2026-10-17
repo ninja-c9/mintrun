@@ -36,6 +36,7 @@ type ExecRequest struct {
 	TimeoutSec int      `json:"timeout_seconds,omitempty"`
 	Approve    bool     `json:"approve,omitempty"`   // Require interactive human-in-the-loop approval
 	CleanEnv   bool     `json:"clean_env,omitempty"` // Child gets only the base env + policy allowed_env + Lease.Env (can only tighten policy)
+	Sandbox    bool     `json:"sandbox,omitempty"`   // Run under sandbox-exec (macOS), away from mintrun's home and the Keychain (can only tighten policy)
 	Purpose    string   `json:"purpose,omitempty"`   // The agent's reason in plain words: shown to the approver, never trusted
 	// Set by mintrun, never by an agent: MCP arguments unmarshal straight into ExecRequest.
 	Client    string `json:"-"` // MCP clientInfo name, self-reported by the AI app
@@ -99,6 +100,7 @@ type PolicyRule struct {
 	CleanEnv             bool     `json:"clean_env,omitempty"`             // Force clean-env for every exec of this provider (audit M1)
 	AllowedEnv           []string `json:"allowed_env,omitempty"`           // Host env names (globs) a clean-env child keeps; non-empty implies clean_env
 	AllowedInstallations []string `json:"allowed_installations,omitempty"` // Exact params.installation_id values; non-empty requires a listed one
+	Sandbox              bool     `json:"sandbox,omitempty"`               // Run every exec of this provider under sandbox-exec (macOS only; denied elsewhere)
 }
 
 func matchPattern(pattern, value string) bool {
@@ -182,12 +184,7 @@ func (rt *Runtime) LoadPolicies() (map[string]PolicyRule, error) {
 	}
 	raw, err := os.ReadFile(p)
 	if err != nil {
-		// Keep only the cause, so the path never reaches an agent.
-		var pe *fs.PathError
-		if errors.As(err, &pe) {
-			err = pe.Err
-		}
-		return nil, err
+		return nil, pathCause(err) // the path must never reach an agent
 	}
 	var rules map[string]PolicyRule
 	if err := json.Unmarshal(raw, &rules); err != nil {
@@ -200,26 +197,29 @@ func (rt *Runtime) LoadPolicies() (map[string]PolicyRule, error) {
 type PolicyDecision struct {
 	Allowed          bool   `json:"allowed"`
 	Reason           string `json:"reason,omitempty"`     // Denial reason: the exact error ExecBlind returns
-	BlockedBy        string `json:"blocked_by,omitempty"` // Which check denied: invalid_request, paused, purpose, policy_file, env_dump, static, scope, permission, installation, command
+	BlockedBy        string `json:"blocked_by,omitempty"` // Which check denied: invalid_request, paused, purpose, policy_file, env_dump, static, scope, permission, installation, command, sandbox
 	ApprovalRequired bool   `json:"approval_required"`    // ExecBlind would ask a human (approve, require_approval, MINTRUN_APPROVE=1)
 	TTLSeconds       int    `json:"ttl_seconds"`          // Lease TTL requested from the provider after max_ttl_seconds and the 600s default
 	CleanEnv         bool   `json:"clean_env"`            // Child gets the clean env (request, policy clean_env, or allowed_env)
+	Sandbox          bool   `json:"sandbox"`              // Child runs under sandbox-exec (request or policy sandbox)
 }
 
 // CheckPolicy runs every static rule of the exec gate: request validation, the fail-closed
-// policy.json load, the anti-exfiltration guard, and the provider's policy rule. It never opens
-// a vault, mints, executes, or prompts a human. ExecBlind enforces this same verdict, so a dry
-// run and a real exec cannot drift.
+// policy.json load, the anti-exfiltration guard, the provider's policy rule, and whether a
+// sandbox that is on can be set up. It never opens a vault, mints, executes, or prompts a human.
+// ExecBlind enforces this same verdict, so a dry run and a real exec cannot drift.
 func (rt *Runtime) CheckPolicy(req ExecRequest) PolicyDecision {
-	d, _ := rt.decide(req)
+	d, _, _ := rt.decide(req)
 	return d
 }
 
 // decide is CheckPolicy plus the rule's allowed_env, so ExecBlind builds the child env from the
-// policy.json it checked. (A slice field would make PolicyDecision incomparable.)
-func (rt *Runtime) decide(req ExecRequest) (PolicyDecision, []string) {
-	deny := func(by, format string, a ...any) (PolicyDecision, []string) {
-		return PolicyDecision{Reason: fmt.Sprintf(format, a...), BlockedBy: by}, nil
+// policy.json it checked, and the sandbox-exec argv prefix ExecBlind runs the command behind (nil
+// when the sandbox is off), built here so nothing about it can fail after the mint. (A slice
+// field would make PolicyDecision incomparable.)
+func (rt *Runtime) decide(req ExecRequest) (PolicyDecision, []string, []string) {
+	deny := func(by, format string, a ...any) (PolicyDecision, []string, []string) {
+		return PolicyDecision{Reason: fmt.Sprintf(format, a...), BlockedBy: by}, nil, nil
 	}
 	if len(req.Command) == 0 {
 		return deny("invalid_request", "exec requires a non-empty command")
@@ -327,34 +327,123 @@ func (rt *Runtime) decide(req ExecRequest) (PolicyDecision, []string) {
 		req.TTLSeconds = 600
 	}
 
-	return PolicyDecision{
+	d := PolicyDecision{
 		Allowed:          true,
 		ApprovalRequired: req.Approve || (hasRule && rule.RequireApproval) || os.Getenv("MINTRUN_APPROVE") == "1",
 		TTLSeconds:       req.TTLSeconds,
 		CleanEnv:         req.CleanEnv || rule.CleanEnv || len(rule.AllowedEnv) > 0,
-	}, rule.AllowedEnv
+		Sandbox:          req.Sandbox || rule.Sandbox,
+	}
+	if !d.Sandbox {
+		return d, rule.AllowedEnv, nil
+	}
+	// Fail closed: a sandbox that is on but cannot be set up denies the request.
+	sandbox, err := sandboxArgv(rt.HomeDir)
+	if err != nil {
+		return deny("sandbox", "policy denied: sandbox is on, but %v", err)
+	}
+	return d, rule.AllowedEnv, sandbox
 }
 
-// checkPolicy enforces CheckPolicy's verdict on req (effective TTL, clean mode) and asks a
-// human through ApprovalFunc when the verdict requires approval. It returns the allowed_env of
-// the rule it enforced; e records why it denied.
-func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest, e *AuditEntry) ([]string, error) {
-	d, env := rt.decide(*req)
+// SandboxExecPath is the macOS sandbox runner a sandboxed exec goes through, a var so tests can
+// stub it; it is empty on every other OS, where the sandbox is a denial.
+var SandboxExecPath = func() string {
+	if runtime.GOOS == "darwin" {
+		return "/usr/bin/sandbox-exec"
+	}
+	return ""
+}()
+
+// sandboxProfile allows everything except mintrun's home, the Keychain folder, and the Mach
+// services the Security framework reaches the Keychain through.
+const sandboxProfile = `(version 1)
+(allow default)
+(deny file-read* file-write* (subpath (param "MINTRUN_DIR")))
+(deny file-read* file-write* (subpath (param "KEYCHAINS")))
+(deny mach-lookup
+  (global-name "com.apple.SecurityServer")
+  (global-name "com.apple.securityd.xpc")
+  (global-name "com.apple.securityd.general")
+  (global-name "com.apple.securityd.ckks")
+  (global-name "com.apple.securityd.aps")
+  (global-name "com.apple.securityd.sos")
+  (global-name "com.apple.security.octagon")
+  (global-name "com.apple.security.kcsharing")
+  (global-name "com.apple.security.escrow-update"))
+`
+
+// sandboxArgv returns the sandbox-exec argv the command goes behind. The profile matches real
+// paths, so both folders are made absolute and their symlinks resolved. A reason keeps only the
+// error's cause, never a path (rule 36): it reaches agents and audit.jsonl.
+func sandboxArgv(homeDir string) ([]string, error) {
+	if SandboxExecPath == "" {
+		return nil, errors.New("this host has no sandbox-exec (macOS only)")
+	}
+	if _, err := os.Stat(SandboxExecPath); err != nil {
+		return nil, fmt.Errorf("sandbox-exec cannot be used (%v)", pathCause(err))
+	}
+	dir, err := realDir(homeDir)
+	if err != nil {
+		return nil, fmt.Errorf("mintrun's home cannot be resolved (%v)", pathCause(err))
+	}
+	userHome, err := os.UserHomeDir()
+	keychains := ""
+	if err == nil {
+		keychains, err = realDir(filepath.Join(userHome, "Library", "Keychains"))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("the Keychain folder cannot be resolved (%v)", pathCause(err))
+	}
+	return []string{SandboxExecPath, "-p", sandboxProfile, "-D", "MINTRUN_DIR=" + dir, "-D", "KEYCHAINS=" + keychains, "--"}, nil
+}
+
+// pathCause drops the path from a *fs.PathError, keeping only its cause (rule 36).
+func pathCause(err error) error {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return pe.Err
+	}
+	return err
+}
+
+// realDir makes dir absolute and resolves its symlinks. A dir not created yet (a fresh install)
+// resolves through its parent; a missing parent or a dangling symlink fails.
+func realDir(dir string) (string, error) {
+	if dir == "" {
+		return "", errors.New("not set")
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Lstat(abs); errors.Is(err, fs.ErrNotExist) {
+		parent, err := filepath.EvalSymlinks(filepath.Dir(abs))
+		return filepath.Join(parent, filepath.Base(abs)), err
+	}
+	return filepath.EvalSymlinks(abs)
+}
+
+// checkPolicy enforces CheckPolicy's verdict on req (effective TTL, clean mode, sandbox) and asks
+// a human through ApprovalFunc when the verdict requires approval. It returns the allowed_env of
+// the rule it enforced and the sandbox-exec prefix (nil when the sandbox is off); e records why
+// it denied.
+func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest, e *AuditEntry) ([]string, []string, error) {
+	d, env, sandbox := rt.decide(*req)
 	if d.Allowed && d.ApprovalRequired {
-		req.TTLSeconds, req.CleanEnv = d.TTLSeconds, d.CleanEnv
+		req.TTLSeconds, req.CleanEnv, req.Sandbox = d.TTLSeconds, d.CleanEnv, d.Sandbox
 		if err := rt.approve(ctx, *req, e); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		// A pause or rule change made while the request waited for a human still applies. Fed
-		// the first verdict's TTL and clean mode, the second one can only tighten them.
-		d, env = rt.decide(*req)
+		// the first verdict's TTL, clean mode, and sandbox, the second one can only tighten them.
+		d, env, sandbox = rt.decide(*req)
 	}
 	if !d.Allowed {
 		e.Outcome, e.BlockedBy = "blocked", d.BlockedBy
-		return nil, errors.New(d.Reason)
+		return nil, nil, errors.New(d.Reason)
 	}
-	req.TTLSeconds, req.CleanEnv = d.TTLSeconds, d.CleanEnv
-	return env, nil
+	req.TTLSeconds, req.CleanEnv, req.Sandbox = d.TTLSeconds, d.CleanEnv, d.Sandbox
+	return env, sandbox, nil
 }
 
 // approve asks a human through ApprovalFunc. Only an allow returns nil; e records the outcome of
@@ -513,7 +602,7 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 		write(1, err.Error())
 		return nil, err
 	}
-	allowedEnv, err := rt.checkPolicy(ctx, &req, &e)
+	allowedEnv, sandbox, err := rt.checkPolicy(ctx, &req, &e)
 	if err != nil {
 		write(126, err.Error())
 		return nil, err
@@ -598,6 +687,12 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 	defer cancel()
 
 	cmd := exec.CommandContext(execCtx, req.Command[0], req.Command[1:]...)
+	if sandbox != nil {
+		// sandbox-exec execs the resolved command in place, so the pid, the process group, and the
+		// exit code are the command's; a failed lookup (cmd.Err) still fails Start first.
+		cmd.Args = append(append(sandbox, cmd.Path), req.Command[1:]...)
+		cmd.Path = sandbox[0]
+	}
 	killProcessGroup(cmd) // a timeout or cancel kills the child's whole process group (audit L2)
 	cmd.WaitDelay = PipeWaitDelay
 	if req.WorkingDir != "" {

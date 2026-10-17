@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -1091,6 +1092,39 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 		}
 	}
 
+	// A sandbox that is on but cannot be set up denies in both, naming the cause and never a path.
+	t.Run("sandbox", func(t *testing.T) {
+		userHome, stub, dangling := t.TempDir(), filepath.Join(t.TempDir(), "sandbox-exec"), filepath.Join(t.TempDir(), "home")
+		if err := errors.Join(os.MkdirAll(filepath.Join(userHome, "Library", "Keychains"), 0o700), os.WriteFile(stub, nil, 0o700), os.Symlink(dangling+".missing", dangling)); err != nil {
+			t.Fatal(err)
+		}
+		defer func(p string) { core.SandboxExecPath = p }(core.SandboxExecPath)
+		t.Chdir(t.TempDir()) // an unset home reads policy.json and the pause file from here
+		req := probe("ok.com", []string{"dns:read"}, "true")
+		req.Sandbox = true
+		for _, c := range []struct{ sandboxExec, home, userHome, cause string }{
+			{"", home, userHome, "this host has no sandbox-exec (macOS only)"},
+			{stub + ".missing", home, userHome, "sandbox-exec cannot be used (no such file or directory)"},
+			{stub, "", userHome, "mintrun's home cannot be resolved (not set)"},
+			{stub, filepath.Join(t.TempDir(), "missing", "home"), userHome, "mintrun's home cannot be resolved (no such file or directory)"},
+			{stub, dangling, userHome, "mintrun's home cannot be resolved (no such file or directory)"},
+			{stub, home, t.TempDir(), "the Keychain folder cannot be resolved (no such file or directory)"},
+			{stub, home, "", "the Keychain folder cannot be resolved ($HOME is not defined)"},
+		} {
+			core.SandboxExecPath = c.sandboxExec
+			t.Setenv("HOME", c.userHome)
+			srt := core.NewRuntime(c.home, "keychain", reg)
+			d := srt.CheckPolicy(req)
+			_, err := srt.ExecBlind(ctx, req)
+			if want := "policy denied: sandbox is on, but " + c.cause; d.Allowed || d.Reason != want || d.BlockedBy != "sandbox" || err == nil || err.Error() != want {
+				t.Errorf("%s: decision %+v, exec error %v, want both to deny with %q", c.cause, d, err, want)
+			}
+		}
+		if e := lastAudit(t, home); e.Outcome != "blocked" || e.BlockedBy != "sandbox" || e.ExitCode != 126 {
+			t.Errorf("sandbox denial entry: %+v", e)
+		}
+	})
+
 	// Approval: reported by the dry run without prompting; ExecBlind then asks exactly once.
 	gated := core.ExecRequest{MintRequest: core.MintRequest{Provider: "gated"}, Command: []string{"true"}, CleanEnv: true}
 	if d := rt.CheckPolicy(gated); !d.Allowed || !d.ApprovalRequired || d.TTLSeconds != 600 || !d.CleanEnv || approvals != 0 {
@@ -1118,6 +1152,160 @@ func probeRuntime(t *testing.T, master string) (*core.Runtime, string) {
 		t.Fatal(err)
 	}
 	return core.NewRuntime(home, "keychain", reg), home
+}
+
+// sandboxProfile is the profile a sandboxed exec must hand sandbox-exec, spelled out so a
+// dropped rule fails.
+const sandboxProfile = `(version 1)
+(allow default)
+(deny file-read* file-write* (subpath (param "MINTRUN_DIR")))
+(deny file-read* file-write* (subpath (param "KEYCHAINS")))
+(deny mach-lookup
+  (global-name "com.apple.SecurityServer")
+  (global-name "com.apple.securityd.xpc")
+  (global-name "com.apple.securityd.general")
+  (global-name "com.apple.securityd.ckks")
+  (global-name "com.apple.securityd.aps")
+  (global-name "com.apple.securityd.sos")
+  (global-name "com.apple.security.octagon")
+  (global-name "com.apple.security.kcsharing")
+  (global-name "com.apple.security.escrow-update"))
+`
+
+// sandboxStub points SandboxExecPath at a script that logs its arguments (NUL-separated, then
+// END) to a calls.log beside it and execs the command after "--", as sandbox-exec does. The log
+// sits by the script because clean mode strips the environment. calls returns the logged calls
+// and clears the log.
+func sandboxStub(t *testing.T) (calls func() [][]string) {
+	t.Helper()
+	dir := t.TempDir()
+	stub, log := filepath.Join(dir, "sandbox-exec"), filepath.Join(dir, "calls.log")
+	script := "#!/bin/sh\nprintf '%s\\0' \"$@\" END >>\"${0%/*}/calls.log\"\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n"
+	if err := os.WriteFile(stub, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	old := core.SandboxExecPath
+	core.SandboxExecPath = stub
+	t.Cleanup(func() { core.SandboxExecPath = old })
+	return func() [][]string {
+		t.Helper()
+		raw, err := os.ReadFile(log)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err := errors.Join(err, os.Remove(log)); err != nil {
+			t.Fatal(err)
+		}
+		var out [][]string
+		args := []string{}
+		for _, a := range strings.Split(strings.TrimSuffix(string(raw), "\x00"), "\x00") {
+			if a == "END" {
+				out, args = append(out, args), []string{}
+			} else {
+				args = append(args, a)
+			}
+		}
+		return out
+	}
+}
+
+// TestExecBlindSandbox pins the sandbox prefix: a request or policy sandbox runs the resolved
+// command behind sandbox-exec with the profile and both folders made absolute and real, the exit
+// code is the command's, the audit log keeps the command as asked, and a policy change while a
+// human approves can add the sandbox but never drop it.
+func TestExecBlindSandbox(t *testing.T) {
+	t.Setenv("MINTRUN_APPROVE", "")
+	ctx := context.Background()
+	calls := sandboxStub(t)
+	rt, home := probeRuntime(t, "sandbox_master_secret")
+	userHome := t.TempDir()
+	keychains := filepath.Join(userHome, "Library", "Keychains")
+	sh, err := exec.LookPath("sh")
+	if err := errors.Join(err, os.MkdirAll(keychains, 0o700)); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", userHome)
+	real := func(p string) string {
+		t.Helper()
+		r, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	save := func(rules string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(home, "policy.json"), []byte(rules), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// run execs req on r and checks the exit code and that sandbox-exec ran once with mintrun's
+	// home given as dir, or not at all when dir is empty.
+	run := func(name string, r *core.Runtime, req core.ExecRequest, dir string) {
+		t.Helper()
+		res, err := r.ExecBlind(ctx, req)
+		var want [][]string
+		if dir != "" {
+			want = [][]string{{"-p", sandboxProfile, "-D", "MINTRUN_DIR=" + dir, "-D", "KEYCHAINS=" + real(keychains), "--", sh, "-c", "exit 3"}}
+		}
+		if got := calls(); err != nil || res.ExitCode != 3 || !slices.EqualFunc(got, want, slices.Equal) {
+			t.Errorf("%s: res=%+v err=%v\nsandbox-exec calls %q\nwant %q", name, res, err, got, want)
+		}
+	}
+	req := core.ExecRequest{MintRequest: core.MintRequest{Provider: "probe"}, Command: []string{"sh", "-c", "exit 3"}}
+	asked := req
+	asked.Sandbox = true
+	for _, c := range []struct {
+		name, policy string
+		req          core.ExecRequest
+		dir          string
+	}{
+		{"neither", `{}`, req, ""},
+		{"request", `{}`, asked, real(home)},
+		{"policy", `{"probe":{"sandbox":true}}`, req, real(home)},
+	} {
+		save(c.policy)
+		if d := rt.CheckPolicy(c.req); !d.Allowed || d.Sandbox != (c.dir != "") {
+			t.Errorf("%s: decision %+v", c.name, d)
+		}
+		run(c.name, rt, c.req, c.dir)
+	}
+
+	// The profile matches real paths: a symlinked home resolves, and a relative one is made
+	// absolute, before and after the first audit entry creates it.
+	save(`{}`)
+	link := filepath.Join(t.TempDir(), "home")
+	if err := os.Symlink(home, link); err != nil {
+		t.Fatal(err)
+	}
+	run("symlinked home", core.NewRuntime(link, "keychain", rt.Registry), asked, real(home))
+	parent := t.TempDir()
+	t.Chdir(parent)
+	rel := core.NewRuntime("rel", "keychain", rt.Registry)
+	run("relative home not created yet", rel, asked, filepath.Join(real(parent), "rel"))
+	if _, err := os.Stat(filepath.Join(parent, "rel", "audit.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+	run("relative home", rel, asked, filepath.Join(real(parent), "rel"))
+
+	// The verdict after approval is fed the first one's sandbox: a rule dropped while a human
+	// approves keeps it, and a rule added then turns it on.
+	save(`{"probe":{"require_approval":true,"sandbox":true}}`)
+	rt.ApprovalFunc = func(context.Context, core.ExecRequest) (bool, error) { save(`{}`); return true, nil }
+	run("sandbox dropped during approval", rt, req, real(home))
+	save(`{"probe":{"require_approval":true}}`)
+	rt.ApprovalFunc = func(context.Context, core.ExecRequest) (bool, error) {
+		save(`{"probe":{"sandbox":true}}`)
+		return true, nil
+	}
+	run("sandbox added during approval", rt, req, real(home))
+
+	// The audit log keeps the command as asked, never the sandbox-exec prefix.
+	raw, err := os.ReadFile(filepath.Join(home, "audit.jsonl"))
+	if e := lastAudit(t, home); err != nil || !slices.Equal(e.Command, req.Command) ||
+		bytes.Contains(raw, []byte("sandbox-exec")) || bytes.Contains(raw, []byte("MINTRUN_DIR")) || bytes.Contains(raw, []byte("(version 1)")) {
+		t.Errorf("audit log names the sandbox prefix (err %v):\n%s", err, raw)
+	}
 }
 
 // TestExecBlindOutputCap covers audit L1: each stream keeps its first MaxOutputBytes, no byte of

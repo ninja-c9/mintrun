@@ -127,6 +127,7 @@ func cmdExec(ctx context.Context, rt *core.Runtime, args []string) {
 	cwd := fs.String("cwd", "", "Working directory for command")
 	approve := fs.Bool("approve", false, "Ask a human before minting: macOS dialog, plus Telegram or Slack when approval-telegram or approval-slack is set")
 	cleanEnv := fs.Bool("clean-env", false, "Run the command with only PATH/HOME/TMPDIR/USER/LANG/TERM/SSL_CERT_FILE, policy allowed_env, and the lease env")
+	sandbox := fs.Bool("sandbox", false, "Run the command in a macOS sandbox that cannot read mintrun's home or the Keychain")
 
 	var cmdArgs []string
 	var flagArgs []string
@@ -167,6 +168,7 @@ func cmdExec(ctx context.Context, rt *core.Runtime, args []string) {
 		WorkingDir: *cwd,
 		Approve:    *approve,
 		CleanEnv:   *cleanEnv,
+		Sandbox:    *sandbox,
 	})
 	if err != nil {
 		fatal("%v", err)
