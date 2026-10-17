@@ -87,8 +87,8 @@ func (m *MCPBridge) Serve(ctx context.Context, rt *core.Runtime, in io.Reader, o
 	return scanner.Err()
 }
 
-// clientName returns initialize's params.clientInfo.name with only [A-Za-z0-9._ ()-] kept, cut to
-// 64 bytes, or "" when the params hold no name.
+// clientName returns the shortLabel of initialize's params.clientInfo.name, or "" when the params
+// hold no name.
 func clientName(params json.RawMessage) string {
 	var p struct {
 		ClientInfo struct {
@@ -96,13 +96,18 @@ func clientName(params json.RawMessage) string {
 		} `json:"clientInfo"`
 	}
 	_ = json.Unmarshal(params, &p)
-	name := strings.Map(func(r rune) rune {
+	return shortLabel(p.ClientInfo.Name)
+}
+
+// shortLabel keeps only [A-Za-z0-9._ ()-] of s, then cuts it to 64 bytes.
+func shortLabel(s string) string {
+	s = strings.Map(func(r rune) rune {
 		if strings.ContainsRune("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._ ()-", r) {
 			return r
 		}
 		return -1
-	}, p.ClientInfo.Name)
-	return name[:min(len(name), 64)] // every kept character is one byte
+	}, s)
+	return s[:min(len(s), 64)] // every kept character is one byte
 }
 
 func (m *MCPBridge) handleRequest(ctx context.Context, rt *core.Runtime, req jsonRPCRequest, client string) jsonRPCResponse {
@@ -198,7 +203,7 @@ func (m *MCPBridge) handleRequest(ctx context.Context, rt *core.Runtime, req jso
 					},
 					{
 						"name":        "mintrun_audit",
-						"description": "Return recent entries of the mintrun_exec audit log, oldest first. Each command is cut to its binary name and no purpose is shown: a secret typed into argv is not one the runner can scrub, and a blocked request keeps the agent's text as written.",
+						"description": "Return recent entries of the mintrun_exec audit log, oldest first. Text an agent wrote is left out or cut down, since a secret typed into argv is not one the runner can scrub and each request is logged as the agent sent it: scope, permissions, and purpose are left out, an error shows as [MINTRUN:REDACTED] (outcome and blocked_by give the verdict), each command is cut to its binary name, and provider, binary, and client names keep only letters, digits, and ._ ()- up to 64 bytes.",
 						"inputSchema": map[string]any{
 							"type": "object",
 							"properties": map[string]any{
@@ -291,12 +296,14 @@ func (m *MCPBridge) handleToolCall(ctx context.Context, rt *core.Runtime, id jso
 }
 
 // readAudit returns the last limit (default 20, max 100) entries of audit.jsonl matching provider
-// (case-insensitive) and failedOnly, filtered like `mintrun audit`. Every command is cut to
-// argv[0]: policy-denied entries keep the raw argv (no secret is loaded yet to scrub against),
-// and a secret a human typed into argv is one the runner never holds, so arguments never reach
-// an agent. The purpose is blanked for the same reason: a blocked entry keeps the agent's raw
-// text, which one agent could use to slip text to another. The on-disk log keeps both for the
-// operator.
+// (case-insensitive) and failedOnly, filtered like `mintrun audit`. An entry keeps the request as
+// the agent sent it: one written before the master loads has no secret to scrub against, a
+// secret a human typed into argv is one the runner never holds, and a policy that allows `*`, or
+// has no rule for the provider, lets any scope and permission through. So that one agent cannot
+// pass free text to another, every entry's scope, permissions, and purpose are blanked, its error
+// becomes [MINTRUN:REDACTED] (outcome and blocked_by keep the verdict), its arguments become
+// [MINTRUN:REDACTED], and its provider and argv[0]'s base name are cut to a shortLabel, like the
+// client. The on-disk log keeps all of it for the operator.
 func readAudit(home, provider string, failedOnly bool, limit int) ([]core.AuditEntry, error) {
 	if limit <= 0 {
 		limit = 20
@@ -314,7 +321,14 @@ func readAudit(home, provider string, failedOnly bool, limit int) ([]core.AuditE
 		if len(e.Command) > 1 {
 			e.Command = []string{e.Command[0], core.RedactedPlaceholder}
 		}
-		e.Purpose = ""
+		if len(e.Command) > 0 {
+			e.Command[0] = shortLabel(filepath.Base(e.Command[0]))
+		}
+		e.Provider = shortLabel(e.Provider)
+		e.Scope, e.Permissions, e.Purpose = "", nil, ""
+		if e.Error != "" {
+			e.Error = core.RedactedPlaceholder
+		}
 		entries = append(entries, e)
 	})
 	if err != nil {
