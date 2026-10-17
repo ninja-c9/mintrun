@@ -36,6 +36,10 @@ var (
 // errNotFound marks a plain keystore miss, which falls back to the file vault quietly.
 var errNotFound = errors.New("not found")
 
+// ErrSecretNotFound is what KeychainVault.GetSecret wraps when no store holds the key, as
+// opposed to a store that could not be read.
+var ErrSecretNotFound = errors.New("not found in vault")
+
 // maxSecurityLine is the longest command line `security -i` reads intact (a 4 KiB fgets buffer,
 // newline included). Measured on macOS: a 4095-byte line stores the secret, while a 4097-byte
 // line is split, stores a corrupted item, and exits 1.
@@ -488,13 +492,13 @@ func (k *KeychainVault) writeMap(m map[string]string) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(k.vaultFilePath(), raw, 0o600)
+	return WriteFileAtomic(k.vaultFilePath(), raw, 0o600)
 }
 
-// writeFileAtomic writes to a temp file in the same directory, fsyncs it, then
-// renames over path, so a crash mid-write never leaves a truncated vault (audit L3).
-func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".vault-*.tmp")
+// WriteFileAtomic writes to a temp file in the same directory, fsyncs it, then
+// renames over path, so a crash mid-write never leaves a truncated file (audit L3).
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*.tmp")
 	if err != nil {
 		return err
 	}
@@ -527,7 +531,7 @@ func (k *KeychainVault) getFileSecret(key string) (string, error) {
 	}
 	v, ok := m[k.serviceName(key)]
 	if !ok || v == "" {
-		return "", fmt.Errorf("secret %q not found in vault", key)
+		return "", fmt.Errorf("secret %q %w", key, ErrSecretNotFound)
 	}
 	return v, nil
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -41,6 +42,79 @@ type telegramUpdate struct {
 			Date int64 `json:"date"`
 		} `json:"message"`
 	} `json:"callback_query"`
+	Message *struct {
+		Text string `json:"text"`
+		From struct {
+			ID        int64  `json:"id"`
+			FirstName string `json:"first_name"`
+			LastName  string `json:"last_name"`
+			Username  string `json:"username"`
+		} `json:"from"`
+	} `json:"message"`
+}
+
+// ParseTelegramConfig splits an approval-telegram value into the user ID and the bot token. The
+// error quotes neither cfg nor the parse error: both can hold the token.
+func ParseTelegramConfig(cfg string) (int64, string, error) {
+	user, token, _ := strings.Cut(strings.TrimSpace(cfg), ":")
+	userID, err := strconv.ParseInt(user, 10, 64)
+	if err != nil || userID <= 0 || !telegramTokenRe.MatchString(token) {
+		return 0, "", fmt.Errorf("%s must be <user_id>:<bot_token>", TelegramApprovalKey)
+	}
+	return userID, token, nil
+}
+
+// TelegramLink finds the user to ask: it shows a t.me link that carries a one-time code and waits
+// for the /start message with that code, so nobody else who messages the bot gets linked. It
+// returns the sender's ID and name. The offset never passes a callback query, which may answer a
+// request still waiting for it (see telegramApprove).
+func TelegramLink(ctx context.Context, token string, show func(link string)) (int64, string, error) {
+	if !telegramTokenRe.MatchString(token) {
+		return 0, "", errors.New("telegram: a bot token looks like <digits>:<letters, digits, _ or ->")
+	}
+	var me struct {
+		Username string `json:"username"`
+	}
+	if err := telegramCall(ctx, token, "getMe", map[string]any{}, &me); err != nil {
+		return 0, "", err
+	}
+	code := rand.Text()
+	show("https://t.me/" + me.Username + "?start=" + code)
+
+	pollCtx, cancel := context.WithTimeout(ctx, telegramTimeout)
+	defer cancel()
+	var offset int64
+	for pollCtx.Err() == nil {
+		var updates []telegramUpdate
+		err := telegramCall(pollCtx, token, "getUpdates", map[string]any{"offset": offset, "timeout": telegramPoll}, &updates)
+		if err != nil && strings.Contains(err.Error(), "webhook") {
+			return 0, "", err
+		}
+		blocked := false
+		for _, u := range updates {
+			if m := u.Message; m != nil && m.Text == "/start "+code {
+				name := strings.TrimSpace(m.From.FirstName + " " + m.From.LastName)
+				if m.From.Username != "" {
+					name += " (@" + m.From.Username + ")"
+				}
+				return m.From.ID, name, nil
+			}
+			blocked = blocked || u.CallbackQuery != nil
+			if !blocked {
+				offset = u.UpdateID + 1
+			}
+		}
+		if err != nil || blocked {
+			select {
+			case <-pollCtx.Done():
+			case <-time.After(telegramRetry):
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, "", err
+	}
+	return 0, "", fmt.Errorf("telegram: no /start with this link's code within %s", telegramTimeout)
 }
 
 // TelegramApproval asks through a Telegram bot: it messages the user named in the default vault's
@@ -59,11 +133,9 @@ func TelegramApproval(rt *core.Runtime) func(context.Context, core.ExecRequest) 
 		if err != nil {
 			return false, fmt.Errorf("telegram approval: not configured (mintrun secret set %s): %v", TelegramApprovalKey, err)
 		}
-		user, token, _ := strings.Cut(strings.TrimSpace(cfg), ":")
-		userID, err := strconv.ParseInt(user, 10, 64)
-		if err != nil || userID <= 0 || !telegramTokenRe.MatchString(token) {
-			// Neither cfg nor err is quoted: both can hold the token.
-			return false, fmt.Errorf("telegram approval: %s must be <user_id>:<bot_token>", TelegramApprovalKey)
+		userID, token, err := ParseTelegramConfig(cfg)
+		if err != nil {
+			return false, fmt.Errorf("telegram approval: %v", err)
 		}
 		return telegramApprove(ctx, token, userID, req)
 	}

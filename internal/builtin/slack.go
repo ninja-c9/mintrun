@@ -51,13 +51,22 @@ func SlackApproval(rt *core.Runtime) func(context.Context, core.ExecRequest) (bo
 		if err != nil {
 			return false, fmt.Errorf("slack approval: not configured (mintrun secret set %s): %v", SlackApprovalKey, err)
 		}
-		user, token, _ := strings.Cut(strings.TrimSpace(cfg), ":")
-		if !slackUserRe.MatchString(user) || !slackTokenRe.MatchString(token) {
-			// cfg is never quoted: it holds the token.
-			return false, fmt.Errorf("slack approval: %s must be <user_id>:<bot_token>", SlackApprovalKey)
+		user, token, err := ParseSlackConfig(cfg)
+		if err != nil {
+			return false, fmt.Errorf("slack approval: %v", err)
 		}
 		return slackApprove(ctx, token, user, req)
 	}
+}
+
+// ParseSlackConfig splits an approval-slack value into the member ID and the bot token. The error
+// never quotes cfg, which holds the token.
+func ParseSlackConfig(cfg string) (string, string, error) {
+	user, token, _ := strings.Cut(strings.TrimSpace(cfg), ":")
+	if !slackUserRe.MatchString(user) || !slackTokenRe.MatchString(token) {
+		return "", "", fmt.Errorf("%s must be <user_id>:<bot_token>", SlackApprovalKey)
+	}
+	return user, token, nil
 }
 
 func slackApprove(ctx context.Context, token, user string, req core.ExecRequest) (bool, error) {

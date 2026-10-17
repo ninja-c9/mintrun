@@ -430,7 +430,7 @@ func (g *GitHubProvider) Mint(ctx context.Context, masterSecret string, req core
 }
 
 func signGitHubAppJWT(appID, pemStr string) (string, error) {
-	key, err := parseRSAPrivateKey(pemStr)
+	key, err := ParseRSAPrivateKey(pemStr)
 	if err != nil {
 		return "", err
 	}
@@ -438,8 +438,8 @@ func signGitHubAppJWT(appID, pemStr string) (string, error) {
 	return signRS256(key, map[string]any{"iat": now - 60, "exp": now + 540, "iss": appID})
 }
 
-// parseRSAPrivateKey decodes a PKCS#1 or PKCS#8 RSA private key PEM (literal `\n` escapes allowed).
-func parseRSAPrivateKey(pemStr string) (*rsa.PrivateKey, error) {
+// ParseRSAPrivateKey decodes a PKCS#1 or PKCS#8 RSA private key PEM (literal `\n` escapes allowed).
+func ParseRSAPrivateKey(pemStr string) (*rsa.PrivateKey, error) {
 	block, _ := pem.Decode([]byte(strings.ReplaceAll(pemStr, `\n`, "\n")))
 	if block == nil {
 		return nil, errors.New("invalid PEM block")
@@ -783,7 +783,7 @@ func (g *GCPProvider) Mint(ctx context.Context, masterSecret string, req core.Mi
 	if json.Unmarshal([]byte(masterSecret), &sa) != nil || sa.ClientEmail == "" || sa.PrivateKey == "" {
 		return nil, errors.New(`gcp JIT mode needs a service-account JSON key with client_email and private_key (wrap an access token with the "static" permission instead)`)
 	}
-	key, err := parseRSAPrivateKey(sa.PrivateKey)
+	key, err := ParseRSAPrivateKey(sa.PrivateKey)
 	if err != nil {
 		return nil, fmt.Errorf("gcp service-account private_key: %w", err)
 	}

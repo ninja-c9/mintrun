@@ -24,6 +24,7 @@ func TestSlackApproval(t *testing.T) {
 	oldAPI, oldTimeout, oldPoll := slackAPI, slackTimeout, slackPoll
 	t.Cleanup(func() { slackAPI, slackTimeout, slackPoll = oldAPI, oldTimeout, oldPoll })
 	slackPoll = 10 * time.Millisecond
+	slackAPI = failingAPI(t) // the config checks below must refuse before sending anything
 
 	t.Setenv("MINTRUN_VAULT_KEY", "slack-test-passphrase")
 	home := t.TempDir()

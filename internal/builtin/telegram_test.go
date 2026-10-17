@@ -23,6 +23,7 @@ func TestTelegramApproval(t *testing.T) {
 		telegramAPI, telegramTimeout, telegramPoll, telegramRetry = oldAPI, oldTimeout, oldPoll, oldRetry
 	})
 	telegramPoll, telegramRetry = 0, 10*time.Millisecond
+	telegramAPI = failingAPI(t) // the config checks below must refuse before sending anything
 
 	t.Setenv("MINTRUN_VAULT_KEY", "telegram-test-passphrase")
 	home := t.TempDir()
@@ -213,5 +214,103 @@ func TestTelegramApproval(t *testing.T) {
 	long := telegramText(core.ExecRequest{Command: []string{strings.Repeat("é", 3000)}})
 	if len(long) > 3700 || !utf8.ValidString(long) || !strings.HasSuffix(long, "Deny unless you know the rest.") {
 		t.Fatalf("long request: %d bytes, valid UTF-8 %v, tail %q", len(long), utf8.ValidString(long), long[len(long)-40:])
+	}
+}
+
+// failingAPI returns the URL of a server that fails the test on any request, so code that must
+// refuse before sending anything never reaches a real API either.
+func failingAPI(t *testing.T) string {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+func TestTelegramLink(t *testing.T) {
+	const token = "123456:TEST-bot_tokenABC"
+	oldAPI, oldTimeout, oldPoll, oldRetry := telegramAPI, telegramTimeout, telegramPoll, telegramRetry
+	t.Cleanup(func() {
+		telegramAPI, telegramTimeout, telegramPoll, telegramRetry = oldAPI, oldTimeout, oldPoll, oldRetry
+	})
+	telegramPoll, telegramRetry, telegramTimeout = 0, 10*time.Millisecond, 5*time.Second
+	ctx := context.Background()
+
+	telegramAPI = failingAPI(t)
+	if _, _, err := TelegramLink(ctx, "SECRET/VALUE", func(string) { t.Error("showed a link for a malformed token") }); err == nil || strings.Contains(err.Error(), "SECRET") {
+		t.Fatalf("malformed token: got %v, want an error that quotes no secret", err)
+	}
+
+	msg := func(id, from int64, text string) map[string]any {
+		return map[string]any{"update_id": id, "message": map[string]any{"text": text,
+			"from": map[string]any{"id": from, "first_name": "Ada", "last_name": "Lovelace", "username": "ada"}}}
+	}
+	tap := map[string]any{"update_id": 11, "callback_query": map[string]any{"id": "cb", "data": "allow:LIVE"}}
+	var (
+		mu      sync.Mutex
+		code    string
+		offsets []int64
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Offset int64 `json:"offset"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		defer mu.Unlock()
+		var result any
+		switch r.URL.Path {
+		case "/bot" + token + "/getMe":
+			result = map[string]any{"username": "mintrun_test_bot"}
+		case "/bot" + token + "/getUpdates":
+			offsets = append(offsets, body.Offset)
+			// A stranger's guess, a tap another request still waits for, and a /start with no code;
+			// then the tap again and this link's /start.
+			result = []map[string]any{msg(10, 666, "/start WRONGCODE"), tap, msg(12, 4242, "/start")}
+			if len(offsets) > 1 {
+				result = []map[string]any{tap, msg(13, 4242, "/start "+code)}
+			}
+		default:
+			t.Errorf("unexpected request %s", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": result})
+	}))
+	defer srv.Close()
+	telegramAPI = srv.URL
+	id, name, err := TelegramLink(ctx, token, func(link string) {
+		mu.Lock()
+		defer mu.Unlock()
+		c, ok := strings.CutPrefix(link, "https://t.me/mintrun_test_bot?start=")
+		if !ok || len(c) != 26 {
+			t.Errorf("link %q, want https://t.me/<bot>?start=<26-character code>", link)
+		}
+		code = c
+	})
+	if err != nil || id != 4242 || name != "Ada Lovelace (@ada)" {
+		t.Fatalf("got (%d, %q, %v), want the sender of this link's /start", id, name, err)
+	}
+	if !slices.Equal(offsets, []int64{0, 11}) {
+		t.Errorf("offsets %v, want [0 11]: past the stranger's message, never past the tap", offsets)
+	}
+
+	// A webhook ends the wait at once, and silence ends it at the timeout.
+	telegramTimeout = 100 * time.Millisecond
+	for _, tc := range []struct{ reply, err string }{
+		{`{"ok":false,"description":"Conflict: can't use getUpdates method while webhook is active"}`, "webhook is active"},
+		{`{"ok":true,"result":[]}`, "no /start with this link's code within 100ms"},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/getMe") {
+				_, _ = w.Write([]byte(`{"ok":true,"result":{"username":"b"}}`))
+				return
+			}
+			_, _ = w.Write([]byte(tc.reply))
+		}))
+		telegramAPI = srv.URL
+		_, _, err := TelegramLink(ctx, token, func(string) {})
+		srv.Close()
+		if err == nil || !strings.Contains(err.Error(), tc.err) {
+			t.Fatalf("got %v, want %q", err, tc.err)
+		}
 	}
 }
