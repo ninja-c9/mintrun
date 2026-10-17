@@ -1526,6 +1526,17 @@ func TestMCPBridgeGovernanceTools(t *testing.T) {
 			t.Fatalf("policy_check %d: got %+v, want %+v", i, d, want)
 		}
 	}
+	// The keys are what the tool description promises agents, and decoding into the struct that
+	// encoded them cannot see a renamed one, so one reply is pinned whole.
+	if got := text(r[1]); got != `{
+  "allowed": true,
+  "approval_required": false,
+  "ttl_seconds": 120,
+  "clean_env": false,
+  "sandbox": false
+}` {
+		t.Fatalf("policy_check reply drifted:\n%s", got)
+	}
 	// Denied: the reason is the exact error mintrun_exec returns for the same request.
 	if d := decision(r[4]); d.Allowed || !strings.Contains(d.Reason, "not in allowed_scopes") || r[7].Result.Content[0].Text != "mintrun execution error: "+d.Reason {
 		t.Fatalf("scope denial drifted from mintrun_exec: %+v vs %q", d, r[7].Result.Content[0].Text)
