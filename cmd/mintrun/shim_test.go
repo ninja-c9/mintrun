@@ -68,10 +68,19 @@ func TestCLIShim(t *testing.T) {
 		}
 		osExecutable = origExe
 
+		// Pre-create .zprofile with an existing line to verify it is preserved and updated.
+		writeFile(t, filepath.Join(home, ".zprofile"), "export PATH=\"/usr/local/bin:$PATH\"\n")
+
 		// Install all default shims (block mode).
 		r = runCLI(t, "", nil, "shim", "install")
-		if r.exited || !strings.Contains(r.out, "Installed block shim(s)") || !strings.Contains(r.out, "export PATH=") {
+		if r.exited || !strings.Contains(r.out, "Installed block shim(s)") || !strings.Contains(r.out, "export PATH=") || !strings.Contains(r.out, "~/.zshenv") || !strings.Contains(r.out, "~/.zshrc") {
 			t.Fatalf("shim install all:\n%s%s", r.out, r.err)
+		}
+		for _, rc := range []string{".zshenv", ".zshrc", ".zprofile"} {
+			data, err := os.ReadFile(filepath.Join(home, rc))
+			if err != nil || !strings.Contains(string(data), shimProfileMarker) || !strings.Contains(string(data), dir) {
+				t.Errorf("%s not wired with shim PATH: err=%v\n%s", rc, err, data)
+			}
 		}
 		for _, name := range append(shimToolNames(), "mintrun") {
 			fi, err := os.Lstat(filepath.Join(dir, name))
@@ -99,9 +108,22 @@ func TestCLIShim(t *testing.T) {
 		if _, err := os.Lstat(filepath.Join(dir, "gh")); !os.IsNotExist(err) {
 			t.Errorf("gh symlink still exists: %v", err)
 		}
+		// Other shims remain, so .zshrc still has the marker.
+		if data, _ := os.ReadFile(filepath.Join(home, ".zshrc")); !strings.Contains(string(data), shimProfileMarker) {
+			t.Errorf(".zshrc marker removed while other shims still installed")
+		}
 		r = runCLI(t, "", nil, "shim", "remove")
 		if r.exited {
 			t.Fatalf("shim remove all:\n%s%s", r.out, r.err)
+		}
+		for _, rc := range []string{".zshenv", ".zshrc", ".zprofile"} {
+			data, err := os.ReadFile(filepath.Join(home, rc))
+			if err != nil || strings.Contains(string(data), shimProfileMarker) {
+				t.Errorf("%s still contains shim marker after removing all shims: err=%v\n%s", rc, err, data)
+			}
+		}
+		if zprof, _ := os.ReadFile(filepath.Join(home, ".zprofile")); !strings.Contains(string(zprof), "/usr/local/bin") {
+			t.Errorf(".zprofile lost original line:\n%s", zprof)
 		}
 		// Refuses when <home>/shims/gh is a directory.
 		if err := os.Remove(filepath.Join(dir, "gh")); err != nil && !os.IsNotExist(err) {

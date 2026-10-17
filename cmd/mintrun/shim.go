@@ -324,7 +324,14 @@ func shimInstall(rt *core.Runtime, origPath string, args []string) {
 	if err := writeShimConfig(rt.HomeDir, cfg); err != nil {
 		fatal("write shim config: %v", err)
 	}
+	updated, err := ensureShimShellProfiles(dir)
+	if err != nil {
+		fatal("update shell profile: %v", err)
+	}
 	fmt.Printf("Installed %s shim(s) in %s (%s).\n", *mode, dir, strings.Join(tools, ", "))
+	if len(updated) > 0 {
+		fmt.Printf("Added %s to PATH in %s.\n", dir, strings.Join(updated, ", "))
+	}
 	if !shimFirstOnPath(tools[0], origPath, dir) {
 		fmt.Printf("Put %s first on PATH in your shell profile:\n  export PATH=%s:\"$PATH\"\n", dir, shellQuote(dir))
 	}
@@ -356,7 +363,116 @@ func shimRemove(rt *core.Runtime, args []string) {
 			fatal("write shim config: %v", err)
 		}
 	}
+	if !anyShimInstalled(dir) {
+		if _, err := removeShimShellProfiles(); err != nil {
+			fatal("clean shell profile: %v", err)
+		}
+	}
 	fmt.Printf("Removed shim(s): %s.\n", strings.Join(tools, ", "))
+}
+
+const shimProfileMarker = "# mintrun-shim"
+
+func anyShimInstalled(dir string) bool {
+	for _, t := range shimTargets {
+		if fi, err := os.Lstat(filepath.Join(dir, t.tool)); err == nil && fi.Mode()&fs.ModeSymlink != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func ensureShimShellProfiles(shims string) ([]string, error) {
+	userHome, err := os.UserHomeDir()
+	if err != nil || userHome == "" {
+		return nil, nil
+	}
+	line := fmt.Sprintf("export PATH=%s:\"$PATH\" %s", shellQuote(shims), shimProfileMarker)
+	candidates := []struct {
+		name   string
+		create bool
+	}{
+		{".zshenv", true},
+		{".zshrc", true},
+		{".zprofile", false},
+		{".bashrc", false},
+	}
+	var updated []string
+	for _, c := range candidates {
+		p := filepath.Join(userHome, c.name)
+		mode := fs.FileMode(0o600)
+		data, err := os.ReadFile(p)
+		if err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				return nil, err
+			}
+			if !c.create {
+				continue
+			}
+		} else if fi, statErr := os.Stat(p); statErr == nil {
+			mode = fi.Mode().Perm()
+		}
+		var kept []string
+		for _, ln := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+			if ln == "" && len(kept) == 0 && len(data) == 0 {
+				continue
+			}
+			if strings.Contains(ln, shimProfileMarker) {
+				continue
+			}
+			kept = append(kept, ln)
+		}
+		kept = append(kept, line)
+		out := strings.Join(kept, "\n") + "\n"
+		if string(data) != out {
+			if err := builtin.WriteFileAtomic(p, []byte(out), mode); err != nil {
+				return nil, err
+			}
+			updated = append(updated, "~/"+c.name)
+		}
+	}
+	return updated, nil
+}
+
+func removeShimShellProfiles() ([]string, error) {
+	userHome, err := os.UserHomeDir()
+	if err != nil || userHome == "" {
+		return nil, nil
+	}
+	var cleaned []string
+	for _, name := range []string{".zshenv", ".zshrc", ".zprofile", ".bashrc"} {
+		p := filepath.Join(userHome, name)
+		data, err := os.ReadFile(p)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			return nil, err
+		}
+		if !strings.Contains(string(data), shimProfileMarker) {
+			continue
+		}
+		mode := fs.FileMode(0o600)
+		if fi, statErr := os.Stat(p); statErr == nil {
+			mode = fi.Mode().Perm()
+		}
+		var kept []string
+		for _, ln := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+			if strings.Contains(ln, shimProfileMarker) {
+				continue
+			}
+			kept = append(kept, ln)
+		}
+		out := ""
+		if len(kept) > 0 && !(len(kept) == 1 && kept[0] == "") {
+			out = strings.Join(kept, "\n") + "\n"
+		}
+		if err := builtin.WriteFileAtomic(p, []byte(out), mode); err != nil {
+			return nil, err
+		}
+		cleaned = append(cleaned, "~/"+name)
+	}
+	return cleaned, nil
 }
 
 // runShim handles an invocation where argv[0] is a shimmed CLI name (gh, aws, gcloud, wrangler,
