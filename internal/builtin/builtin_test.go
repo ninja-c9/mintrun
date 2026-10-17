@@ -1588,6 +1588,48 @@ func TestMCPBridgeGovernanceTools(t *testing.T) {
 	}
 }
 
+// TestMCPBridgeAuditUnreadable calls mintrun_audit on an audit.jsonl that exists but cannot be
+// read: a directory fails in TailAudit's read, and a file without read permission (which root
+// reads anyway) fails at the open. The agent gets the cause, never the path, which names the home
+// (rule 36).
+func TestMCPBridgeAuditUnreadable(t *testing.T) {
+	unreadable := map[string]func(p string) error{
+		"is a directory": func(p string) error { return os.Mkdir(p, 0o700) },
+	}
+	if os.Geteuid() > 0 {
+		unreadable["permission denied"] = func(p string) error {
+			if err := os.WriteFile(p, []byte("{}\n"), 0o600); err != nil {
+				return err
+			}
+			return os.Chmod(p, 0)
+		}
+	}
+	req := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mintrun_audit","arguments":{}}}` + "\n"
+	for cause, setup := range unreadable {
+		home := t.TempDir()
+		if err := setup(filepath.Join(home, "audit.jsonl")); err != nil {
+			t.Fatal(err)
+		}
+		var out bytes.Buffer
+		if err := NewMCPBridge().Serve(context.Background(), core.NewRuntime(home, "keychain", core.NewRegistry()), strings.NewReader(req), &out); err != nil {
+			t.Fatal(err)
+		}
+		var resp struct {
+			Result struct {
+				IsError bool                    `json:"isError"`
+				Content []struct{ Text string } `json:"content"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if want := "read audit log: " + cause; !resp.Result.IsError || len(resp.Result.Content) != 1 ||
+			resp.Result.Content[0].Text != want || strings.Contains(out.String(), home) {
+			t.Fatalf("%s: got %s, want the tool error %q and no path", cause, out.String(), want)
+		}
+	}
+}
+
 // TestMCPBridgeExecCleanEnv runs a successful mintrun_exec with clean_env over JSON-RPC. The
 // policy allows static mode but does not force clean mode, so only the request's clean_env can
 // strip the host variable. The child prints the lease token: the agent must see only the

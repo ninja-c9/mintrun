@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -313,7 +315,7 @@ func readAudit(home, provider string, failedOnly bool, limit int) ([]core.AuditE
 		return []core.AuditEntry{}, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read audit log: %v", err)
+		return nil, auditReadError(err)
 	}
 	defer f.Close()
 	entries := []core.AuditEntry{}
@@ -332,9 +334,19 @@ func readAudit(home, provider string, failedOnly bool, limit int) ([]core.AuditE
 		entries = append(entries, e)
 	})
 	if err != nil {
-		return nil, fmt.Errorf("read audit log: %v", err)
+		return nil, auditReadError(err)
 	}
 	return entries, nil
+}
+
+// auditReadError keeps only the cause of a *fs.PathError, whose path names the home: the text
+// reaches the agent (rule 36).
+func auditReadError(err error) error {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		err = pe.Err
+	}
+	return fmt.Errorf("read audit log: %v", err)
 }
 
 func toolTextResult(id json.RawMessage, text string, isError bool) jsonRPCResponse {
