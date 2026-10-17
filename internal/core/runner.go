@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/url"
 	"os"
 	"os/exec"
@@ -109,7 +110,7 @@ type Runtime struct {
 	Registry     *Registry
 	Policies     map[string]PolicyRule
 	ApprovalFunc func(ctx context.Context, req ExecRequest) (bool, error)
-	policyErr    error // Non-nil if policy.json exists but failed to parse → every exec fails closed.
+	policyErr    error // Non-nil if policy.json exists but cannot be read or parsed → every exec fails closed.
 }
 
 func NewRuntime(homeDir, defaultVault string, reg *Registry) *Runtime {
@@ -133,8 +134,21 @@ func (rt *Runtime) PluginsDir() string {
 
 func (rt *Runtime) loadPolicyFile() {
 	p := filepath.Join(rt.HomeDir, "policy.json")
+	// Only a missing policy.json means no rules. Lstat, so a symlink to a missing file still
+	// counts as a policy that cannot be read.
+	if _, err := os.Lstat(p); errors.Is(err, fs.ErrNotExist) {
+		return
+	}
 	raw, err := os.ReadFile(p)
 	if err != nil {
+		// Fail closed: a policy that cannot be read (a directory, no permission, an I/O error)
+		// denies every exec. Keep only the cause, so the path never reaches an agent.
+		var pe *fs.PathError
+		if errors.As(err, &pe) {
+			err = pe.Err
+		}
+		rt.policyErr = err
+		fmt.Fprintf(os.Stderr, "mintrun: WARNING: policy.json cannot be read (%v); denying all exec until fixed\n", err)
 		return
 	}
 	if err := json.Unmarshal(raw, &rt.Policies); err != nil {
@@ -169,7 +183,7 @@ func (rt *Runtime) CheckPolicy(req ExecRequest) PolicyDecision {
 		return deny("exec requires a provider name")
 	}
 
-	// Fail closed: a policy.json that exists but failed to parse denies everything.
+	// Fail closed: a policy.json that exists but cannot be read or parsed denies everything.
 	if rt.policyErr != nil {
 		return deny("policy denied: policy.json failed to load (%v)", rt.policyErr)
 	}

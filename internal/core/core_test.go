@@ -937,6 +937,42 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 		}
 	}
 
+	// Only a missing policy.json means no policy. One that exists but cannot be read (a directory,
+	// a symlink to a missing file, a file without read permission, which root reads anyway) denies
+	// with the same reason in both, quoting the cause and never the path.
+	unreadable := map[string]func(p string) error{
+		"is a directory":            func(p string) error { return os.Mkdir(p, 0o700) },
+		"no such file or directory": func(p string) error { return os.Symlink(p+".missing", p) },
+	}
+	if os.Geteuid() > 0 {
+		unreadable["permission denied"] = func(p string) error {
+			if err := os.WriteFile(p, []byte("{}"), 0o600); err != nil {
+				return err
+			}
+			return os.Chmod(p, 0)
+		}
+	}
+	dnsRead := probe("ok.com", []string{"dns:read"}, "true")
+	for cause, setup := range unreadable {
+		dir := t.TempDir()
+		if err := setup(filepath.Join(dir, "policy.json")); err != nil {
+			t.Fatal(err)
+		}
+		urt := core.NewRuntime(dir, "keychain", reg)
+		d := urt.CheckPolicy(dnsRead)
+		_, err := urt.ExecBlind(ctx, dnsRead)
+		if want := "policy denied: policy.json failed to load (" + cause + ")"; d.Allowed || d.Reason != want || err == nil || err.Error() != want {
+			t.Fatalf("%s: decision %+v, exec error %v, want both to deny with %q", cause, d, err, want)
+		}
+	}
+	open := core.NewRuntime(t.TempDir(), "keychain", reg)
+	if d := open.CheckPolicy(dnsRead); !d.Allowed {
+		t.Fatalf("a missing policy.json must allow: %+v", d)
+	}
+	if res, err := open.ExecBlind(ctx, dnsRead); err != nil || res.ExitCode != 0 {
+		t.Fatalf("a missing policy.json must allow: res=%+v err=%v", res, err)
+	}
+
 	// Allowed: the listed installation mints, max_ttl_seconds caps the TTL (also an unset one),
 	// allowed_env forces clean mode.
 	for _, tc := range []struct{ ttl, want int }{{0, 120}, {300, 120}, {60, 60}} {
