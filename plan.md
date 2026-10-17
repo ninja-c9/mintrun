@@ -238,6 +238,21 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
   go test -count=1 -v -run 'TestCLIDoctor' ./cmd/mintrun
   ```
 
+### Workstream O — A Missing Secret Names Its Fix
+- **Files:** `internal/builtin/keychain.go`, `internal/builtin/telegram.go`, `internal/builtin/slack.go`, `internal/core/runner.go`, `internal/builtin/builtin_test.go`, `internal/builtin/telegram_test.go`, `internal/builtin/slack_test.go`
+- **Design:**
+  - The file vault's miss ends with `(run mintrun init <step>)` for a key `mintrun init` stores (`github`, `aws`, `gcp`, `cloudflare`; `approval-telegram` is the `telegram` step and `approval-slack` the `slack` step) and `(run mintrun secret set <key>)` for any other, folding case and spaces as the vault does. It still wraps `ErrSecretNotFound`, which `doctor` reads as not set.
+  - Only the vault can tell a miss from a failure, so callers add no hint. `ExecBlind` drops the `secret set` hint it added to every vault error, which a miss would now repeat and which told a user with a wrong `MINTRUN_VAULT_KEY` to store the secret again; the Telegram and Slack approvals drop theirs.
+  - 1Password adds none: `op` fails the same way for a miss, a locked or signed-out account, and an ambiguous title, its `stderr` has never been checked against a real `op` (rule 28), and the error already quotes that `stderr`, scrubbed. A plugin vault's error keeps its own text (`bitwarden` names `bw sync`).
+- **Deliverables:**
+  1. `[SERIAL]` `setupHint` in the file vault, and the callers' hints removed.
+  2. `[SERIAL]` `TestSecretNotFoundHint` and the exact not-configured errors in `TestTelegramApproval` and `TestSlackApproval`; mutants run on a copy of the repo.
+- **Not built:** `secret check` still prints only `NOT configured` and drops the error, so it shows neither the hint nor a vault failure; `init` and `secret set` store into the default vault, so with `MINTRUN_VAULT` naming another vault, a request that picks `keychain` gets a command that stores elsewhere.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestSecretNotFoundHint|TestTelegramApproval|TestSlackApproval' ./internal/builtin
+  ```
+
 ---
 
 ## 3. Deferred Backlog (Next Actionable Items)
