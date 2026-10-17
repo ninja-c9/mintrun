@@ -472,7 +472,7 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
   1. `[SERIAL]` The field, and the comment above `appRequest` that says it is mintrun's verdict.
   2. `[SERIAL]` `TestAppApproval` compares the exact request line with the sandbox off (`Approve`, `CleanEnv`, and `FromAgent` on) and on (those three off), so a field taken from another flag fails.
   3. `[SERIAL]` Mutants on a copy, each built first and each failing the test; the pipeline and the hermetic proof in a `git archive` export; AGENTS.md rule 42, `checks.md`, `progress.md`. README never describes the app socket, so it does not change.
-- **Not built:** the macOS app is not in this repo, and it must show the field (`progress.md`). Nothing in `cmd/mintrun` calls `AppApproval` yet (X6).
+- **Not built:** the macOS app is not in this repo, and it must show the field (`progress.md`). Nothing in `cmd/mintrun` called `AppApproval` then; X7 wires it in (Workstream X, Phase 3).
 - **Verification:**
   ```bash
   go test -count=1 -v -run 'TestAppApproval|TestAppTrack' ./internal/builtin
@@ -550,7 +550,7 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
 - **Order:**
   - Phase 1: `[SERIAL]` X0 → X2 → X5 → X1a → X4 → X8, all in `internal/core/runner.go` and `internal/core/core_test.go`. Built on 2026-10-17; the evidence is in [checks.md](checks.md) (Workstream X, Phase 1).
   - Phase 2: `[PARALLEL]` X1b and X3, which need Phase 1's fields. Their files are disjoint but compile as one package, so each runs in its own worktree and they merge one at a time, with `go test -count=1 ./internal/builtin` after each merge. Built on 2026-10-17, with X3b (agent-written text kept out of `mintrun_audit`) and the fork-race fix (rule 20), and brought up to date with `main` through its shim profile fix; the evidence is in [checks.md](checks.md) (Workstream X, Phase 2).
-  - Phase 3, now that Workstream M has landed (it edits `cmd/mintrun/main.go`, `README.md`, and `internal/builtin/telegram.go` and `slack.go` with their tests, and exports what X6 reuses): `[PARALLEL]` X1c alongside `[SERIAL]` X6 → X7; then the docs and the full §1 pipeline.
+  - Phase 3, now that Workstream M has landed (it edits `cmd/mintrun/main.go`, `README.md`, and `internal/builtin/telegram.go` and `slack.go` with their tests, and exports what X6 reuses): `[PARALLEL]` X1c alongside `[SERIAL]` X6 → X7; then the docs and the full §1 pipeline. Built on 2026-10-17 in one worktree, X1c first; the evidence is in [checks.md](checks.md) (Workstream X, Phase 3). `appRequest` carries the sandbox since App Socket Sends the Sandbox (section 2); the macOS app must show it.
 - Every check runs with `-v`, and each new test must show `--- PASS` (rule 15). On 2026-10-17, `go test -list` showed each check's regex selecting the existing tests it names, and none of the new test names exists yet.
 - **Merging Phase 1:** merge X3 first or together with it, because until X3, `mintrun_audit` hands agents the `purpose` an agent wrote. Workstream M's `cmd/mintrun/setup.go` reads `Runtime.Policies`, which X8 removed: in `policy()`, replace `if _, ok := w.rt.Policies["github"]; ok {` with `rules, _ := w.rt.LoadPolicies()` and `if _, ok := rules["github"]; ok {` (verified on a trial merge). `doctorPolicy` should call `rt.LoadPolicies()` too: after X8 its FAIL text (`exec then allows every request`) is wrong, since a file that fails to load now denies every exec.
 
@@ -668,7 +668,7 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
   ```bash
   go test -count=1 -v -run 'TestCLIApps' ./cmd/mintrun
   ```
-  The tests pass `-command`, because test binaries live under `os.TempDir()`, and point `HOME`, `XDG_CONFIG_HOME`, and `PATH` (a stub `claude` that logs its argv) at temporary directories.
+  The tests run in `setupEnv`'s fake `HOME`: `HOME` and `PATH` (a stub `claude` that logs its argv) are temporary directories, and `XDG_CONFIG_HOME` is cleared, so every config path falls under that `HOME`. Most pass `-command`; `os.Executable` is stubbed for the default command and the `go run` refusal.
 
 ### X7 — Settings and Wiring
 - **Files:** `cmd/mintrun/main.go`, `cmd/mintrun/main_test.go`
@@ -690,7 +690,7 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
   printf 'm/apps.go:1:\tf\t0.0%%\n' | grep -E '/(appbroker|apps)\.go:' | grep -c -E '[[:space:]]0\.0%$'   # must print 1 (planted control)
   rm -f coverage.out
   ```
-- The installer tests set `HOME`, `XDG_CONFIG_HOME`, and `PATH` to temporary directories (rule 22). To prove it, run the suite with an empty `HOME` and check that no file appears in it outside Go's own caches, then plant a write with the rebuilt binary as the positive control. On 2026-10-17 the first line printed nothing on this tree, and a planted `.cursor/mcp.json` printed:
+- The installer tests set `HOME` and `PATH` to temporary directories and clear `XDG_CONFIG_HOME` (rule 22). To prove it, run the suite with an empty `HOME` and check that no file appears in it outside Go's own caches, then plant a write with the rebuilt binary as the positive control. On 2026-10-17 the first line printed nothing on this tree, and a planted `.cursor/mcp.json` printed:
   ```bash
   S="$(mktemp -d)"; GOCACHE="$(go env GOCACHE)" GOMODCACHE="$(go env GOMODCACHE)" GOPATH="$(go env GOPATH)" HOME="$S" go test -count=1 ./... && find "$S" -type f -not -path "$S/Library/Caches/*" -not -path "$S/Library/Application Support/go/*"   # must print nothing
   mkdir "$S/.cursor" && HOME="$S" ./mintrun apps connect -app cursor && find "$S" -type f -not -path "$S/Library/Caches/*" -not -path "$S/Library/Application Support/go/*"   # must list .cursor/mcp.json
@@ -712,7 +712,7 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
 
 ### Docs and Rules (Phase 3)
 - README: approval (the app channel, the timeout), the MCP tools table (`purpose`, the new audit fields), pause, stop, `mintrun apps`, `settings.json`, and the points above.
-- AGENTS.md: Phase 1 amended rules 4 (the `Purpose` and `Client` lines), 8 (one entry per exit), 16 (pause, purpose, and the policy reload in `CheckPolicy`), 20 (the `Track` stop), 22 (mutants must compile; stubs `exec` their helper), and 31 (the deadline). Phase 3 adds the app channel to rule 31 and the Expired text to rule 34, and new rules after Workstream M's rule 35, one per hook, written from what the tests pinned.
+- AGENTS.md: Phase 1 amended rules 4 (the `Purpose` and `Client` lines), 8 (one entry per exit), 16 (pause, purpose, and the policy reload in `CheckPolicy`), 20 (the `Track` stop), 22 (mutants must compile; stubs `exec` their helper), and 31 (the deadline). Phase 3 adds the app channel to rule 31 and the Expired text to rule 34, and new rules 44 (`mintrun apps`) and 45 (`settings.json` and the wiring), after rule 43, written from what the tests pinned.
 - `checks.md`: one row per hook and per live check. `progress.md`: a checkpoint.
 
 ### Open Questions (decided 2026-10-17: the recommended defaults)

@@ -15,7 +15,7 @@ Engineered with **100% Go standard library**, **zero external dependencies**, an
   <a href="https://github.com/ninja-c9/mintrun/blob/main/go.mod"><img src="https://img.shields.io/badge/Go-1.24.0-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go 1.24.0" /></a>
   <a href="#architecture-everything-is-a-plugin"><img src="https://img.shields.io/badge/Dependencies-Zero_(100%25_stdlib)-10B981?style=flat-square" alt="Zero Dependencies" /></a>
   <a href="#ai-agent-integration-mcp"><img src="https://img.shields.io/badge/MCP-JSON--RPC_2.0_Ready-38BDF8?style=flat-square" alt="MCP Ready" /></a>
-  <a href="#verification--testing"><img src="https://img.shields.io/badge/Coverage-95.2%25_Verified-A78BFA?style=flat-square" alt="95.2% Coverage" /></a>
+  <a href="#verification--testing"><img src="https://img.shields.io/badge/Coverage-95.4%25_Verified-A78BFA?style=flat-square" alt="95.4% Coverage" /></a>
 </p>
 
 <p align="center">
@@ -54,7 +54,7 @@ Yet every existing way of handing credentials to an agent forces a bad trade-off
 | **What the child CLI receives** | Account-wide permanent credential | Account-wide permanent credential | **Narrowly scoped JIT sub-token** locked to 1 zone, 1 repo, 1 IAM role ARN, or specific OAuth2 scopes |
 | **Token lifetime** | Weeks, months, or never rotated | Weeks, months, or never rotated | **Seconds to minutes.** Cloudflare & GitHub sub-tokens are deleted (`DELETE`) the instant the command exits; AWS STS & GCP tokens cannot be revoked early and expire on their own (AWS ≥ 15 min, GCP ≤ 1 h) |
 | **Stdout / Stderr scrubbing** | None | Exact raw string match only | **5-Encoding Scrubber** redacts Raw, Base64, RawBase64, Hex, and URL-encoded forms with `[MINTRUN:REDACTED]` |
-| **Exfiltration & policy gate** | None | None | **Fail-closed `policy.json`** blocks `env`/`printenv`, restricts scopes/permissions, isolates child env, and can ask a human first (macOS dialog, Telegram, or Slack) |
+| **Exfiltration & policy gate** | None | None | **Fail-closed `policy.json`** blocks `env`/`printenv`, restricts scopes/permissions, isolates child env, and can ask a human first (the mintrun macOS app or a dialog, Telegram, or Slack) |
 | **Supply-chain footprint** | N/A | Dozens to hundreds of external packages | **0 external dependencies.** 100% Go 1.24 standard library |
 
 > **Design Principle — Separate Authority from Possession:**
@@ -116,12 +116,14 @@ Stage 5 reports revocation honestly. **Cloudflare** and **GitHub** delete the su
 ```text
 mintrun/
 ├── cmd/mintrun/
-│   ├── main.go                           # CLI entrypoint (exec, secret, plugin, mcp, audit, init, doctor, shim)
+│   ├── main.go                           # CLI entrypoint (exec, secret, plugin, mcp, audit, init, doctor, shim, apps), settings.json
 │   ├── setup.go                          # Guided onboarding (mintrun init) and read-only diagnostics (mintrun doctor)
 │   ├── shim.go                           # PATH shims (mintrun shim): block-and-redirect or transparent auto-wrap
+│   ├── apps.go                           # Non-interactive MCP entries for Claude Code, Claude Desktop & Cursor (mintrun apps), JSON output
 │   ├── main_test.go                      # End-to-end CLI & subcommand test suite
 │   ├── setup_test.go                     # Hermetic init and doctor test suite
 │   ├── shim_test.go                      # Hermetic CLI shim (block, auto, env-tightening, shell profiles, doctor) test suite
+│   ├── apps_test.go                      # Hermetic mintrun apps test suite (stub claude, byte-exact config edits)
 │   └── examples_test.go                  # Installs and runs the example plugins against stand-ins
 ├── internal/
 │   ├── core/
@@ -138,9 +140,11 @@ mintrun/
 │       ├── mcp.go                        # MCP JSON-RPC 2.0 stdio bridge server
 │       ├── telegram.go                   # Telegram approval channel (Bot API long polling)
 │       ├── slack.go                      # Slack approval channel (polls a DM's reactions)
+│       ├── appbroker.go                  # mintrun macOS app channel over ~/.mintrun/app.sock (approval & stop)
 │       ├── builtin_test.go               # Comprehensive provider, vault, and MCP unit test suite
 │       ├── telegram_test.go              # Telegram approval against a local Bot API
 │       ├── slack_test.go                 # Slack approval against a local Web API
+│       ├── appbroker_test.go             # App approval and tracking against a local socket
 │       └── keychain_integration_test.go  # Real macOS Keychain round trip (`-tags integration` only)
 ├── examples/plugins/                     # Plugins built into the binary (`plugin install <name>`): bitwarden (vault), vercel & postgres-jit (providers)
 └── docs/
@@ -202,6 +206,19 @@ Store your master credential in the OS keystore yourself. `mintrun` never modifi
 `mintrun secret set <provider> <secret>` still works, but prints a warning: an argument is visible in shell history and `ps`. On macOS, a secret too long for one `security -i` line (about 2 KB, such as a GCP service-account JSON or a GitHub App PEM) is split across up to 16 Keychain items, 24,000 bytes in all; a longer one is stored in the encrypted file vault with a warning, and that needs `MINTRUN_VAULT_KEY` set.
 
 `mintrun` reads the Keychain or libsecret before the encrypted file vault, so `secret set` removes the older copy from the other store: a keystore store removes the file-vault copy (without `MINTRUN_VAULT_KEY` it cannot decrypt `vault.json`, so it warns that the copy may remain), and a store that falls back to the file vault removes the keystore item. If the keystore exists but cannot be reached (for example, `secret-tool` without a D-Bus session), that removal can fail too, and `secret set` then exits non-zero after storing the secret in the file vault. On such a host, set `MINTRUN_FILE_VAULT=1` wherever `mintrun` runs (your shell and the MCP server config) to use only the encrypted file vault.
+
+### 4. Settings (`~/.mintrun/settings.json`)
+
+The mintrun macOS app keeps two settings in `~/.mintrun/settings.json`, and you can write the file yourself:
+
+```json
+{ "vault": "keychain", "approval_timeout_seconds": 300 }
+```
+
+- **`vault`** picks where master secrets live: `keychain` (the macOS Keychain or Linux libsecret, then the encrypted file vault; the default), `1password`, or `file` (the encrypted file vault only, like `MINTRUN_FILE_VAULT=1`). A non-empty `MINTRUN_VAULT`, or `MINTRUN_FILE_VAULT=1`, wins over it. Switching moves no secrets: store each one again in the new vault.
+- **`approval_timeout_seconds`** (1 to 600, default 600) is how long [approval](#approve-from-your-phone-telegram-or-slack) waits before the request is not approved.
+- **Read once, at start.** A running `mintrun mcp` keeps the old values until its AI app restarts it.
+- **Checked.** Unknown keys are ignored. Any other value for a known key, malformed JSON, or a file that exists but cannot be read stops `mintrun` with an error that names the cause, never the file's path. Only a missing file means no settings.
 
 ---
 
@@ -298,13 +315,20 @@ Coding agents often default to running `gh`, `aws`, `gcloud`, `wrangler`, `verce
 
 ### Inspect the Zero-Secret Audit Trail
 
-Every execution is recorded in `~/.mintrun/audit.jsonl` with lease metadata, exit code, revocation status, and `truncated` when an output stream hit the 4 MiB cap. `sandbox: true` marks a request the gate let through, or asked a human about, with the sandbox on; one it blocked before that has none, and MCP `mintrun_audit` shows the field as it is. Secrets the runner holds (master secret, lease credentials) are scrubbed. A policy-denied entry keeps its raw command because no secret is loaded yet, so never put a secret in `argv`; MCP `mintrun_audit` shows agents only each command's binary name. `mintrun audit` and `mintrun_audit` stream the file through `core.TailAudit`, so their memory use does not grow with the log:
+Every request gets exactly one entry in `~/.mintrun/audit.jsonl`, a blocked or failed one too. It records the request's `task` handle, where it came from (`via`: `cli` for `mintrun exec` and the shims, `mcp` for an agent), lease metadata (`expires_at` for a lease that expires), exit code, revocation status, `truncated` when an output stream hit the 4 MiB cap, and how it ended:
+
+- `outcome`: `done` (exit code 0), `blocked` (the policy gate refused it, and `blocked_by` names the check: `invalid_request`, `paused`, `purpose`, `policy_file`, `env_dump`, `static`, `scope`, `permission`, `installation`, `command`, or `sandbox`), `denied` (a human said no), `no_answer` (nobody answered by the approval deadline), `failed` (a non-zero exit, or every approval channel, the vault, or the provider failed), `stopped` (stopped from the mintrun app), `interrupted` (`mintrun` got a signal, or the MCP server shut down), or `timed_out` (the 5-minute limit).
+- `decided_at`: when a human answered the approval.
+- `sandbox: true` marks a request the gate let through, or asked a human about, with the sandbox on; one it blocked before that has none, and MCP `mintrun_audit` shows the field as it is.
+- An agent's request also records the AI app's name as `client` and the agent's `purpose`. Both are what the agent claims, never an identity.
+
+Secrets the runner holds (master secret, lease credentials) are scrubbed. A policy-denied entry keeps its raw command because no secret is loaded yet, so never put a secret in `argv`; MCP `mintrun_audit` shows agents each entry's verdict but no text an agent wrote. `mintrun audit` and `mintrun_audit` stream the file through `core.TailAudit`, so their memory use does not grow with the log:
 
 ```bash
 ./mintrun audit -provider cloudflare -limit 5
 ```
 ```json
-{"ts":"2026-10-15T04:20:00Z","provider":"cloudflare","scope":"example.com","permissions":["dns:write","workers:write"],"command":["npx","wrangler","deploy"],"lease_id":"9a8b7c6d5e","ephemeral":true,"revoked":true,"exit_code":0,"duration_ms":1840}
+{"ts":"2026-10-17T04:20:00Z","task":"EXAMPLETASKHANDLE234567ABC","via":"cli","provider":"cloudflare","scope":"example.com","permissions":["dns:write","workers:write"],"command":["npx","wrangler","deploy"],"outcome":"done","lease_id":"9a8b7c6d5e","ephemeral":true,"expires_at":"2026-10-17T04:30:00Z","revoked":true,"exit_code":0,"duration_ms":1840}
 ```
 
 ---
@@ -326,20 +350,39 @@ Connect `mintrun` to **Google Antigravity**, **Claude Code**, **Cursor**, or **W
 
 `mintrun init mcp` adds this entry for you (see [Quick Start](#quick-start)). Set `command` to the absolute path of a built binary, not a `go run` build, whose temporary binary is deleted when it exits, and give the entry no `env`: a `MINTRUN_VAULT_KEY` there lets anyone who can read the config decrypt the vault.
 
+### Connect AI Apps With `mintrun apps`
+
+`mintrun apps` adds, checks, or removes the same entry for Claude Code, Claude Desktop, and Cursor without asking, and prints one JSON row per app. The mintrun macOS app runs it this way:
+
+```bash
+./mintrun apps status
+./mintrun apps connect -dry-run
+./mintrun apps connect -app claude-desktop,cursor
+./mintrun apps disconnect -app cursor
+```
+
+- **Unlike `init mcp`**, it never asks, updates an entry that runs another command, and writes Cursor's `~/.cursor/mcp.json` instead of opening its install link. Without `-app`, `connect` and `disconnect` skip an app that is not found (no `claude` on `PATH`, or no config folder). `status` reports each app's `found`, `installed`, and `matches` (the entry runs this binary with `mcp`); `connect` and `disconnect` report `add`, `update`, `remove`, or `none`, and `-dry-run` reports without changing anything. A row with an `error` makes it exit 1.
+- **Claude Code** changes only through its own CLI (`claude mcp add` and `claude mcp remove`, user scope), found on `PATH`. An entry that also sets keys besides `type`, `command`, `args`, and an empty `env` is left alone, with an error that names those keys, never their values.
+- **Claude Desktop and Cursor** get only the `mintrun` entry under `mcpServers` edited; every other byte of the file stays as it was, and connect then disconnect restores the original file when it already listed another server. A file that is not valid JSON, whose `mcpServers` or `mintrun` is not an object, or that repeats either key is refused. A config is created only when the app's own folder exists. A symlinked config is edited where it points, a broken link is refused, and a file that changed during the edit is left alone. The write is atomic and keeps the file's mode (`0600` for a new file).
+- **The entry** runs this binary by its absolute path with `args: ["mcp"]`, and a new one has no `env`. Updating a Claude Desktop or Cursor entry rewrites only its `command` and `args`, so its other keys, an `env` included, stay. `-command` names another absolute path to an executable. A `go run` build is refused. The output names the command only, never an entry's args or env, or anything else in a config.
+- **Tested against stand-ins.** `go test` runs it against a stub `claude` and throwaway config files, never the real apps.
+
 ### Exposed MCP Tools
 
 | Tool Name | Description | Key Parameters |
 | :--- | :--- | :--- |
-| **`mintrun_exec`** | Mints a scoped JIT credential, runs the target CLI command in a blind subprocess, scrubs all secret strings from `stdout`/`stderr`, and revokes the credential before returning where the provider allows it (AWS STS and GCP credentials can only expire; `revoked` reports which). Each output stream is capped at 4 MiB; `truncated: true` marks a cut. The command is killed after 5 minutes. | `provider` (`"cloudflare"`), `scope` (`"example.com"`), `permissions` (`["dns:write","workers:write"]`), `command` (`["wrangler","deploy"]`), `cwd`, `ttl_seconds`, `clean_env`, `sandbox` (`true` runs the command in the [macOS or Linux sandbox](#1-declarative-policy-guardrails-mintrunpolicyjson)), `params` (`{"installation_id":"12345678"}` picks a `github` App installation), `approve` (`true` asks a human first) |
+| **`mintrun_exec`** | Mints a scoped JIT credential, runs the target CLI command in a blind subprocess, scrubs all secret strings from `stdout`/`stderr`, and revokes the credential before returning where the provider allows it (AWS STS and GCP credentials can only expire; `revoked` reports which). Each output stream is capped at 4 MiB; `truncated: true` marks a cut. The command is killed after 5 minutes. | `provider` (`"cloudflare"`), `scope` (`"example.com"`), `permissions` (`["dns:write","workers:write"]`), `command` (`["wrangler","deploy"]`), `cwd`, `ttl_seconds`, `clean_env`, `sandbox` (`true` runs the command in the [macOS or Linux sandbox](#1-declarative-policy-guardrails-mintrunpolicyjson)), `params` (`{"installation_id":"12345678"}` picks a `github` App installation), `approve` (`true` asks a human first), `purpose` (why, in one line of at most 300 bytes, shown to the approver as the agent's claim) |
 | **`mintrun_plugins`** | Lists all registered built-in and external plugins (`vault`, `provider`, `bridge`) along with their supported permission scopes. | *(none)* |
 | **`mintrun_policy_check`** | Dry-runs a `mintrun_exec` request against `policy.json` and the anti-exfiltration guard, through the same gate `mintrun_exec` enforces. Never opens the vault, mints, runs the command, or asks a human. Returns `allowed`, the denial `reason` (the exact error `mintrun_exec` would return), `approval_required`, `ttl_seconds` (the TTL requested from the provider after `max_ttl_seconds`; `gcp` tokens always live up to 1h), `clean_env`, and `sandbox`. | Same as `mintrun_exec` |
-| **`mintrun_audit`** | Returns recent audit entries, oldest first, filtered like `mintrun audit`. Each command is cut to its binary name plus `[MINTRUN:REDACTED]`: a policy-denied entry keeps the raw `argv` (no secret is loaded yet to scrub against), and a secret typed into `argv` is one the runner never holds, so arguments never reach an agent. The on-disk log keeps the full `argv` for the operator. | `provider` (case-insensitive), `failed_only`, `limit` (default 20, max 100) |
+| **`mintrun_audit`** | Returns recent audit entries, oldest first, filtered like `mintrun audit`. Each entry keeps its verdict (`outcome`, `blocked_by`, `exit_code`), `task`, `via`, `client`, `lease_id`, and timestamps, but no text an agent wrote: `scope`, `permissions`, and `purpose` are blank, an `error` reads `[MINTRUN:REDACTED]`, and each command is cut to its binary name plus `[MINTRUN:REDACTED]`. A policy-denied entry keeps the raw `argv` (no secret is loaded yet to scrub against), and a secret typed into `argv` is one the runner never holds, so arguments never reach an agent. The on-disk log keeps every field for the operator. | `provider` (case-insensitive), `failed_only`, `limit` (default 20, max 100) |
 
 The vault is yours to pick, never the agent's: `mintrun mcp` reads every master secret from the vault it was started with (`MINTRUN_VAULT`, or `keychain`). A `mintrun_exec` or `mintrun_policy_check` request that names a vault (`vault`), even that same one, is denied with the same reason by both, and the denied `mintrun_exec` goes to the audit log like any other denial. Nor does an agent set the time limit: its command is killed after 5 minutes, like one run with `mintrun exec`, and a request that sets `timeout_seconds` is denied the same way.
 
 ### Approve From Your Phone (Telegram or Slack)
 
-`mintrun exec -approve`, `MINTRUN_APPROVE=1` in `mintrun`'s environment, and `"require_approval": true` in a provider's policy ask a human before anything is minted; the last two also cover an agent's `mintrun_exec` calls. An agent can ask for this check itself with `approve: true`, but cannot turn off one that `MINTRUN_APPROVE=1` or the policy requires. On macOS a dialog asks; Deny is its default button, so pressing Return denies. With a Telegram or Slack bot set up (or both), your phone is asked at the same time, so you can approve an agent's commands away from the machine. The first answer, from any of them, wins and closes the others.
+`mintrun exec -approve`, `MINTRUN_APPROVE=1` in `mintrun`'s environment, and `"require_approval": true` in a provider's policy ask a human before anything is minted; the last two also cover an agent's `mintrun_exec` calls. An agent can ask for this check itself with `approve: true`, but cannot turn off one that `MINTRUN_APPROVE=1` or the policy requires. On macOS, the mintrun app asks when it is running, and a dialog asks when it is not; Deny is the dialog's default button, so pressing Return denies. With a Telegram or Slack bot set up (or both), your phone is asked at the same time, so you can approve an agent's commands away from the machine. The first answer, from any of them, wins and closes the others.
+
+**The mintrun macOS app.** `mintrun` first tries the app's socket, `~/.mintrun/app.sock`, and shows the dialog only when nothing listens there. Once it has reached the app, a dropped connection or a malformed reply fails that channel, never approves, and brings up no dialog; Telegram and Slack still race it. The app is also sent whether the sandbox is on, which the dialog, Telegram, and Slack show first. The app also lists each running command and can stop it. Any program running as you can listen on that socket and answer, but such a program can already edit `policy.json` and read your Keychain (see [5](#5-what-the-vault-protects-and-what-it-does-not)), so the socket adds no isolation. The app is not part of this repository.
 
 **Telegram:**
 
@@ -365,15 +408,16 @@ mintrun secret set approval-slack       # enter <user_id>:<bot_token>
 
 The bot sends you a direct message with ✅ and ❌ already on it: tap one. `mintrun` polls the message's reactions, so it needs no public URL.
 
-- **Only your answer to this request counts.** A tap or reaction from another account, or on another request's message, is ignored, and so are the Slack bot's own reactions and any emoji but ✅ and ❌. In Slack, ❌ wins if you add both. The message is then edited to show the outcome.
-- **Ten minutes, then no.** Telegram and Slack each give up after 10 minutes and the request is not approved, while the macOS dialog, which has no timeout, keeps waiting. On Linux, where there is no dialog, Telegram and Slack are the only channels. With none, `-approve` fails closed.
+- **Only your answer to this request counts.** A tap or reaction from another account, or on another request's message, is ignored, and so are the Slack bot's own reactions and any emoji but ✅ and ❌. In Slack, ❌ wins if you add both. The message is then edited to show the outcome: allowed, denied, expired (no answer by the approval deadline), or closed (another channel answered first, or the request was canceled).
+- **Ten minutes, then no.** Every channel, the app and the macOS dialog included, stops at the approval deadline: 10 minutes, or `approval_timeout_seconds` in [`settings.json`](#4-settings-mintrunsettingsjson) (1 to 600). The request is then not approved (`outcome: no_answer`), and the dialog's `osascript` is stopped, so the dialog closes. On Linux, where there is no app and no dialog, Telegram and Slack are the only channels. With none, `-approve` fails closed.
 - **A Telegram bot of its own.** `mintrun` reads taps with `getUpdates`, which Telegram refuses while the bot has a webhook.
 - **Slack polls.** `mintrun` reads the message's reactions every 3 seconds, so an answer takes a few seconds to land, and each waiting request spends about 20 `reactions.get` calls a minute of the app's Tier 3 limit (50 or more a minute). When Slack rate-limits it, it waits as long as `Retry-After` says. A missing scope, a revoked token, or any other refusal ends the Slack request with that error, never an approval.
 - **The default vault only.** The settings are read from the default vault (`MINTRUN_VAULT`, or `keychain`), never from the vault a request names, so an agent cannot send approvals to a bot it controls.
 - **The sandbox first.** The first line under the heading is `Sandbox: on` or `Sandbox: off`, which `mintrun` writes itself, unquoted, ahead of every field an agent sets, so a long request cannot push it behind the TRUNCATED warning. It shows the policy's decision, not only the request's: a rule that turns the sandbox on for a provider reads `on` even when the request did not ask for it. A rule saved while you decide can still add the sandbox, never remove it.
 - **Every field quoted.** The dialog and the messages show each field of the request in quotes, the vault and the working directory included, so a line break in an argument shows as `\n` and cannot pose as a line of the request. A vault or working directory the request leaves empty shows as `(not set: …)` without quotes: the default vault, or the directory `mintrun` itself runs in. Slack's message also escapes `&`, `<`, and `>`, so an argument cannot mention `@channel` or a person, or hide a link behind other text. A request too long to show ends in a TRUNCATED warning: deny it unless you know the rest.
-- **What Telegram and Slack see.** The message carries whether the sandbox is on, the provider, vault, scope, permissions, params, command, and working directory through Telegram's or Slack's servers, and stays in the chat. It holds no secret, because approval comes before any secret is loaded, but a secret typed into the command's arguments would be in it, and a working directory is often a local path that holds your user name.
-- **Tested against stand-ins.** Both channels, and `mintrun init`'s link and test request, have run only against a local Bot API and a local Slack Web API in `go test`, never a real Telegram bot or Slack workspace.
+- **The agent's words, labeled.** An agent's request ends with its `purpose` on a `Purpose:` line and the AI app's name on a `Client:` line, after every fact about the request, so a long request is cut through them first. Both are what the agent claims: any program can send any name and any reason, so judge the command, not the purpose.
+- **What Telegram and Slack see.** The message carries whether the sandbox is on, the provider, vault, scope, permissions, params, command, working directory, and an agent's purpose and AI app name through Telegram's or Slack's servers, and stays in the chat. It holds no secret, because approval comes before any secret is loaded, but a secret typed into the command's arguments would be in it, and a working directory is often a local path that holds your user name.
+- **Tested against stand-ins.** Both channels, and `mintrun init`'s link and test request, have run only against a local Bot API and a local Slack Web API in `go test`, never a real Telegram bot or Slack workspace. The app channel has run only against a test socket, and the dialog's deadline only against a stub `osascript`.
 
 ---
 
@@ -381,7 +425,7 @@ The bot sends you a direct message with ✅ and ❌ already on it: tap one. `min
 
 ### 1. Declarative Policy Guardrails (`~/.mintrun/policy.json`)
 
-Restrict which domains, repositories, roles, or permissions an AI agent may touch, cap lease TTLs, enforce a minimal child environment, or require human approval (macOS dialog, [Telegram, or Slack](#approve-from-your-phone-telegram-or-slack)) per provider in `~/.mintrun/policy.json`:
+Restrict which domains, repositories, roles, or permissions an AI agent may touch, cap lease TTLs, enforce a minimal child environment, or require human approval (the mintrun app or a macOS dialog, [Telegram, or Slack](#approve-from-your-phone-telegram-or-slack)) per provider in `~/.mintrun/policy.json`:
 
 ```json
 {
@@ -404,7 +448,11 @@ Restrict which domains, repositories, roles, or permissions an AI agent may touc
 }
 ```
 
-If `~/.mintrun/policy.json` exists but cannot be read (a directory, a file without read permission, a symlink to a missing file) or is malformed JSON, `mintrun` **fails closed**: it prints a warning and denies every execution until the file is fixed. Only a missing `policy.json` means no policy.
+If `~/.mintrun/policy.json` exists but cannot be read (a directory, a file without read permission, a symlink to a missing file) or is malformed JSON, `mintrun` **fails closed**: it prints a warning and denies every execution until the file is fixed. Only a missing `policy.json` means no policy. `mintrun` reads the file again on every request, so a saved change applies to a running `mintrun mcp` at once.
+
+**Pause:** while `~/.mintrun/paused` exists (the mintrun app's Pause creates it, as does `touch ~/.mintrun/paused`; anything there counts, a dangling symlink too, and removing it resumes), every new request is denied (`blocked_by: paused`) before any secret is loaded, and a request that was waiting for approval is denied once it is approved. Pause blocks new requests only: a command already running and credentials already handed out keep working until they end or expire.
+
+**What an agent can get around:** an agent with its own shell can bypass pause and every rule here. It can run `security` itself, point `MINTRUN_HOME` at another folder (no `policy.json` or pause file there, while the Keychain items stay readable), or delete the pause file. Approval does not stop code already running as you either: it can answer on the app's socket, edit `policy.json`, or delete the pause file. See [5](#5-what-the-vault-protects-and-what-it-does-not).
 
 **Child environment isolation:** `clean_env: true` (or any non-empty `allowed_env`) runs the command with only `PATH`, `HOME`, `TMPDIR`, `USER`, `LANG`, `TERM`, `SSL_CERT_FILE`, the `allowed_env` globs, and the lease env, so ambient host secrets such as `SSH_AUTH_SOCK` or other cloud keys never reach the child. A caller can request the same per run with `-clean-env` (CLI) or `clean_env` (MCP), but cannot switch off a policy that enables it. `MINTRUN_VAULT_KEY` is never passed to a child, even when allowlisted.
 
@@ -435,7 +483,7 @@ across **Raw**, **Base64**, **RawBase64**, **Hex**, and **URL-encoded** represen
 
 Each child stream keeps its first 4 MiB; the rest is counted and dropped, so a runaway command cannot exhaust memory. A cut stream ends with `[MINTRUN:TRUNCATED <n> bytes]`, and the result and audit entry carry `truncated: true`. A tail that could be the start of a secret variant is dropped before scrubbing, so the cut never leaves half a secret behind.
 
-On Unix the command runs in its own process group. A timeout (5 minutes) or a `SIGINT` / `SIGTERM` / `SIGHUP` to `mintrun` kills the whole group with `SIGKILL`, so no grandchild keeps running with the lease, and the lease is still revoked and audited. Two side effects: a command that reads the terminal directly (`/dev/tty`) is stopped by `SIGTTIN` until the timeout, and a background process the command leaves behind after a clean exit is not killed (`mintrun` stops waiting for its output 5 s after the command exits).
+On Unix the command runs in its own process group. A timeout (5 minutes), a stop from the mintrun app, or a `SIGINT` / `SIGTERM` / `SIGHUP` to `mintrun` kills the whole group with `SIGKILL`, so no grandchild keeps running with the lease; on other systems only the command's own process is killed. A process that left the group (a daemon that called `setsid`) survives any of these. Either way the lease is revoked where its provider allows it and audited, and the entry's `revoked` says whether that worked: `cloudflare` and `github` delete their JIT tokens; `aws` and `gcp` credentials keep working until they expire; a plugin's lease ends early only when its own revoke succeeds; and a static lease is the master secret itself, never revoked. Two side effects: a command that reads the terminal directly (`/dev/tty`) is stopped by `SIGTTIN` until the timeout, and a background process the command leaves behind after a clean exit is not killed (`mintrun` stops waiting for its output 5 s after the command exits).
 
 ### 5. What the Vault Protects and What It Does Not
 
@@ -444,7 +492,7 @@ On Unix the command runs in its own process group. A timeout (5 minutes) or a `S
 | **macOS Keychain / Linux libsecret** | Other users and a copy of the disk; the secret never touches `argv`, `ps`, or shell history | Any process running as your user while the keychain is unlocked: it can run `security find-generic-password` or `secret-tool lookup` itself |
 | **Encrypted file vault** (`~/.mintrun/vault.json`) | A copy of `vault.json` (backup, sync folder, lost disk) without the passphrase: AES-256-GCM with a key derived from `MINTRUN_VAULT_KEY` (PBKDF2-HMAC-SHA256, 210,000 iterations, per-vault random salt); a tampered file fails to decrypt | Any process running as your user that can read both `vault.json` and the passphrase (from a shell profile, an MCP config file, or, on Linux, `mintrun`'s environment), a keylogger, or offline guessing of a weak passphrase |
 
-The blind command is such a process. `mintrun` never passes `MINTRUN_VAULT_KEY` to it, which stops accidental exposure (an `env` dump, a debug log), but a command written to steal secrets can still query the keystore, or read `vault.json` and look for the passphrase (a shell profile, an MCP config file, and on Linux `mintrun`'s own environment through `/proc/$PPID/environ`). On macOS 27.0, `ps -E` and `sysctl` showed another process's arguments but not its environment in our test; older releases are untested. `mintrun` keeps raw secrets out of the agent's context and transcripts; unless the [sandbox](#1-declarative-policy-guardrails-mintrunpolicyjson) is on, it does not confine the command it runs. Block what an agent must not run with `blocked_commands`, and use `require_approval` (macOS dialog, Telegram, or Slack) to see each command before it runs.
+The blind command is such a process. `mintrun` never passes `MINTRUN_VAULT_KEY` to it, which stops accidental exposure (an `env` dump, a debug log), but a command written to steal secrets can still query the keystore, or read `vault.json` and look for the passphrase (a shell profile, an MCP config file, and on Linux `mintrun`'s own environment through `/proc/$PPID/environ`). On macOS 27.0, `ps -E` and `sysctl` showed another process's arguments but not its environment in our test; older releases are untested. `mintrun` keeps raw secrets out of the agent's context and transcripts; unless the [sandbox](#1-declarative-policy-guardrails-mintrunpolicyjson) is on, it does not confine the command it runs. Block what an agent must not run with `blocked_commands`, and use `require_approval` (the mintrun app or a macOS dialog, Telegram, or Slack) to see each command before it runs.
 
 **What the sandbox blocks.** `TestSandboxHidesHome` runs real commands under `sandbox-exec` on macOS 27.0 and under user and mount namespaces on Linux (Ubuntu 24.04, kernel 6.17): a sandboxed command cannot read, list, or write `mintrun`'s home or the keystore folder (`~/Library/Keychains` on macOS, `~/.local/share/keyrings` on Linux) by its path, read `mintrun`'s home through a symlink (or in other letter case on macOS), or on Linux read `/proc/$PPID/environ`, while its exit code and environment (where the lease travels) come through unchanged. On Linux the test passed both as an unprivileged user and as `root` (`uid=0`), and a command whose `cwd` is inside a hidden directory fails to start (`exit 126`, `permission denied`). In a manual check on macOS 27.0, `security find-generic-password` also failed inside the sandbox (exit 44, as for a missing item). `TestSandboxHidesKeychainItem`, opt-in because it stores a throwaway item in your login Keychain and then deletes it, shows the same for a real item on macOS 27.0: without the sandbox, a command read the item with `security` and read the login Keychain file; inside it, `security` exited 44 and reading the file was denied. On Linux, `TestSandboxHidesSecretTool` starts a throwaway `dbus-daemon` and `gnome-keyring-daemon`, stores a throwaway item with `secret-tool`, and shows that without the sandbox a command read the item over `DBUS_SESSION_BUS_ADDRESS` and over `$XDG_RUNTIME_DIR/bus`, read `login.keyring`, and listed `$XDG_RUNTIME_DIR/keyring`, while inside it all four failed and the host lookup still worked afterwards. What it does **not** do:
 
@@ -567,7 +615,7 @@ A reply that does not decode, such as text that is not JSON or an `expires_at` t
 
 ## Verification & Testing
 
-`mintrun` ships with a deterministic, offline unit and integration test suite (**95.2%** total statement coverage, measured without build tags) that mocks Cloudflare, GitHub App RS256, AWS STS SigV4 (plus a fixed AWS signing vector), Google OAuth2 JWT-bearer, Telegram Bot, and Slack Web APIs plus the macOS `security`, `osascript`, and `sandbox-exec`, Linux `secret-tool` and the user+mount namespace sandbox helper, 1Password `op`, and `stty` CLIs, checks child environment isolation, the sandbox gate, the output cap, and the process-group kill, verifies AES-256-GCM encryption at rest, tests multi-encoding leak scrubbing, enforces policy guardrails, validates external plugin execution and the governance tools over MCP, installs and runs the [example plugins](examples/plugins/README.md) against a stub `bw`, a stub `psql`, and a local Vercel API (skipped without `python3`), and runs `mintrun init`, `mintrun doctor`, and `mintrun shim` in a throwaway home directory against stub `git`, `claude`, and `open`. It never touches the real Keychain, Telegram, Slack, Bitwarden, Vercel, a database, or your IDE configs:
+`mintrun` ships with a deterministic, offline unit and integration test suite (**95.4%** total statement coverage, measured without build tags) that mocks Cloudflare, GitHub App RS256, AWS STS SigV4 (plus a fixed AWS signing vector), Google OAuth2 JWT-bearer, Telegram Bot, and Slack Web APIs plus the macOS `security`, `osascript`, and `sandbox-exec`, Linux `secret-tool` and the user+mount namespace sandbox helper, 1Password `op`, and `stty` CLIs, checks child environment isolation, the sandbox gate, the output cap, and the process-group kill, verifies AES-256-GCM encryption at rest, tests multi-encoding leak scrubbing, enforces policy guardrails, validates external plugin execution and the governance tools over MCP, installs and runs the [example plugins](examples/plugins/README.md) against a stub `bw`, a stub `psql`, and a local Vercel API (skipped without `python3`), runs `mintrun init`, `mintrun doctor`, `mintrun shim`, and `mintrun apps` in a throwaway home directory against stub `git`, `claude`, and `open`, and asks the mintrun app over a local test socket. It never touches the real Keychain, Telegram, Slack, Bitwarden, Vercel, a database, the mintrun app, or your IDE configs:
 
 ```bash
 go test -v -cover ./...
