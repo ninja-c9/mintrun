@@ -280,6 +280,19 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
   go test -count=1 -v -run 'TestCLISecretCheckConfigured' ./cmd/mintrun
   ```
 
+### Workstream R — Plugin JSON Errors Never Quote `stdout`
+- **Files:** `internal/core/plugin.go`, `internal/core/core_test.go`
+- **Design:**
+  - `ExternalPlugin.call` wrapped the `json.Unmarshal` error, and Go's JSON errors quote their input: a bare secret on a plugin's `stdout` showed its first character (`invalid character 'h' looking for beginning of value`), and a string in `lease.expires_at`, a `time.Time`, showed whole, twice (`parsing time "…" as "2006-01-02T15:04:05Z07:00": cannot parse "…" as "2006"`). `Scrub` knows the master, plus a lease's secrets once the reply has decoded, so the text reached `secret check`, `ExecBlind`, and MCP, and a mint's also reached `audit.jsonl`.
+  - The error is now the fixed `plugin "<name>" returned an invalid JSON response`, which quotes nothing from `stdout`. It says "invalid JSON response" rather than "not valid JSON", because a reply with a mistyped field is valid JSON. The `stderr` and `resp.Error` paths are unchanged: the plugin scrubs those itself (rule 32).
+- **Deliverables:**
+  1. `[SERIAL]` the `json.Unmarshal` branch in `internal/core/plugin.go`.
+  2. `[SERIAL]` `TestPluginInvalidJSONNeverQuotesStdout` (a plugin vault whose reply is a bare canary, a plugin provider whose lease holds the canary in `expires_at`: the exact `ExecBlind` error, no canary, and the audited mint error); the re-wrap mutant runs on a copy of the repo.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestPluginInvalidJSONNeverQuotesStdout' ./internal/core
+  ```
+
 ---
 
 ## 3. Deferred Backlog (Next Actionable Items)

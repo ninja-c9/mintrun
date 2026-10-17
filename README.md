@@ -498,6 +498,8 @@ When the child command finishes, `mintrun` invokes your provider plugin again wi
 
 Put only secrets in `env`. `mintrun` removes every `env` value, every `redact` entry, and the lease `id` from the command's output, so a non-secret such as a port number would be blanked wherever it appears. The `id` is public: the audit log and the MCP result show it.
 
+A reply that does not decode, such as text that is not JSON or an `expires_at` that is not an RFC 3339 time, fails with `plugin "<name>" returned an invalid JSON response`. `mintrun` never quotes the reply, because it can hold a secret.
+
 ---
 
 ## Roadmap
