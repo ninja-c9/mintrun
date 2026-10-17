@@ -323,3 +323,10 @@
 - **Chưa kiểm chứng:** test mới chỉ chạy trên macOS 27.0, chưa chạy trên Linux hay Windows.
 - **Chưa xử lý:** đường dẫn đã resolve symlink hoặc bị escape; `stderr` của plugin không bị giới hạn độ dài như output của lệnh (luật 19); hai việc còn lại của checkpoint trước (lỗi ghi file vault vẫn có đường dẫn; `readMap` và symlink `vault.json`) vẫn còn.
 - **Next step:** push hai commit lên `main` khi bạn đồng ý (luật 25: kiểm tra `git ls-remote` ngay trước khi push).
+
+## Checkpoint — Workstream Y: ghim reply của `mintrun_policy_check` (2026-10-17)
+
+- **Hoàn thành:** `TestMCPBridgeGovernanceTools` so nguyên văn một reply của `mintrun_policy_check`. Trước đó test giải mã reply vào `PolicyDecision`, chính struct đã mã hoá nó, nên đổi tên khóa `sandbox` (M29) vẫn qua mọi test trên `f13b90f`, dù mô tả tool hứa với agent các khóa này.
+- **Outputs:** `internal/builtin/builtin_test.go`; docs `AGENTS.md` (luật 43), `checks.md` (Y7, M29), `progress.md`.
+- **Kiểm chứng:** Y7 trong [checks.md](checks.md).
+- **Next step:** push hai commit lên `main` khi bạn đồng ý (luật 25: kiểm tra `git ls-remote` ngay trước khi push); sau đó các mục "Chưa xử lý" của checkpoint Workstream Y.
