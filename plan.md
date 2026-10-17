@@ -163,7 +163,7 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
 ### Workstream L — Slack Approval
 - **Files:** `internal/builtin/slack.go`, `internal/builtin/slack_test.go`, `cmd/mintrun/main.go`
 - **Design** (checked against Slack's Web API reference on 2026-10-16): Slack's interactive buttons post the tap to a public Request URL, and Socket Mode needs a WebSocket client, which the standard library lacks. So `mintrun` posts the request and polls for a reaction, which needs no endpoint of its own:
-  1. `chat.postMessage` with `channel=<user_id>` posts into the bot's DM with that user and returns the DM's channel ID and the message `ts`. The text is plain (`mrkdwn=false`, `parse=none`, `link_names=false`, no unfurls), quotes every agent-controlled field as Telegram does, and escapes `&`, `<`, `>` to the entities Slack shows as text, so no field can open a `<!channel>`, `<@U…>`, or `<url|label>` sequence. `core.ApprovalText` (Workstream J) cuts the raw text short enough that its escaped form fits in 3,500 bytes, because `chat.update` refuses text over 4,000 characters; escaping after the cut never splits an entity.
+  1. `chat.postMessage` with `channel=<user_id>` posts into the bot's DM with that user and returns the DM's channel ID and the message `ts`. The text is plain (`mrkdwn=false`, `parse=none`, `link_names=false`, no unfurls), quotes every agent-controlled field as Telegram does, and escapes `&`, `<`, `>` to the entities Slack shows as text, so no field can open a `<!channel>`, `<@U…>`, or `<url|label>` sequence. `core.ApprovalText` (Workstream K) cuts the raw text short enough that its escaped form fits in 3,500 bytes, because `chat.update` refuses text over 4,000 characters; escaping after the cut never splits an entity.
   2. `reactions.add` puts ✅ (`white_check_mark`) and ❌ (`x`) on the message, so one tap answers. Both must succeed before polling starts.
   3. `reactions.get` with `full=true` (the complete `users` list) runs every 3 s. Only a reaction whose `users` holds the stored user ID counts, so the bot's own reactions never do, and ❌ wins over ✅. A config naming the bot itself therefore reads as both, a denial.
   4. `chat.update` replaces the prompt with the outcome, best effort, even after the context is cancelled.
@@ -176,6 +176,49 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
 - **Verification:**
   ```bash
   go test -count=1 -v -run 'TestSlackApproval|TestTelegramApproval' ./internal/builtin
+  ```
+
+### Workstream M — Onboarding: `mintrun init` & `mintrun doctor`
+- **Files:** `cmd/mintrun/main.go`, `cmd/mintrun/setup.go` (new), `cmd/mintrun/setup_test.go` (new), `internal/builtin/telegram.go`, `internal/builtin/slack.go`, `internal/builtin/cloudflare.go`, `internal/builtin/keychain.go`, `internal/builtin/telegram_test.go`, `internal/builtin/slack_test.go`, `README.md`
+- **Design:**
+  - `mintrun init [github|aws|gcp|cloudflare|telegram|slack|policy|mcp]` sets up one piece, or asks about each in turn when given none. It checks every value before storing it, with the provider's own parser where there is one, stores it in the default vault, and asks before replacing a stored secret. Invalid input stores nothing.
+    - **GitHub:** App ID and Installation ID are digits; the `.pem` must parse with `ParseRSAPrivateKey`. It stores `<app_id>:<installation_id>:<pem>`, which pins the installation. An empty Installation ID stores `<app_id>::<pem>` and points to `allowed_installations` (rule 27).
+    - **AWS:** an `AKIA…` or `ASIA…` access key ID, a 40-character secret read hidden, and a session token, which `ASIA` requires.
+    - **GCP:** a service-account JSON file whose `private_key` parses.
+    - **Cloudflare:** an API token read hidden.
+    - **Telegram:** the bot token is read hidden. `builtin.TelegramLink` prints `https://t.me/<bot>?start=<code>` with a one-time `rand.Text()` code and accepts only a `/start <code>` message, so nobody else who messages the bot gets linked. It shows the sender's name and stores `<user_id>:<bot_token>` only on a yes, then sends a test request through `TelegramApproval`, the path `-approve` uses. Its polling never confirms a callback query, which may answer another pending request (rule 31).
+    - **Slack:** the bot token is read hidden and the member ID typed; the test request goes through `SlackApproval`. Slack has no link that proves the member ID is the user's, so `init` asks whether they answered the test themselves and removes the setting on a no.
+    - **Policy:** suggests `{"github": {"allowed_scopes": ["<owner/repo>"], "clean_env": true}}` from `git remote get-url origin`. An `owner/*` wildcard only when typed, and never `allow_static`. The remote URL is never printed, since it can carry a token. It creates `policy.json` only when none exists and only after a yes, with `O_EXCL` and mode `0600`: a file made in between is never replaced, and a partial write leaves malformed JSON, which `exec` reads as deny-all. Otherwise it prints the rule and leaves the file alone.
+    - **MCP:** the entry is `{"command": "<absolute path>", "args": ["mcp"]}`, from `os.Executable` plus `EvalSymlinks`, and a `go run` build is refused. No entry carries an `env`, so `MINTRUN_VAULT_KEY` never lands in an IDE config.
+      - Claude Code: runs `claude mcp add -s user mintrun -- <path> mcp` after a yes and never edits `~/.claude.json`. Without `claude` on `PATH`, it prints the command when `~/.claude.json` exists.
+      - Cursor: when `~/.cursor` exists, prints the `cursor://anysphere.cursor-deeplink/mcp/install?config=<base64>&name=mintrun` link, which asks in Cursor before it adds the server, and offers to open it on macOS (elsewhere the link is only printed).
+      - Claude Desktop: shows the entry and asks, backs up `claude_desktop_config.json`, then writes it atomically with every other key kept. An existing `mintrun` entry is left alone.
+      - Antigravity: offers each of `~/.gemini/antigravity/mcp_config.json` and `~/.gemini/config/mcp_config.json` that exists, merged after a yes as for Claude Desktop. With `~/.gemini/antigravity` but neither file, it points to "Manage MCP Servers → View raw config" and prints the entry.
+      - On a file-vault host, it warns that an IDE started from the Dock or an app menu does not get the shell's `MINTRUN_VAULT_KEY`.
+  - `mintrun doctor` is read-only and prints names, never values. It checks:
+    - the binary: a `go run` build fails; a missing `mintrun` on `PATH`, or a different one, warns;
+    - the default vault: the file vault without `MINTRUN_VAULT_KEY` fails;
+    - which providers have a stored secret;
+    - the approval channels: a malformed `approval-telegram` or `approval-slack` fails;
+    - `policy.json`: malformed JSON or an unknown field fails, because the runtime ignores an unknown field and a typo silently drops a limit; a provider with a stored secret and no rule warns;
+    - every IDE entry it finds: a missing command, or `MINTRUN_VAULT_KEY` in its `env`, fails.
+
+    Any failure exits 1.
+- **Deliverables:**
+  1. `[SERIAL]` builtin: export `ParseRSAPrivateKey` and `WriteFileAtomic`; add `ParseTelegramConfig` and `ParseSlackConfig`, which the approval channels and `doctor` share; add `TelegramLink`.
+  2. `[SERIAL]` `mintrun doctor` and its hermetic test.
+  3. `[SERIAL]` `mintrun init` and its hermetic tests, with a fake `HOME`, `MINTRUN_HOME`, stub `git`, `claude`, `stty` and `open`, and in-process Bot API and Slack Web API stand-ins (an `http.RoundTripper` that refuses every other host).
+  4. `[SERIAL]` Mutants run on a copy of the repo, one per security condition.
+- **Not built:**
+  - `doctor -live` (network calls, 1Password);
+  - a web UI;
+  - policy rules for providers other than GitHub;
+  - Claude Code's project and local scopes.
+- **Limits:** the Cursor link, the Claude Code command, and the Antigravity paths are checked against stubs and the vendors' docs only, never a real IDE. `CLAUDE_CONFIG_DIR` is not read, so `doctor` looks for Claude Code's entry in `~/.claude.json` only. The `O_EXCL` guard covers a `policy.json` created between the check and the write, a race the tests do not stage.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCLIDoctor|TestCLIInit' ./cmd/mintrun
+  go test -count=1 -v -run 'TestTelegramLink|TestTelegramApproval|TestSlackApproval' ./internal/builtin
   ```
 
 ---

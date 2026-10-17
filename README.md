@@ -157,9 +157,24 @@ cd mintrun
 go build -trimpath -o mintrun ./cmd/mintrun
 ```
 
-### 2. Enroll Your Master Secret Once
+### 2. Set Up With `mintrun init`
 
-Store your master credential in the OS keystore. `mintrun` never modifies or replaces your existing cloud CLIs—it injects ephemeral credentials at runtime.
+`mintrun init` walks through the setup one step at a time and asks before each: a master secret for GitHub, AWS, Google Cloud, or Cloudflare, approval through Telegram or Slack, a starting policy, and the MCP entry in your IDEs. `mintrun doctor` then checks what is in place.
+
+```bash
+./mintrun init              # every step, each after a yes
+./mintrun init github       # one step: github, aws, gcp, cloudflare, telegram, slack, policy, or mcp
+./mintrun doctor            # check the setup; exits 1 if any check fails
+```
+
+- **Checked before it is stored.** A GitHub App ID and installation ID must be digits, and the App's private key must parse; leave the installation ID empty and each request picks one, which `init` tells you to limit with `allowed_installations`. An AWS access key ID must look like `AKIA…` or `ASIA…`, and an `ASIA` key needs its session token. A Google Cloud key file needs a `client_email` and a `private_key` that parses. Tokens and secret keys are typed with echo off, private keys and key files are read from their path, and a stored secret is replaced only after a yes.
+- **A policy that starts closed.** `init policy` suggests a rule for one repository, taken from the current directory's `origin` remote (the remote URL, which can hold a token, is never printed), with `clean_env` on and `allow_static` off. It writes `policy.json` only after a yes and only when there is none: an existing one is never changed, and `init` prints the rule to add to it instead.
+- **Each IDE its own way.** `init mcp` adds Claude Code with `claude mcp add -s user`, shows Cursor's install link (and opens it on macOS after a yes), and edits Claude Desktop's or Antigravity's config only after a yes, keeping a timestamped backup and every other entry. The entry runs this binary by its absolute path and carries no environment, so `MINTRUN_VAULT_KEY` never lands in a config. With the encrypted file vault, an IDE started from the Dock or an app launcher may not get your shell's `MINTRUN_VAULT_KEY`: start it from that shell, or use the macOS Keychain or libsecret, which need no passphrase.
+- **`doctor` only reads.** It reports the binary and whether `PATH` runs it, the vault and which providers have a master secret, the approval settings, `policy.json` (including a field `exec` would ignore, such as a misspelling), and each IDE's `mintrun` entry. It prints names, never a secret, its length, or an IDE config's contents, and calls no cloud or chat API.
+
+### 3. Or Enroll a Master Secret by Hand
+
+Store your master credential in the OS keystore yourself. `mintrun` never modifies or replaces your existing cloud CLIs—it injects ephemeral credentials at runtime.
 
 ```bash
 # Prompts on stdin with terminal echo off, so your master secret never appears
@@ -276,6 +291,8 @@ Connect `mintrun` to **Google Antigravity**, **Claude Code**, **Cursor**, or **W
 }
 ```
 
+`mintrun init mcp` adds this entry for you (see [Quick Start](#quick-start)). Set `command` to the absolute path of a built binary, not a `go run` build, whose temporary binary is deleted when it exits, and give the entry no `env`: a `MINTRUN_VAULT_KEY` there lets anyone who can read the config decrypt the vault.
+
 ### Exposed MCP Tools
 
 | Tool Name | Description | Key Parameters |
@@ -291,8 +308,10 @@ Connect `mintrun` to **Google Antigravity**, **Claude Code**, **Cursor**, or **W
 
 **Telegram:**
 
-1. Create a bot for `mintrun` alone with [@BotFather](https://t.me/BotFather), and send it `/start` from your account so it may message you.
-2. Store your numeric Telegram user ID (not your @username) and the bot token in the default vault:
+1. Create a bot for `mintrun` alone with [@BotFather](https://t.me/BotFather).
+2. Run `mintrun init telegram` and paste the bot token (echo is off). On the phone that will approve, open the link it shows and tap **Start**, then confirm the name it read. It stores your user ID and the token in the default vault and sends a test request: answer it either way. Only a `/start` that carries the link's one-time code counts, so a message to the bot from anyone else is ignored.
+
+To store the setting by hand instead, send the bot `/start` from your account, then enter your numeric Telegram user ID (not your @username) and the bot token:
 
 ```bash
 mintrun secret set approval-telegram    # enter <user_id>:<bot_token>
@@ -301,7 +320,9 @@ mintrun secret set approval-telegram    # enter <user_id>:<bot_token>
 **Slack:**
 
 1. Create an app for `mintrun` alone at [api.slack.com/apps](https://api.slack.com/apps), give its bot the `chat:write`, `reactions:read`, and `reactions:write` scopes, and install it to your workspace.
-2. Store your Slack member ID (`U…`, from **Copy member ID** in your profile's menu) and the bot token (`xoxb-…`) in the default vault:
+2. Run `mintrun init slack`, paste the bot token (`xoxb-…`, echo is off), and enter your Slack member ID (`U…`, from **Copy member ID** in your profile's menu). It stores both in the default vault and sends you a test request: answer it either way. Slack has no link to prove the member ID is yours, so `init` then asks whether you answered it, and removes the setting if someone else did.
+
+To store the setting by hand instead:
 
 ```bash
 mintrun secret set approval-slack       # enter <user_id>:<bot_token>
@@ -316,7 +337,7 @@ The bot sends you a direct message with ✅ and ❌ already on it: tap one. `min
 - **The default vault only.** The settings are read from the default vault (`MINTRUN_VAULT`, or `keychain`), never from the vault a request names, so an agent cannot send approvals to a bot it controls.
 - **Every field quoted.** The dialog and the messages show each field an agent sets in quotes, so a line break in an argument shows as `\n` and cannot pose as a line of the request. Slack's message also escapes `&`, `<`, and `>`, so an argument cannot mention `@channel` or a person, or hide a link behind other text. A request too long to show ends in a TRUNCATED warning: deny it unless you know the rest.
 - **What Telegram and Slack see.** The message carries the provider, scope, permissions, params, and command through Telegram's or Slack's servers, and stays in the chat. It holds no secret, because approval comes before any secret is loaded, but a secret typed into the command's arguments would be in it.
-- **Tested against stand-ins.** Both channels have run only against a local Bot API and a local Slack Web API in `go test`, never a real Telegram bot or Slack workspace.
+- **Tested against stand-ins.** Both channels, and `mintrun init`'s link and test request, have run only against a local Bot API and a local Slack Web API in `go test`, never a real Telegram bot or Slack workspace.
 
 ---
 
@@ -497,7 +518,7 @@ Put only secrets in `env`. `mintrun` removes every `env` value, every `redact` e
 
 ## Verification & Testing
 
-`mintrun` ships with a deterministic, offline unit and integration test suite (**94.1%** total statement coverage, measured without build tags) that mocks Cloudflare, GitHub App RS256, AWS STS SigV4 (plus a fixed AWS signing vector), Google OAuth2 JWT-bearer, Telegram Bot, and Slack Web APIs plus the macOS `security` and `osascript`, Linux `secret-tool`, 1Password `op`, and `stty` CLIs, checks child environment isolation, the output cap, and the process-group kill, verifies AES-256-GCM encryption at rest, tests multi-encoding leak scrubbing, enforces policy guardrails, validates external plugin execution and the governance tools over MCP, and installs and runs the [example plugins](examples/plugins/README.md) against a stub `bw`, a stub `psql`, and a local Vercel API (skipped without `python3`). It never touches the real Keychain, Telegram, Slack, Bitwarden, Vercel, or a database:
+`mintrun` ships with a deterministic, offline unit and integration test suite (**94.3%** total statement coverage, measured without build tags) that mocks Cloudflare, GitHub App RS256, AWS STS SigV4 (plus a fixed AWS signing vector), Google OAuth2 JWT-bearer, Telegram Bot, and Slack Web APIs plus the macOS `security` and `osascript`, Linux `secret-tool`, 1Password `op`, and `stty` CLIs, checks child environment isolation, the output cap, and the process-group kill, verifies AES-256-GCM encryption at rest, tests multi-encoding leak scrubbing, enforces policy guardrails, validates external plugin execution and the governance tools over MCP, installs and runs the [example plugins](examples/plugins/README.md) against a stub `bw`, a stub `psql`, and a local Vercel API (skipped without `python3`), and runs `mintrun init` and `mintrun doctor` in a throwaway home directory against stub `git`, `claude`, and `open`. It never touches the real Keychain, Telegram, Slack, Bitwarden, Vercel, a database, or your IDE configs:
 
 ```bash
 go test -v -cover ./...
