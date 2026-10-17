@@ -170,6 +170,9 @@ func telegramApprove(ctx context.Context, token string, user int64, req core.Exe
 	for pollCtx.Err() == nil {
 		var updates []telegramUpdate
 		err := telegramCall(pollCtx, token, "getUpdates", map[string]any{"offset": offset, "timeout": telegramPoll}, &updates)
+		if pollCtx.Err() != nil {
+			break // a tap read once the caller cancelled or the deadline passed answers nothing
+		}
 		if err != nil && strings.Contains(err.Error(), "webhook") {
 			outcome = "⚠️ Not approved: this bot has a webhook, so mintrun cannot read taps. Use a dedicated bot."
 			return false, err

@@ -1985,8 +1985,9 @@ esac
 }
 
 // TestApprovalTimeout pins the approval deadline: nobody answering within ApprovalTimeout is
-// no_answer and closes a dialog still open, a caller whose context ends first is interrupted, and
-// 0 or more than 10 minutes means 10 minutes.
+// no_answer and closes a dialog still open, a caller whose context ends first is interrupted, an
+// allow that comes after either is neither an allow nor a deny, and 0 or more than 10 minutes
+// means 10 minutes.
 func TestApprovalTimeout(t *testing.T) {
 	t.Setenv("MINTRUN_APPROVE", "")
 	rt, home := probeRuntime(t, "timeout_master_secret")
@@ -2018,6 +2019,19 @@ func TestApprovalTimeout(t *testing.T) {
 	caller, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	expect("caller", caller, "interrupted", "policy denied: human-in-the-loop approval rejected (context deadline exceeded)")
+
+	// A channel can read an allow just as its context ends, and FirstApproval passes on the first
+	// answer it gets, so the gate drops an answer that comes once the context has ended.
+	rt.ApprovalFunc = core.FirstApproval(func(ctx context.Context, _ core.ExecRequest) (bool, error) {
+		<-ctx.Done()
+		return true, nil
+	})
+	rt.ApprovalTimeout = 50 * time.Millisecond
+	expect("allow after the deadline", context.Background(), "no_answer", "policy denied: no answer within 50ms")
+	rt.ApprovalTimeout = time.Minute
+	late, cancelLate := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelLate()
+	expect("allow after the caller left", late, "interrupted", "policy denied: human-in-the-loop approval rejected (context deadline exceeded)")
 
 	for _, c := range []struct{ set, want time.Duration }{
 		{0, 10 * time.Minute}, {-time.Second, 10 * time.Minute}, {time.Hour, 10 * time.Minute}, {90 * time.Second, 90 * time.Second},

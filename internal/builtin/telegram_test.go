@@ -1,9 +1,11 @@
 package builtin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -61,10 +63,12 @@ func TestTelegramApproval(t *testing.T) {
 	}
 	type taps = func(nonce string, now int64) []map[string]any // queued when the message is sent at now
 	pending := func(_ string, now int64) []map[string]any { return []map[string]any{tap(1, user, "allow:LIVE", now)} }
+	allowed := func(n string, now int64) []map[string]any { return []map[string]any{tap(1, user, "allow:"+n, now)} }
 	cases := []struct {
 		name         string
 		timeout      time.Duration
-		cancelOnPoll bool   // the caller cancels once polling starts, as FirstApproval does
+		cancelOnPoll bool   // the caller cancels while a poll's reply is on its way, as FirstApproval may
+		lateReply    bool   // each poll's reply comes only once the deadline passed
 		reply        string // raw 409 reply to every getUpdates
 		taps         taps
 		ok           bool
@@ -72,8 +76,7 @@ func TestTelegramApproval(t *testing.T) {
 		outcome      string
 		offset       int64 // highest getUpdates offset: every update below it is confirmed
 	}{
-		{name: "allow", taps: func(n string, now int64) []map[string]any { return []map[string]any{tap(1, user, "allow:"+n, now)} },
-			ok: true, outcome: "✅ Allowed", offset: 2},
+		{name: "allow", taps: allowed, ok: true, outcome: "✅ Allowed", offset: 2},
 		{name: "other users', stale and malformed taps are dropped", taps: func(n string, now int64) []map[string]any {
 			return []map[string]any{
 				{"update_id": int64(1), "message": map[string]any{"text": "/start"}},
@@ -89,8 +92,10 @@ func TestTelegramApproval(t *testing.T) {
 		}, outcome: "⛔ Denied", offset: 2},
 		{name: "no answer", timeout: 100 * time.Millisecond, taps: pending,
 			err: "telegram: no answer within 100ms", outcome: "⌛ Expired", offset: 0},
-		{name: "answered elsewhere", cancelOnPoll: true, taps: pending,
+		{name: "answered elsewhere", cancelOnPoll: true, taps: allowed,
 			err: "context canceled", outcome: "⌛ Closed", offset: 0},
+		{name: "an answer after the deadline", timeout: 100 * time.Millisecond, lateReply: true, taps: allowed,
+			err: "telegram: no answer within 100ms", outcome: "⌛ Expired", offset: 0},
 		{name: "webhook", reply: `{"ok":false,"description":"Conflict: can't use getUpdates method while webhook is active"}`,
 			err: "webhook is active", outcome: "⚠️ Not approved", offset: 0},
 	}
@@ -102,6 +107,12 @@ func TestTelegramApproval(t *testing.T) {
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
+			switch {
+			case tc.cancelOnPoll:
+				lateReplies(t, "getUpdates", cancel)
+			case tc.lateReply:
+				lateReplies(t, "getUpdates", func() {}) // the reply waits for the deadline
+			}
 			var (
 				mu       sync.Mutex
 				queue    []map[string]any
@@ -143,9 +154,6 @@ func TestTelegramApproval(t *testing.T) {
 					}
 					result = map[string]any{"message_id": 77}
 				case "getUpdates":
-					if tc.cancelOnPoll {
-						cancel()
-					}
 					if tc.reply != "" {
 						w.WriteHeader(http.StatusConflict)
 						_, _ = w.Write([]byte(tc.reply))
@@ -227,6 +235,33 @@ func failingAPI(t *testing.T) string {
 	t.Cleanup(srv.Close)
 	return srv.URL
 }
+
+// lateReplies holds every reply to method until its request's context ends, calling cancel first:
+// the answer then lands after the caller cancelled, as FirstApproval may while a poll is on its way,
+// or after the deadline. The test's own server still answers; only the delivery waits.
+func lateReplies(t *testing.T, method string, cancel func()) {
+	orig := http.DefaultClient.Transport
+	t.Cleanup(func() { http.DefaultClient.Transport = orig })
+	http.DefaultClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		resp, err := http.DefaultTransport.RoundTrip(r)
+		if err != nil || !strings.HasSuffix(r.URL.Path, "/"+method) {
+			return resp, err
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		cancel()
+		<-r.Context().Done()
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		return resp, nil
+	})
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestTelegramLink(t *testing.T) {
 	const token = "123456:TEST-bot_tokenABC"

@@ -453,7 +453,8 @@ func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest, e *AuditEn
 }
 
 // approve asks a human through ApprovalFunc. Only an allow returns nil; e records the outcome of
-// anything else, and when a human answered.
+// anything else, and when a human answered. An answer that comes once the deadline passed or the
+// caller left is neither an allow nor a deny: a channel can read one just as its context ends.
 func (rt *Runtime) approve(ctx context.Context, req ExecRequest, e *AuditEntry) error {
 	approveFn := rt.ApprovalFunc
 	if approveFn == nil {
@@ -466,6 +467,9 @@ func (rt *Runtime) approve(ctx context.Context, req ExecRequest, e *AuditEntry) 
 	actx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	ok, err := approveFn(actx, req)
+	if err == nil {
+		err = actx.Err()
+	}
 	switch {
 	case err == nil:
 		e.DecidedAt = time.Now().UTC().Format(time.RFC3339)
@@ -558,7 +562,8 @@ func ApprovalText(header string, req ExecRequest, limit int) string {
 // FirstApproval asks every approver at once. The first answer, allow or deny, wins and cancels
 // the others; it returns once they have all returned, so none outlives the decision. An approver
 // that fails (no GUI, not configured, unreachable) drops out, and only when every one fails is
-// their joined error returned.
+// their joined error returned. The first answer wins even when ctx ended before it came;
+// Runtime.approve, which owns the deadline, drops such an answer.
 func FirstApproval(approvers ...func(context.Context, ExecRequest) (bool, error)) func(context.Context, ExecRequest) (bool, error) {
 	return func(ctx context.Context, req ExecRequest) (bool, error) {
 		ctx, cancel := context.WithCancel(ctx)

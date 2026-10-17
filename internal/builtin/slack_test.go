@@ -73,7 +73,8 @@ func TestSlackApproval(t *testing.T) {
 		name         string
 		cfgUser      string // the user ID in the config; user when empty
 		timeout      time.Duration
-		cancelOnPoll bool                  // the caller cancels once polling starts, as FirstApproval does
+		cancelOnPoll bool                  // the caller cancels while a poll's reply is on its way, as FirstApproval may
+		lateReply    bool                  // each poll's reply comes only once the deadline passed
 		polls        []map[string][]string // each answered reactions.get's reactions besides the bot's; the last repeats
 		fails        map[string]reply      // "<method> <n>" (n counts that method's calls) gets this reply instead
 		ok           bool
@@ -94,6 +95,8 @@ func TestSlackApproval(t *testing.T) {
 		}, ok: true, outcome: "✅ Allowed"},
 		{name: "no answer", timeout: 100 * time.Millisecond, err: "slack: no answer within 100ms", outcome: "⌛ Expired"},
 		{name: "answered elsewhere", cancelOnPoll: true, polls: allow, err: "context canceled", outcome: "⌛ Closed"},
+		{name: "an answer after the deadline", timeout: 100 * time.Millisecond, lateReply: true, polls: allow,
+			err: "slack: no answer within 100ms", outcome: "⌛ Expired"},
 		{name: "an API error is never retried", polls: allow, fails: map[string]reply{
 			"reactions.get 1": {status: http.StatusOK, body: `{"ok":false,"error":"missing_scope","needed":"reactions:read"}`},
 		}, err: "slack reactions.get: HTTP 200: missing_scope (needed: reactions:read)", outcome: "⚠️ Not approved"},
@@ -109,6 +112,12 @@ func TestSlackApproval(t *testing.T) {
 			slackTimeout = cmp.Or(tc.timeout, 5*time.Second)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
+			switch {
+			case tc.cancelOnPoll:
+				lateReplies(t, "reactions.get", cancel)
+			case tc.lateReply:
+				lateReplies(t, "reactions.get", func() {}) // the reply waits for the deadline
+			}
 			var (
 				mu     sync.Mutex
 				calls  = map[string]int{}
@@ -136,9 +145,6 @@ func TestSlackApproval(t *testing.T) {
 					t.Errorf("%s came %s before Retry-After passed", method, until.Sub(now))
 				}
 				calls[method]++
-				if method == "reactions.get" && tc.cancelOnPoll {
-					cancel()
-				}
 				if fail, ok := tc.fails[fmt.Sprint(method, " ", calls[method])]; ok {
 					if fail.status == 0 {
 						conn, _, err := w.(http.Hijacker).Hijack()

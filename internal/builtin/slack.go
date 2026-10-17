@@ -113,6 +113,9 @@ func slackApprove(ctx context.Context, token, user string, req core.ExecRequest)
 		}
 		// full=true lists every user who reacted, not only the first few.
 		retry, err := slackCall(pollCtx, token, "reactions.get", url.Values{"channel": {sent.Channel}, "timestamp": {sent.TS}, "full": {"true"}}, &got)
+		if pollCtx.Err() != nil {
+			break // a reply read once the caller cancelled or the deadline passed answers nothing
+		}
 		if err != nil && retry == 0 {
 			outcome = unusable
 			return false, err
