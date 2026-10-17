@@ -1465,7 +1465,7 @@ func TestMCPBridgeGovernanceTools(t *testing.T) {
 	t.Setenv("MINTRUN_APPROVE", "")
 	policy := `{"cloudflare":{"allowed_scopes":["ok.com"],"allowed_permissions":["dns:*"],"max_ttl_seconds":120},"gated":{"require_approval":true,"clean_env":true}}`
 	ok := `{"ts":"2026-10-15T00:00:00Z","provider":"github","command":["gh","api","/user"],"exit_code":0}` + "\n"
-	seed := `{"ts":"2026-10-15T00:00:00Z","provider":"github","command":["gh","run","rerun"],"exit_code":2}` + "\n" + strings.Repeat(ok, 119) + "{not json\n"
+	seed := `{"ts":"2026-10-15T00:00:00Z","provider":"github","command":["gh","run","rerun"],"exit_code":2,"sandbox":true}` + "\n" + strings.Repeat(ok, 119) + "{not json\n"
 	for path, data := range map[string]string{
 		filepath.Join(home, "policy.json"):    policy,
 		filepath.Join(home, "audit.jsonl"):    seed,
@@ -1652,7 +1652,8 @@ func TestMCPBridgeGovernanceTools(t *testing.T) {
 	if es := audit(r[10]); len(es) != 1 || es[0].Provider != "cloudflare" {
 		t.Fatalf("provider filter: %+v", es)
 	}
-	if es := audit(r[11]); len(es) != 2 || es[0].ExitCode != 2 || es[1].ExitCode != 126 {
+	// The failed_only filter keeps both failures, and the seeded entry still says it ran in the sandbox.
+	if es := audit(r[11]); len(es) != 2 || es[0].ExitCode != 2 || !es[0].Sandbox || es[1].ExitCode != 126 || es[1].Sandbox {
 		t.Fatalf("failed_only filter: %+v", es)
 	}
 	// Every entry is shown that way, not only a blocked one: the failed exec kept its request raw

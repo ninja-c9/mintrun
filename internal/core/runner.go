@@ -86,7 +86,11 @@ type AuditEntry struct {
 	ExitCode   int    `json:"exit_code"`
 	DurationMs int64  `json:"duration_ms"`
 	Truncated  bool   `json:"truncated,omitempty"`
-	Error      string `json:"error,omitempty"`
+	// Sandbox is whether the command runs under sandbox-exec, from the verdict that asked a human
+	// or allowed the request. A request the gate blocked first has none, and one it blocked after
+	// an approval keeps what the human was shown.
+	Sandbox bool   `json:"sandbox,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 // PolicyRule controls which scopes, permissions, and commands are permitted for a provider.
@@ -425,12 +429,13 @@ func realDir(dir string) (string, error) {
 
 // checkPolicy enforces CheckPolicy's verdict on req (effective TTL, clean mode, sandbox) and asks
 // a human through ApprovalFunc when the verdict requires approval. It returns the allowed_env of
-// the rule it enforced and the sandbox-exec prefix (nil when the sandbox is off); e records why
-// it denied.
+// the rule it enforced and the sandbox-exec prefix (nil when the sandbox is off); e records
+// whether the sandbox is on and why it denied.
 func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest, e *AuditEntry) ([]string, []string, error) {
 	d, env, sandbox := rt.decide(*req)
 	if d.Allowed && d.ApprovalRequired {
 		req.TTLSeconds, req.CleanEnv, req.Sandbox = d.TTLSeconds, d.CleanEnv, d.Sandbox
+		e.Sandbox = d.Sandbox
 		if err := rt.approve(ctx, *req, e); err != nil {
 			return nil, nil, err
 		}
@@ -443,6 +448,7 @@ func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest, e *AuditEn
 		return nil, nil, errors.New(d.Reason)
 	}
 	req.TTLSeconds, req.CleanEnv, req.Sandbox = d.TTLSeconds, d.CleanEnv, d.Sandbox
+	e.Sandbox = d.Sandbox
 	return env, sandbox, nil
 }
 
@@ -508,7 +514,8 @@ func OSApproval(ctx context.Context, req ExecRequest) (bool, error) {
 
 // ApprovalText is the request an approver shows a human. Every field an agent sets is quoted, so
 // a newline or quote in an argument cannot fake a line or push the command out of view, and text
-// longer than limit bytes is cut with a warning.
+// longer than limit bytes is cut with a warning. The sandbox line comes before every such field,
+// so none can push it out of view either.
 func ApprovalText(header string, req ExecRequest, limit int) string {
 	quote := func(list []string) string {
 		q := make([]string, len(list))
@@ -529,8 +536,12 @@ func ApprovalText(header string, req ExecRequest, limit int) string {
 		}
 		return strconv.Quote(s)
 	}
-	text := fmt.Sprintf("%s\n\nProvider: %q\nVault: %s\nScope: %q\nPermissions: %s\nParams: %s\nCommand: %s\nWorking directory: %s",
-		header, req.Provider, orUnset(req.Vault, "(not set: the default vault)"), req.Scope, quote(req.Permissions),
+	sandbox := "off"
+	if req.Sandbox {
+		sandbox = "on"
+	}
+	text := fmt.Sprintf("%s\n\nSandbox: %s\nProvider: %q\nVault: %s\nScope: %q\nPermissions: %s\nParams: %s\nCommand: %s\nWorking directory: %s",
+		header, sandbox, req.Provider, orUnset(req.Vault, "(not set: the default vault)"), req.Scope, quote(req.Permissions),
 		strings.Join(params, " "), quote(req.Command), orUnset(req.WorkingDir, "(not set: mintrun's own)"))
 	if req.Purpose != "" {
 		text += "\nPurpose: " + strconv.Quote(req.Purpose)
