@@ -267,6 +267,19 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
   go test -count=1 -v -run 'TestCLISecretCheckReportsVaultError' ./cmd/mintrun
   ```
 
+### Workstream Q — `secret check` Prints No Length
+- **Files:** `cmd/mintrun/main.go`, `cmd/mintrun/main_test.go`
+- **Design:**
+  - On success `secret check` printed `(length=<n> chars, value hidden)`. The length comes from the secret, and `doctor` never prints one (rule 35). It narrows a guess and tells one kind of credential from another.
+  - The line now names only the key and the vault: `Secret "<key>" is configured in vault "<vault>" (value hidden).`, exit 0. The three failure paths from Workstream P are unchanged.
+- **Deliverables:**
+  1. `[SERIAL]` the success line in the `check` branch of `cmd/mintrun/main.go`.
+  2. `[SERIAL]` `TestCLISecretCheckConfigured` (the exact line, exit 0, an empty `stderr`); 1 mutant (the length printed again) run on a copy of the repo.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCLISecretCheckConfigured' ./cmd/mintrun
+  ```
+
 ---
 
 ## 3. Deferred Backlog (Next Actionable Items)

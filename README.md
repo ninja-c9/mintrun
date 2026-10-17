@@ -183,7 +183,7 @@ Store your master credential in the OS keystore yourself. `mintrun` never modifi
 
 # Verify existence without ever printing the secret value:
 ./mintrun secret check cloudflare
-# -> Secret "cloudflare" is configured in vault "keychain" (length=40 chars, value hidden).
+# -> Secret "cloudflare" is configured in vault "keychain" (value hidden).
 # A missing secret prints the command that stores it, and a vault that cannot be read
 # (such as a wrong MINTRUN_VAULT_KEY) says so with the vault's error. Both exit 1.
 
