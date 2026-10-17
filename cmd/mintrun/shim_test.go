@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func runAsTool(t *testing.T, arg0 string, args ...string) cliResult {
@@ -72,7 +75,7 @@ func TestCLIShim(t *testing.T) {
 		writeFile(t, filepath.Join(home, ".zprofile"), "export PATH=\"/usr/local/bin:$PATH\"\n")
 
 		// Install all default shims (block mode).
-		r = runCLI(t, "", nil, "shim", "install")
+		r = runCLI(t, "y\n", nil, "shim", "install")
 		if r.exited || !strings.Contains(r.out, "Installed block shim(s)") || !strings.Contains(r.out, "export PATH=") || !strings.Contains(r.out, "~/.zshenv") || !strings.Contains(r.out, "~/.zshrc") {
 			t.Fatalf("shim install all:\n%s%s", r.out, r.err)
 		}
@@ -102,17 +105,17 @@ func TestCLIShim(t *testing.T) {
 
 		// Remove one tool, then all.
 		r = runCLI(t, "", nil, "shim", "rm", "gh")
-		if r.exited || !strings.Contains(r.out, "Removed shim(s): gh.") {
+		if r.exited || !strings.Contains(r.out, "Removed shim(s): gh.") || strings.Contains(r.out, "[y/N]") {
 			t.Fatalf("shim rm gh:\n%s%s", r.out, r.err)
 		}
 		if _, err := os.Lstat(filepath.Join(dir, "gh")); !os.IsNotExist(err) {
 			t.Errorf("gh symlink still exists: %v", err)
 		}
-		// Other shims remain, so .zshrc still has the marker.
+		// Other shims remain, so nothing is offered and .zshrc keeps the line.
 		if data, _ := os.ReadFile(filepath.Join(home, ".zshrc")); !strings.Contains(string(data), shimProfileMarker) {
 			t.Errorf(".zshrc marker removed while other shims still installed")
 		}
-		r = runCLI(t, "", nil, "shim", "remove")
+		r = runCLI(t, "y\n", nil, "shim", "remove")
 		if r.exited {
 			t.Fatalf("shim remove all:\n%s%s", r.out, r.err)
 		}
@@ -137,6 +140,247 @@ func TestCLIShim(t *testing.T) {
 		}
 		if err := os.RemoveAll(filepath.Join(dir, "gh")); err != nil {
 			t.Fatal(err)
+		}
+	})
+
+	t.Run("shell profiles change only on a yes, each backed up first", func(t *testing.T) {
+		home, _ := setupEnv(t)
+		dir := filepath.Join(home, ".mintrun", "shims")
+		line := "export PATH='" + dir + "':\"$PATH\" # mintrun-shim"
+		zshenv, zshrc, bashrc := filepath.Join(home, ".zshenv"), filepath.Join(home, ".zshrc"), filepath.Join(home, ".bashrc")
+		modes := map[string]os.FileMode{zshenv: 0o600, zshrc: 0o640, bashrc: 0o644}
+		writeFile(t, zshrc, "alias ll='ls -l'\n")
+		writeFile(t, bashrc, "export EDITOR=vi\n")
+		for _, p := range []string{zshrc, bashrc} {
+			if err := os.Chmod(p, modes[p]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		before := profileFiles(t, home)
+		// interrupt runs mintrun shim and presses Ctrl-C (a real SIGINT) once the question shows,
+		// so mintrun stops there.
+		interrupt := func(args ...string) {
+			t.Helper()
+			inR, inW, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer inR.Close()
+			defer inW.Close() // ends the read the question left waiting
+			origArgs := os.Args
+			os.Args = append([]string{"mintrun", "shim"}, args...)
+			defer func() { os.Args = origArgs }()
+			var timer *time.Timer
+			pressCtrlC := func(out string) {
+				if timer == nil && strings.Contains(out, "[y/N]: ") {
+					p, _ := os.FindProcess(os.Getpid())
+					_ = p.Signal(os.Interrupt)
+					// A question that misses Ctrl-C reads EOF soon after, a no, so the test fails instead of hanging.
+					timer = time.AfterFunc(5*time.Second, func() { inW.Close() })
+				}
+			}
+			r := capture(t, inR, pressCtrlC, main)
+			if timer == nil || !timer.Stop() || r.code != 1 || r.err != "interrupted\n" {
+				t.Errorf("%v, interrupted: code %d:\n%s%s", args, r.code, r.out, r.err)
+			}
+		}
+
+		// No answer (EOF) is a no: nothing changes, and the line is shown to add by hand.
+		r := runCLI(t, "", nil, "shim", "install", "gh")
+		if r.exited || !strings.Contains(r.out, "~/.zshenv, ~/.zshrc, ~/.bashrc:\n  "+line+"\n") || !strings.Contains(r.out, "Left them unchanged.") {
+			t.Errorf("install, no answer:\n%s%s", r.out, r.err)
+		}
+		if got := profileFiles(t, home); !reflect.DeepEqual(got, before) {
+			t.Fatalf("install without a yes changed profiles:\n%q\nwant %q", got, before)
+		}
+
+		// A yes puts the line last, creating ~/.zshenv with mode 0600, after copying each existing
+		// profile to a .bak- backup with its own mode.
+		r = runCLI(t, "y\n", nil, "shim", "install", "gh")
+		if r.exited || !strings.Contains(r.out, "Added it to ~/.zshenv, ~/.zshrc, ~/.bashrc;") {
+			t.Errorf("install, yes:\n%s%s", r.out, r.err)
+		}
+		got := profileFiles(t, home)
+		popBackup(t, got, zshrc, "alias ll='ls -l'\n", 0o640)
+		popBackup(t, got, bashrc, "export EDITOR=vi\n", 0o644)
+		wired := map[string]string{zshenv: line + "\n", zshrc: "alias ll='ls -l'\n" + line + "\n", bashrc: "export EDITOR=vi\n" + line + "\n"}
+		if !reflect.DeepEqual(got, wired) {
+			t.Errorf("install, yes:\n%q\nwant %q", got, wired)
+		}
+		for p, mode := range modes {
+			if got := modeOf(t, p); got != mode {
+				t.Errorf("%s: mode %v, want %v", p, got, mode)
+			}
+		}
+
+		// Wired already: nothing to ask, only the line for this shell, whose PATH lacks the shims.
+		r = runCLI(t, "", nil, "shim", "install", "gh")
+		if r.exited || strings.Contains(r.out, "[y/N]") || !strings.Contains(r.out, "Put "+dir+" first on PATH") {
+			t.Errorf("install, wired:\n%s%s", r.out, r.err)
+		}
+
+		// remove asks too: no answer keeps the line, and a yes takes it out after a backup.
+		r = runCLI(t, "", nil, "shim", "remove")
+		if r.exited || !strings.Contains(r.out, "~/.zshenv, ~/.zshrc, ~/.bashrc:\n  "+line+"\n") || !strings.Contains(r.out, "Left them unchanged.") {
+			t.Errorf("remove, no answer:\n%s%s", r.out, r.err)
+		}
+		if got := profileFiles(t, home); !reflect.DeepEqual(got, wired) {
+			t.Errorf("remove without a yes changed profiles:\n%q\nwant %q", got, wired)
+		}
+		interrupt("remove")
+		if got := profileFiles(t, home); !reflect.DeepEqual(got, wired) {
+			t.Errorf("interrupted remove changed profiles:\n%q\nwant %q", got, wired)
+		}
+		r = runCLI(t, "y\n", nil, "shim", "remove")
+		if r.exited || !strings.Contains(r.out, "Removed it from ~/.zshenv, ~/.zshrc, ~/.bashrc.") {
+			t.Errorf("remove, yes:\n%s%s", r.out, r.err)
+		}
+		got = profileFiles(t, home)
+		for p, s := range wired {
+			popBackup(t, got, p, s, modes[p])
+		}
+		if want := map[string]string{zshenv: "", zshrc: "alias ll='ls -l'\n", bashrc: "export EDITOR=vi\n"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("remove, yes:\n%q\nwant %q", got, want)
+		}
+
+		// A profile edited while the question waits is left alone.
+		edits, err := shimProfileEdits(line, true)
+		if err != nil || len(edits) != 3 {
+			t.Fatalf("edits %v (%v), want three", edits, err)
+		}
+		writeFile(t, zshenv, "export B=2\n")
+		inR, inW, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer inR.Close()
+		if _, err := inW.WriteString("y\n"); err != nil {
+			t.Fatal(err)
+		}
+		inW.Close()
+		r = capture(t, inR, nil, func() { offerShimProfiles(context.Background(), line, edits, true) })
+		if r.code != 1 || !strings.Contains(r.err, "~/.zshenv changed while mintrun waited, so it was left unchanged") {
+			t.Errorf("edited while asking: code %d:\n%s%s", r.code, r.out, r.err)
+		}
+		edited := map[string]string{zshenv: "export B=2\n", zshrc: "alias ll='ls -l'\n", bashrc: "export EDITOR=vi\n"}
+		if got := profileFiles(t, home); !reflect.DeepEqual(got, edited) {
+			t.Errorf("edited while asking:\n%q\nwant %q", got, edited)
+		}
+		interrupt("install", "gh")
+		if got := profileFiles(t, home); !reflect.DeepEqual(got, edited) {
+			t.Errorf("interrupted install changed profiles:\n%q\nwant %q", got, edited)
+		}
+
+		// Without HOME there is no profile to offer, only the line.
+		t.Setenv("HOME", "")
+		r = runCLI(t, "", nil, "shim", "install", "gh")
+		if r.exited || strings.Contains(r.out, "[y/N]") || !strings.Contains(r.out, "Put "+dir+" first on PATH") {
+			t.Errorf("install, no HOME:\n%s%s", r.out, r.err)
+		}
+	})
+
+	t.Run("a linked profile changes where it lives and a broken link is left alone", func(t *testing.T) {
+		home, _ := setupEnv(t)
+		line := "export PATH='" + filepath.Join(home, ".mintrun", "shims") + "':\"$PATH\" # mintrun-shim"
+		zshenv, zshrc := filepath.Join(home, ".zshenv"), filepath.Join(home, ".zshrc")
+		dotfiles := filepath.Join(home, "dotfiles")
+		target := filepath.Join(dotfiles, "zshrc")
+		writeFile(t, target, "alias ll='ls -l'\n")
+		if err := os.Symlink(filepath.Join("dotfiles", "zshrc"), zshrc); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("missing", zshenv); err != nil {
+			t.Fatal(err)
+		}
+
+		r := runCLI(t, "y\n", nil, "shim", "install", "gh")
+		if r.exited || !strings.Contains(r.out, "Added it to ~/.zshrc;") {
+			t.Errorf("install:\n%s%s", r.out, r.err)
+		}
+		got := profileFiles(t, home)
+		popBackup(t, got, target, "alias ll='ls -l'\n", 0o600)
+		want := map[string]string{zshenv: "-> missing", zshrc: "-> " + filepath.Join("dotfiles", "zshrc"), dotfiles: "<dir>", target: "alias ll='ls -l'\n" + line + "\n"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("install:\n%q\nwant %q", got, want)
+		}
+
+		r = runCLI(t, "y\n", nil, "shim", "remove")
+		if r.exited || !strings.Contains(r.out, "Removed it from ~/.zshrc.") {
+			t.Errorf("remove:\n%s%s", r.out, r.err)
+		}
+		got = profileFiles(t, home)
+		popBackup(t, got, target, want[target], 0o600)
+		want[target] = "alias ll='ls -l'\n"
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("remove:\n%q\nwant %q", got, want)
+		}
+
+		// A backup that cannot be written stops before the profile changes.
+		if os.Geteuid() != 0 { // root writes into a read-only directory anyway
+			if err := os.Chmod(dotfiles, 0o500); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(dotfiles, 0o700) }) // so TempDir's cleanup can remove it
+			r = runCLI(t, "y\n", nil, "shim", "install", "gh")
+			if !r.exited || r.code != 1 || !strings.Contains(r.err, "back up ~/.zshrc") {
+				t.Errorf("unwritable backup should fail:\n%s%s", r.out, r.err)
+			}
+			if got := profileFiles(t, home); !reflect.DeepEqual(got, want) {
+				t.Errorf("failed backup changed profiles:\n%q\nwant %q", got, want)
+			}
+		}
+	})
+
+	t.Run("only the exact line mintrun writes moves or goes", func(t *testing.T) {
+		home, _ := setupEnv(t)
+		dir := filepath.Join(home, ".mintrun", "shims")
+		line := "export PATH='" + dir + "':\"$PATH\" # mintrun-shim"
+		zshenv, zshrc, zprofile := filepath.Join(home, ".zshenv"), filepath.Join(home, ".zshrc"), filepath.Join(home, ".zprofile")
+		own := "# mintrun-shim: my own note\nexport PATH=\"$HOME/.other/shims:$PATH\" # mintrun-shim\n"
+		brew := "eval \"$(brew shellenv)\"" // the last line, with no newline at the end
+		writeFile(t, zshrc, own)
+		writeFile(t, zprofile, line+"\n"+own+brew)
+
+		// install moves its line below the later PATH change, on a line of its own, and keeps
+		// every other line.
+		r := runCLI(t, "y\n", nil, "shim", "install", "gh")
+		if r.exited {
+			t.Fatalf("install:\n%s%s", r.out, r.err)
+		}
+		got := profileFiles(t, home)
+		popBackup(t, got, zshrc, own, 0o600)
+		popBackup(t, got, zprofile, line+"\n"+own+brew, 0o600)
+		want := map[string]string{zshenv: line + "\n", zshrc: own + line + "\n", zprofile: own + brew + "\n" + line + "\n"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("install:\n%q\nwant %q", got, want)
+		}
+
+		r = runCLI(t, "y\n", nil, "shim", "remove")
+		if r.exited {
+			t.Fatalf("remove:\n%s%s", r.out, r.err)
+		}
+		got = profileFiles(t, home)
+		for p, s := range want {
+			popBackup(t, got, p, s, 0o600)
+		}
+		if want := map[string]string{zshenv: "", zshrc: own, zprofile: own + brew + "\n"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("remove:\n%q\nwant %q", got, want)
+		}
+
+		// A profile that cannot be read stops install before any shim is linked, and stops remove.
+		if err := os.Mkdir(filepath.Join(home, ".bashrc"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		r = runCLI(t, "", nil, "shim", "install", "gh")
+		if !r.exited || r.code != 1 || !strings.Contains(r.err, "update shell profile:") {
+			t.Errorf("unreadable profile should fail install:\n%s%s", r.out, r.err)
+		}
+		if _, err := os.Lstat(filepath.Join(dir, "gh")); !os.IsNotExist(err) {
+			t.Errorf("install linked gh before it failed: %v", err)
+		}
+		r = runCLI(t, "", nil, "shim", "remove")
+		if !r.exited || r.code != 1 || !strings.Contains(r.err, "clean shell profile:") {
+			t.Errorf("unreadable profile should fail remove:\n%s%s", r.out, r.err)
 		}
 	})
 
@@ -444,4 +688,42 @@ func TestCLIShim(t *testing.T) {
 			t.Errorf("doctor FAIL regular file:\n%s", doc.out)
 		}
 	})
+}
+
+// profileFiles is snapshot of home without mintrun's own files and the stubs: the shell profiles,
+// links, and backups that shim install and remove may change.
+func profileFiles(t *testing.T, home string) map[string]string {
+	t.Helper()
+	m := snapshot(t, home)
+	maps.DeleteFunc(m, func(p, _ string) bool {
+		return p == home || strings.HasPrefix(p, filepath.Join(home, ".mintrun")) || strings.HasPrefix(p, filepath.Join(home, "bin"))
+	})
+	return m
+}
+
+// popBackup checks that p has exactly one .bak- backup, holding want with mode, then deletes it
+// from disk and from m, so the next change starts with none.
+func popBackup(t *testing.T, m map[string]string, p, want string, mode os.FileMode) {
+	t.Helper()
+	baks, err := filepath.Glob(p + ".bak-*")
+	if err != nil || len(baks) != 1 {
+		t.Errorf("%s: backups %q (%v), want one", p, baks, err)
+		return
+	}
+	if got, gotMode := m[baks[0]], modeOf(t, baks[0]); got != want || gotMode != mode {
+		t.Errorf("%s = %q, mode %v; want %q, mode %v", baks[0], got, gotMode, want, mode)
+	}
+	delete(m, baks[0])
+	if err := os.Remove(baks[0]); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func modeOf(t *testing.T, p string) os.FileMode {
+	t.Helper()
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi.Mode().Perm()
 }

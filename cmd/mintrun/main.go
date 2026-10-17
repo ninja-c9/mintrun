@@ -108,7 +108,7 @@ func main() {
 	case "doctor":
 		cmdDoctor(ctx, rt, os.Args[2:])
 	case "shim":
-		cmdShim(rt, os.Getenv("PATH"), os.Args[2:])
+		cmdShim(ctx, rt, os.Getenv("PATH"), os.Args[2:])
 	case "-h", "--help", "help":
 		printUsage()
 	default:

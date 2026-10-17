@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/ninja-c9/mintrun/internal/builtin"
 	"github.com/ninja-c9/mintrun/internal/core"
@@ -210,7 +212,7 @@ func atomicSymlink(target, linkPath string) error {
 }
 
 // cmdShim manages PATH shims under <home>/shims: list, install, and remove.
-func cmdShim(rt *core.Runtime, origPath string, args []string) {
+func cmdShim(ctx context.Context, rt *core.Runtime, origPath string, args []string) {
 	action := "list"
 	if len(args) > 0 {
 		action = args[0]
@@ -223,9 +225,9 @@ func cmdShim(rt *core.Runtime, origPath string, args []string) {
 		}
 		shimList(rt, origPath)
 	case "install", "add":
-		shimInstall(rt, origPath, args)
+		shimInstall(ctx, rt, origPath, args)
 	case "remove", "rm":
-		shimRemove(rt, args)
+		shimRemove(ctx, rt, args)
 	default:
 		fatal("unknown shim action %q (use list, install, or remove)", action)
 	}
@@ -260,7 +262,7 @@ func shimList(rt *core.Runtime, origPath string) {
 	}
 }
 
-func shimInstall(rt *core.Runtime, origPath string, args []string) {
+func shimInstall(ctx context.Context, rt *core.Runtime, origPath string, args []string) {
 	fs := flag.NewFlagSet("shim install", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	mode := fs.String("mode", "block", "Shim mode: block (reject & redirect agent) or auto (wrap via ExecBlind)")
@@ -300,6 +302,11 @@ func shimInstall(rt *core.Runtime, origPath string, args []string) {
 		}
 	}
 	dir := shimsDir(rt.HomeDir)
+	line := shimProfileLine(dir)
+	edits, err := shimProfileEdits(line, true)
+	if err != nil {
+		fatal("update shell profile: %v", err)
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		fatal("%v", err)
 	}
@@ -324,20 +331,15 @@ func shimInstall(rt *core.Runtime, origPath string, args []string) {
 	if err := writeShimConfig(rt.HomeDir, cfg); err != nil {
 		fatal("write shim config: %v", err)
 	}
-	updated, err := ensureShimShellProfiles(dir)
-	if err != nil {
-		fatal("update shell profile: %v", err)
-	}
 	fmt.Printf("Installed %s shim(s) in %s (%s).\n", *mode, dir, strings.Join(tools, ", "))
-	if len(updated) > 0 {
-		fmt.Printf("Added %s to PATH in %s.\n", dir, strings.Join(updated, ", "))
-	}
-	if !shimFirstOnPath(tools[0], origPath, dir) {
-		fmt.Printf("Put %s first on PATH in your shell profile:\n  export PATH=%s:\"$PATH\"\n", dir, shellQuote(dir))
+	if len(edits) > 0 {
+		offerShimProfiles(ctx, line, edits, true)
+	} else if !shimFirstOnPath(tools[0], origPath, dir) {
+		fmt.Printf("Put %s first on PATH to use the shims:\n  export PATH=%s:\"$PATH\"\n", dir, shellQuote(dir))
 	}
 }
 
-func shimRemove(rt *core.Runtime, args []string) {
+func shimRemove(ctx context.Context, rt *core.Runtime, args []string) {
 	tools := args
 	if len(tools) == 0 {
 		tools = shimToolNames()
@@ -363,12 +365,17 @@ func shimRemove(rt *core.Runtime, args []string) {
 			fatal("write shim config: %v", err)
 		}
 	}
+	fmt.Printf("Removed shim(s): %s.\n", strings.Join(tools, ", "))
 	if !anyShimInstalled(dir) {
-		if _, err := removeShimShellProfiles(); err != nil {
+		line := shimProfileLine(dir)
+		edits, err := shimProfileEdits(line, false)
+		if err != nil {
 			fatal("clean shell profile: %v", err)
 		}
+		if len(edits) > 0 {
+			offerShimProfiles(ctx, line, edits, false)
+		}
 	}
-	fmt.Printf("Removed shim(s): %s.\n", strings.Join(tools, ", "))
 }
 
 const shimProfileMarker = "# mintrun-shim"
@@ -382,97 +389,113 @@ func anyShimInstalled(dir string) bool {
 	return false
 }
 
-func ensureShimShellProfiles(shims string) ([]string, error) {
-	userHome, err := os.UserHomeDir()
-	if err != nil || userHome == "" {
-		return nil, nil
-	}
-	line := fmt.Sprintf("export PATH=%s:\"$PATH\" %s", shellQuote(shims), shimProfileMarker)
-	candidates := []struct {
-		name   string
-		create bool
-	}{
-		{".zshenv", true},
-		{".zshrc", true},
-		{".zprofile", false},
-		{".bashrc", false},
-	}
-	var updated []string
-	for _, c := range candidates {
-		p := filepath.Join(userHome, c.name)
-		mode := fs.FileMode(0o600)
-		data, err := os.ReadFile(p)
-		if err != nil {
-			if !errors.Is(err, fs.ErrNotExist) {
-				return nil, err
-			}
-			if !c.create {
-				continue
-			}
-		} else if fi, statErr := os.Stat(p); statErr == nil {
-			mode = fi.Mode().Perm()
-		}
-		var kept []string
-		for _, ln := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
-			if ln == "" && len(kept) == 0 && len(data) == 0 {
-				continue
-			}
-			if strings.Contains(ln, shimProfileMarker) {
-				continue
-			}
-			kept = append(kept, ln)
-		}
-		kept = append(kept, line)
-		out := strings.Join(kept, "\n") + "\n"
-		if string(data) != out {
-			if err := builtin.WriteFileAtomic(p, []byte(out), mode); err != nil {
-				return nil, err
-			}
-			updated = append(updated, "~/"+c.name)
-		}
-	}
-	return updated, nil
+// shimProfileLine is the exact line shim install puts in shell profiles and shim remove takes out.
+func shimProfileLine(dir string) string {
+	return fmt.Sprintf("export PATH=%s:\"$PATH\" %s", shellQuote(dir), shimProfileMarker)
 }
 
-func removeShimShellProfiles() ([]string, error) {
+// profileEdit is a change to one shell profile: its name as shown, the file written (a link's
+// target), that file's mode, and its contents before (nil when it is new) and after.
+type profileEdit struct {
+	name, path string
+	mode       fs.FileMode
+	old        []byte
+	out        string
+}
+
+// shimProfileEdits returns the shell profiles that shim install (add) or remove (!add) would
+// change. Install puts line last in ~/.zshenv and ~/.zshrc, creating them, and in ~/.zprofile and
+// ~/.bashrc when they exist; remove takes it out. Only the exact line counts, so a user's own line
+// that mentions the marker stays. A linked profile (dotfiles) is changed where it lives, and a
+// link that cannot be followed is left alone, never replaced by a file.
+func shimProfileEdits(line string, add bool) ([]profileEdit, error) {
 	userHome, err := os.UserHomeDir()
 	if err != nil || userHome == "" {
 		return nil, nil
 	}
-	var cleaned []string
-	for _, name := range []string{".zshenv", ".zshrc", ".zprofile", ".bashrc"} {
-		p := filepath.Join(userHome, name)
-		data, err := os.ReadFile(p)
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				continue
-			}
-			return nil, err
-		}
-		if !strings.Contains(string(data), shimProfileMarker) {
+	var edits []profileEdit
+	for _, c := range []struct {
+		name   string
+		create bool
+	}{{".zshenv", true}, {".zshrc", true}, {".zprofile", false}, {".bashrc", false}} {
+		p := filepath.Join(userHome, c.name)
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			p = r
+		} else if _, err := os.Lstat(p); err == nil {
 			continue
 		}
-		mode := fs.FileMode(0o600)
-		if fi, statErr := os.Stat(p); statErr == nil {
-			mode = fi.Mode().Perm()
-		}
-		var kept []string
-		for _, ln := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
-			if strings.Contains(ln, shimProfileMarker) {
+		old, err := os.ReadFile(p)
+		if errors.Is(err, fs.ErrNotExist) {
+			if !add || !c.create {
 				continue
 			}
-			kept = append(kept, ln)
-		}
-		out := ""
-		if len(kept) > 0 && !(len(kept) == 1 && kept[0] == "") {
-			out = strings.Join(kept, "\n") + "\n"
-		}
-		if err := builtin.WriteFileAtomic(p, []byte(out), mode); err != nil {
+		} else if err != nil {
 			return nil, err
 		}
-		cleaned = append(cleaned, "~/"+name)
+		mode := fs.FileMode(0o600)
+		if fi, err := os.Stat(p); err == nil {
+			mode = fi.Mode().Perm()
+		}
+		var b strings.Builder
+		for ln := range strings.Lines(string(old)) {
+			if strings.TrimSuffix(ln, "\n") != line {
+				b.WriteString(ln)
+			}
+		}
+		out := b.String()
+		if add {
+			if out != "" && !strings.HasSuffix(out, "\n") {
+				out += "\n"
+			}
+			out += line + "\n"
+		}
+		if out != string(old) {
+			edits = append(edits, profileEdit{"~/" + c.name, p, mode, old, out})
+		}
 	}
-	return cleaned, nil
+	return edits, nil
+}
+
+// offerShimProfiles shows line and the profiles edits change, and changes them only on a yes,
+// first copying each existing one to a timestamped .bak- backup with its mode, as init does.
+func offerShimProfiles(ctx context.Context, line string, edits []profileEdit, add bool) {
+	var names []string
+	for _, e := range edits {
+		names = append(names, e.name)
+	}
+	list := strings.Join(names, ", ")
+	verb := "Remove"
+	if add {
+		verb = "Add"
+		fmt.Printf("To put the shims first on PATH in new shells, this line goes last in %s:\n  %s\n", list, line)
+	} else {
+		fmt.Printf("No shim is left, so this line can come out of %s:\n  %s\n", list, line)
+	}
+	w := &wizard{ctx: ctx, in: bufio.NewReader(os.Stdin)}
+	if !w.confirm(verb + " it (each existing file is backed up first)?") {
+		fmt.Println("Left them unchanged.")
+		return
+	}
+	stamp := time.Now().Format("20060102-150405")
+	for _, e := range edits {
+		// The question may have waited a while: a profile edited since it was read is left alone.
+		if cur, _ := os.ReadFile(e.path); !bytes.Equal(cur, e.old) {
+			fatal("%s changed while mintrun waited, so it was left unchanged; run the command again", e.name)
+		}
+		if e.old != nil { // nil: a new file, with nothing to back up
+			if err := builtin.WriteFileAtomic(e.path+".bak-"+stamp, e.old, e.mode); err != nil {
+				fatal("back up %s: %v", e.name, err)
+			}
+		}
+		if err := builtin.WriteFileAtomic(e.path, []byte(e.out), e.mode); err != nil {
+			fatal("update %s: %v", e.name, err)
+		}
+	}
+	if add {
+		fmt.Printf("Added it to %s; open a new shell to use the shims.\n", list)
+	} else {
+		fmt.Printf("Removed it from %s.\n", list)
+	}
 }
 
 // runShim handles an invocation where argv[0] is a shimmed CLI name (gh, aws, gcloud, wrangler,
