@@ -131,6 +131,10 @@ func (m *MCPBridge) handleRequest(ctx context.Context, rt *core.Runtime, req jso
 					"type":        "boolean",
 					"description": "Run the command with a minimal environment (PATH, HOME, ... plus policy allowed_env and the lease credentials) instead of inheriting the host environment",
 				},
+				"approve": map[string]any{
+					"type":        "boolean",
+					"description": "Ask a human to allow this request before anything is minted (the macOS dialog, plus Telegram or Slack when set up). It only adds a check: a denial, or no channel to ask on, fails the call",
+				},
 				"params": map[string]any{
 					"type":                 "object",
 					"additionalProperties": map[string]any{"type": "string"},
@@ -146,7 +150,7 @@ func (m *MCPBridge) handleRequest(ctx context.Context, rt *core.Runtime, req jso
 				"tools": []map[string]any{
 					{
 						"name":        "mintrun_exec",
-						"description": "Execute a CLI command (e.g. wrangler, curl, terraform, gh) inside a zero-knowledge JIT credential lease. The credential is automatically minted, injected into the subprocess environment, scrubbed from stdout/stderr, and revoked upon exit where the provider allows it (AWS STS and GCP credentials can only expire; the result's revoked field reports which). Each output stream is capped at 4 MiB; truncated=true marks a cut.",
+						"description": "Execute a CLI command (e.g. wrangler, curl, terraform, gh) inside a zero-knowledge JIT credential lease. The credential is automatically minted, injected into the subprocess environment, scrubbed from stdout/stderr, and revoked upon exit where the provider allows it (AWS STS and GCP credentials can only expire; the result's revoked field reports which). Each output stream is capped at 4 MiB; truncated=true marks a cut. The command is killed after 5 minutes.",
 						"inputSchema": execSchema,
 					},
 					{

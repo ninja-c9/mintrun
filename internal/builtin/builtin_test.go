@@ -2,6 +2,7 @@ package builtin
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto"
 	"crypto/ecdsa"
@@ -15,12 +16,15 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1574,6 +1578,20 @@ func TestMCPBridgeExecCleanEnv(t *testing.T) {
 // and mintrun_exec, no argument clears the flag the bridge sets, and the exec is audited with
 // exit 126 before any vault opens. The same exec without vault runs.
 func TestMCPBridgeRefusesVault(t *testing.T) {
+	mcpRefusal(t, `,"vault":"keychain"`, `policy denied: an agent cannot pick the vault (got "keychain"); omit it to use the vault mintrun was started with (MINTRUN_VAULT)`)
+}
+
+// TestMCPBridgeRefusesTimeout pins that an agent cannot lift the 5-minute limit on its command:
+// timeout_seconds is refused the same way, by both tools with the same reason, and audited.
+func TestMCPBridgeRefusesTimeout(t *testing.T) {
+	mcpRefusal(t, `,"timeout_seconds":3600`, `policy denied: an agent cannot set timeout_seconds (got 3600); omit it to run with the 5-minute limit`)
+}
+
+// mcpRefusal sends mintrun_policy_check and mintrun_exec with the extra arguments args (the exec
+// adds a FromAgent argument, which must not clear the flag the bridge sets), then the same exec
+// without them. Both tools must deny with reason, and audit.jsonl must hold the exec's exit-126
+// refusal, then the exit-0 run.
+func mcpRefusal(t *testing.T, args, reason string) {
 	ctx := context.Background()
 	home := t.TempDir()
 	t.Setenv("MINTRUN_HOME", home)
@@ -1594,13 +1612,13 @@ func TestMCPBridgeRefusesVault(t *testing.T) {
 		return false, nil
 	}
 
-	call := func(name, args string) string {
-		return `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + name + `","arguments":{"provider":"cloudflare","permissions":["static"],"command":["true"]` + args + `}}}`
+	call := func(name, extra string) string {
+		return `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + name + `","arguments":{"provider":"cloudflare","permissions":["static"],"command":["true"]` + extra + `}}}`
 	}
 	var out bytes.Buffer
 	in := strings.Join([]string{
-		call("mintrun_policy_check", `,"vault":"keychain"`),
-		call("mintrun_exec", `,"vault":"keychain","FromAgent":false`),
+		call("mintrun_policy_check", args),
+		call("mintrun_exec", args+`,"FromAgent":false`),
 		call("mintrun_exec", ``),
 	}, "\n") + "\n"
 	if err := NewMCPBridge().Serve(ctx, rt, strings.NewReader(in), &out); err != nil {
@@ -1622,17 +1640,16 @@ func TestMCPBridgeRefusesVault(t *testing.T) {
 		}
 	}
 
-	const reason = `policy denied: an agent cannot pick the vault (got "keychain"); omit it to use the vault mintrun was started with (MINTRUN_VAULT)`
 	var d core.PolicyDecision
 	if err := json.Unmarshal([]byte(resps[0].Result.Content[0].Text), &d); err != nil || resps[0].Result.IsError || d != (core.PolicyDecision{Reason: reason}) {
-		t.Fatalf("policy_check naming a vault: got %+v (err=%v), want a denial with %q", resps[0].Result, err, reason)
+		t.Fatalf("policy_check with %s: got %+v (err=%v), want a denial with %q", args, resps[0].Result, err, reason)
 	}
 	if r := resps[1].Result; !r.IsError || r.Content[0].Text != "mintrun execution error: "+reason {
-		t.Fatalf("exec naming a vault: got %+v, want the policy_check reason", r)
+		t.Fatalf("exec with %s: got %+v, want the policy_check reason", args, r)
 	}
 	var res core.ExecResult
 	if r := resps[2].Result; r.IsError || json.Unmarshal([]byte(r.Content[0].Text), &res) != nil || res.ExitCode != 0 {
-		t.Fatalf("exec without a vault: got %+v, want exit 0", r)
+		t.Fatalf("exec without %s: got %+v, want exit 0", args, r)
 	}
 
 	raw, err := os.ReadFile(filepath.Join(home, "audit.jsonl"))
@@ -1649,6 +1666,56 @@ func TestMCPBridgeRefusesVault(t *testing.T) {
 	}
 	if len(es) != 2 || es[0].ExitCode != 126 || es[0].Error != reason || es[1].ExitCode != 0 || es[1].Error != "" {
 		t.Fatalf("audit: got %+v, want the refusal (exit 126) then the run (exit 0)", es)
+	}
+}
+
+// TestMCPExecSchema pins that the input schema of mintrun_exec and mintrun_policy_check lists
+// every argument core.ExecRequest decodes, approve included, except vault and timeout_seconds,
+// which CheckPolicy refuses from an agent. A field added to ExecRequest must be listed or refused.
+func TestMCPExecSchema(t *testing.T) {
+	var want []string
+	var walk func(reflect.Type)
+	walk = func(typ reflect.Type) {
+		for i := range typ.NumField() {
+			f := typ.Field(i)
+			name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+			switch {
+			case f.Anonymous && name == "":
+				walk(f.Type)
+			case name != "-" && name != "vault" && name != "timeout_seconds":
+				want = append(want, cmp.Or(name, f.Name))
+			}
+		}
+	}
+	walk(reflect.TypeOf(core.ExecRequest{}))
+	slices.Sort(want)
+
+	var out bytes.Buffer
+	if err := NewMCPBridge().Serve(context.Background(), nil, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`+"\n"), &out); err != nil {
+		t.Fatal(err)
+	}
+	var resp struct {
+		Result struct {
+			Tools []struct {
+				Name        string
+				InputSchema struct{ Properties map[string]any } `json:"inputSchema"`
+			}
+		}
+	}
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	checked := 0
+	for _, tool := range resp.Result.Tools {
+		if tool.Name == "mintrun_exec" || tool.Name == "mintrun_policy_check" {
+			checked++
+			if got := slices.Sorted(maps.Keys(tool.InputSchema.Properties)); !slices.Equal(got, want) {
+				t.Errorf("%s lists %v, want %v", tool.Name, got, want)
+			}
+		}
+	}
+	if checked != 2 {
+		t.Fatalf("checked %d tools, want mintrun_exec and mintrun_policy_check", checked)
 	}
 }
 

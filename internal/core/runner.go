@@ -33,7 +33,7 @@ type ExecRequest struct {
 	TimeoutSec int      `json:"timeout_seconds,omitempty"`
 	Approve    bool     `json:"approve,omitempty"`   // Require interactive human-in-the-loop approval
 	CleanEnv   bool     `json:"clean_env,omitempty"` // Child gets only the base env + policy allowed_env + Lease.Env (can only tighten policy)
-	FromAgent  bool     `json:"-"`                   // Set by the MCP bridge after decoding: CheckPolicy then refuses any Vault, which only the operator picks
+	FromAgent  bool     `json:"-"`                   // Set by the MCP bridge after decoding: CheckPolicy then refuses any Vault or TimeoutSec, neither of which an agent picks
 }
 
 // ExecResult contains the scrubbed output of a blind command execution.
@@ -186,6 +186,10 @@ func (rt *Runtime) CheckPolicy(req ExecRequest) PolicyDecision {
 	// The vault is the operator's choice (MINTRUN_VAULT, or the CLI's -vault), never an agent's.
 	if req.FromAgent && req.Vault != "" {
 		return deny("policy denied: an agent cannot pick the vault (got %q); omit it to use the vault mintrun was started with (MINTRUN_VAULT)", req.Vault)
+	}
+	// Nor is the timeout an agent's: its timeout_seconds would lift the 5-minute limit to any length.
+	if req.FromAgent && req.TimeoutSec != 0 {
+		return deny("policy denied: an agent cannot set timeout_seconds (got %d); omit it to run with the 5-minute limit", req.TimeoutSec)
 	}
 
 	// Fail closed: a policy.json that exists but cannot be read or parsed denies everything.

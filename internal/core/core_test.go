@@ -976,6 +976,17 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 		req.FromAgent, req.Vault = true, vault
 		return req
 	}
+	agentTimeout := func(sec int) core.ExecRequest {
+		req := agentVault("")
+		req.TimeoutSec = sec
+		return req
+	}
+	// norule moves req to a provider policy.json has no rule for: an agent's vault and timeout are
+	// refused all the same.
+	norule := func(req core.ExecRequest) core.ExecRequest {
+		req.Provider = "norule"
+		return req
+	}
 
 	for _, c := range []struct {
 		rt  *core.Runtime
@@ -994,6 +1005,10 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 		{rt, inst("777")},
 		{rt, inst("555/../777")},
 		{rt, agentVault("keychain")},
+		{rt, norule(agentVault("keychain"))},
+		{rt, agentTimeout(3600)},
+		{rt, agentTimeout(-1)},
+		{rt, norule(agentTimeout(3600))},
 	} {
 		d := c.rt.CheckPolicy(c.req)
 		if _, err := c.rt.ExecBlind(ctx, c.req); d.Allowed || d.Reason == "" || err == nil || err.Error() != d.Reason {
@@ -1049,9 +1064,10 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 		}
 	}
 
-	// The vault stays the operator's: an agent's request without one runs, and so does the CLI's -vault.
+	// The vault and the timeout stay the operator's: an agent's request without them runs, and so
+	// does a request that is not an agent's (the CLI's -vault, a library caller's TimeoutSec).
 	cli := probe("ok.com", []string{"dns:read"}, "true")
-	cli.Vault = "keychain"
+	cli.Vault, cli.TimeoutSec = "keychain", 60
 	for _, req := range []core.ExecRequest{agentVault(""), cli} {
 		d := rt.CheckPolicy(req)
 		if res, err := rt.ExecBlind(ctx, req); !d.Allowed || err != nil || res.ExitCode != 0 {
