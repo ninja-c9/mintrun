@@ -24,9 +24,10 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
    ```bash
    go build -trimpath -o mintrun ./cmd/mintrun && ./mintrun plugin list
    ```
-5. **Opt-In macOS Keychain Integration Check (macOS only):**
+5. **Opt-In macOS Integration Checks (macOS only):**
    ```bash
-   go test -tags integration -count=1 -v -run TestKeychainVaultRealKeychain ./internal/builtin
+   go test -tags integration -count=1 -v -run TestKeychainVaultRealKeychain ./internal/builtin   # real login Keychain
+   go test -tags integration -count=1 -v -run '^TestSandboxHidesHome$' ./internal/core        # real sandbox-exec, throwaway folders
    ```
 
 ---
@@ -388,30 +389,69 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
   go test -count=1 -v -run 'TestCLIShim' ./cmd/mintrun
   ```
 
+### Workstream Y — Sandbox the Blind Command on macOS
+> Planned as Workstream X with rule 41; `main` gave X to the macOS app hooks (§4) and rules 41 and 42 to them, so this is Workstream Y with rule 43.
+
+- **Files:** `internal/core/runner.go`, `internal/core/core_test.go`, `internal/core/sandbox_integration_test.go`, `internal/builtin/mcp.go`, `cmd/mintrun/main.go`, `cmd/mintrun/main_test.go`, `README.md`, `AGENTS.md`, `plan.md`, `checks.md`, `progress.md`
+- **Gap:** the blind command runs as the user, so a command written to steal secrets can read `mintrun`'s home (`vault.json`, `policy.json`, `audit.jsonl`, plugins) or ask the Keychain for the item that holds a master secret (rule 23, README §5). Nothing closed either route.
+- **Design:**
+  - Policy `"sandbox": true` per provider, the CLI's `-sandbox`, and MCP `sandbox` turn the sandbox on. A request can only add it, like `clean_env` (rule 11). `PolicyDecision.Sandbox` reports it, so `mintrun_policy_check` shows it.
+  - On macOS the command runs as `/usr/bin/sandbox-exec -p <profile> -D MINTRUN_DIR=<home> -D KEYCHAINS=<$HOME/Library/Keychains> -- <command> <args>`. The profile allows everything else and denies file reads and writes under both folders, plus the `mach-lookup` of 9 Security services:
+    ```
+    (version 1)
+    (allow default)
+    (deny file-read* file-write* (subpath (param "MINTRUN_DIR")))
+    (deny file-read* file-write* (subpath (param "KEYCHAINS")))
+    (deny mach-lookup
+      (global-name "com.apple.SecurityServer")
+      (global-name "com.apple.securityd.xpc")
+      (global-name "com.apple.securityd.general")
+      (global-name "com.apple.securityd.ckks")
+      (global-name "com.apple.securityd.aps")
+      (global-name "com.apple.securityd.sos")
+      (global-name "com.apple.security.octagon")
+      (global-name "com.apple.security.kcsharing")
+      (global-name "com.apple.security.escrow-update"))
+    ```
+  - `sandbox-exec` execs the command in place, so the child keeps its pid, process group, and exit code. It gets the path Go already resolved, so the sandbox never changes which binary runs, and a failed lookup still fails in `Start`.
+  - The profile matches real paths, so both folders go through `filepath.Abs` and `filepath.EvalSymlinks`. A home not created yet resolves through its parent; an unset home, a missing parent, or a dangling symlink is a denial.
+  - `CheckPolicy` builds the prefix (rule 16): no `sandbox-exec` (any host but macOS), one that cannot be read, or a folder that does not resolve is a denial before any vault opens. The reason keeps only the error's cause, never a path (rule 36). `ExecBlind` runs the exact prefix the check built, so nothing new can fail after the mint.
+  - The audit entry and every error keep the command as the request gave it: the profile and the paths never reach the audit log or an agent.
+  - `SandboxExecPath` is a var, so unit tests run a stub (rule 22).
+- **Spike (2026-10-16 and 2026-10-17, macOS 27.0 build 26A428, a throwaway `HOME`; no real vault or Keychain item was read):**
+  - `pass` The home rule alone: reading `vault.json`, listing the directory, and writing into it fail (exit 1, `Operation not permitted`); other `HOME` files, a local HTTP request (200), and `git` still work.
+  - `pass` The whole profile: `security find-generic-password` can no longer start a search. It exits 44 like a miss, but `stderr` says `One or more parameters passed to a function were not valid` instead of `could not be found`.
+  - `pass` The whole profile: a Go program through the platform verifier, `curl`, `git` over HTTPS, and `python3` `urllib` still reach HTTPS servers, and `curl` still refuses a self-signed certificate.
+  - `pass` The Keychain file rule without the `mach-lookup` names changed nothing a probe could see, so those names are required.
+  - `pass` `sandbox-exec` execs in place (same pid); a missing command exits 71 and a bad profile 65. Paths match case-insensitively. Inside the sandbox, linking a file of a denied folder (symlink or hard link) and reading through a symlink are denied; a hard link made before the command ran stays readable.
+  - `pass` The child could not read its parent's environment: `ps -E -ww -p $PPID` and `sysctl KERN_PROCARGS2` on the parent returned 319 to 742 bytes without the canary, while the same reads of the child's own pid returned 5,012 bytes with it (the positive control). README §5 and rule 23 say this for macOS 27.0 only.
+  - Not tested: `launchctl submit`, or any other request that has a process outside the sandbox run something.
+- **Cost:** inside the sandbox, a tool that keeps its own credential in the Keychain (`gh` with a stored token, `git` with `osxkeychain`) fails; the lease's environment (`GH_TOKEN`, `CLOUDFLARE_API_TOKEN`, …) replaces it.
+- **Not built:** Linux (§3 item 1 keeps the design; `sandbox` is a denial there); `no_network`; neither the approval text nor the audit entry says the sandbox is on; `init policy` does not suggest `sandbox`.
+- **Deliverables:**
+  1. `[SERIAL]` core: the fields, the profile, `SandboxExecPath`, `CheckPolicy`, and `ExecBlind`. `TestExecBlindSandbox`: a stub `sandbox-exec` logs its exact argv for policy only, request only, and policy on with the request off, and is never called when neither is on; a symlinked home, a relative home, and a home not created yet resolve. `TestCheckPolicyMatchesExecBlind`: no `sandbox-exec`, a missing one, no Keychain folder, an unset home, a home whose parent is missing, and a dangling symlink are denied by both, with no path in the reason.
+  2. `[SERIAL]` MCP `sandbox` in both tools' schema (`TestMCPExecSchema`) and the CLI's `-sandbox` (`TestCLIExecSandbox`).
+  3. `[SERIAL]` `-tags integration` tests against the real `sandbox-exec`, each denial with a positive control (the same read without the sandbox; for listing and writing, a listing of `mintrun`'s home without it and a write outside both folders with it): `TestSandboxHidesHome` (a canary file in a throwaway home) and `TestSandboxHidesKeychainItem` (a throwaway login Keychain item, run only after the user's go-ahead).
+  4. `[SERIAL]` Mutants on a copy of the repo, each failing a test, and the hermetic proof with a logging stub `sandbox-exec` (rule 22).
+  5. `[SERIAL]` README, AGENTS.md rule 43 (and `sandbox-exec` in rule 22), `checks.md`, `progress.md`.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCheckPolicyMatchesExecBlind|TestExecBlindSandbox' ./internal/core
+  go test -count=1 -v -run 'TestMCPExecSchema' ./internal/builtin
+  go test -count=1 -v -run 'TestCLIExecSandbox' ./cmd/mintrun
+  go test -count=1 -v -tags integration -run '^TestSandboxHidesHome$' ./internal/core
+  # Only after the user's go-ahead: it stores and deletes a throwaway login Keychain item.
+  go test -count=1 -v -tags integration -run '^TestSandboxHidesKeychainItem$' ./internal/core
+  ```
+
 ---
 
 ## 3. Deferred Backlog (Next Actionable Items)
 
-1. **Child Sandbox: Keep the Blind Command Out of the Vault, awaiting approval:**
-   - **Goal:** while the blind command runs, it cannot read `mintrun`'s home (`~/.mintrun` or `MINTRUN_HOME`: `vault.json`, `policy.json`, `audit.jsonl`, plugins) or the user's Keychain, which closes two routes README §5 lists. It is not isolation: the command still runs as the user, keeps the network and the rest of `HOME`, and can leave something behind (a shell profile line, a LaunchAgent) that runs later outside the sandbox. The docs must say so (rule 23).
-   - **Switch:** policy `"sandbox": true` per provider, and a request flag (CLI `-sandbox`, MCP `sandbox`) that can only tighten it, like `clean_env` (rule 11). The check lives in `CheckPolicy` (rule 16): a sandbox the host cannot provide is a denial before any vault opens.
-   - **macOS:** run `/usr/bin/sandbox-exec -p <profile> -D MINTRUN_DIR=<home> -D KEYCHAINS=<~/Library/Keychains> -- <argv>`, with both paths resolved by `filepath.EvalSymlinks` first, because the profile matches real paths. `sandbox-exec` is deprecated but still ships; a missing one is a denial.
-     ```
-     (version 1)
-     (allow default)
-     (deny file-read* file-write* (subpath (param "MINTRUN_DIR")))
-     (deny file-read* file-write* (subpath (param "KEYCHAINS")))
-     (deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd.xpc"))
-     ```
-   - **Spike (2026-10-16, macOS 27.0 build 26A428, a throwaway `HOME`; no real vault or Keychain item was read):**
-     - `pass` The first rule alone: reading `vault.json`, listing the directory, and writing into it fail (exit 1); other `HOME` files, a local HTTP request (200), and `git` still work.
-     - `pass` The whole profile: `security find-generic-password` can no longer start a search (a parameter error on `stderr`; the exit code stays 44, so only `stderr` tells it from a miss); TLS through Go's platform verifier and `curl` (200), `git`, and `python3` still work.
-     - `pass` The Keychain file rule without the two `mach-lookup` names changed nothing a probe could see, so those names are required.
-     - `pass` The child could not read its parent's environment: `ps -E -ww -p $PPID` and `sysctl KERN_PROCARGS2` on the parent returned 319 to 742 bytes without the canary, while the same reads of the child's own pid returned 5,012 bytes with it (the positive control), also outside the sandbox the test shell ran in. README §5 and rule 23 now say this for macOS 27.0 only; older releases and a debugger attach are untested.
-     - `unresolved` A real Keychain item becoming unreadable inside the profile: needs a throwaway item, read once outside (found) and once inside (refused), in a `-tags integration` test run with the user's go-ahead.
-   - **Cost:** inside the sandbox, tools that keep their own credential in the Keychain (`gh` with a stored token, `git` with `osxkeychain`) fail; the lease's environment (`GH_TOKEN`, `CLOUDFLARE_API_TOKEN`, …) replaces them.
-   - **Linux (design only):** Landlock only grants access, so hiding one directory means granting every other path. Instead `mintrun` re-executes itself in new user and mount namespaces (`SysProcAttr.Cloneflags`), mounts an empty `tmpfs` over its home, and then `exec`s the command. Ubuntu 24.04 blocks unprivileged user namespaces by default (`kernel.apparmor_restrict_unprivileged_userns=1`), so the check must probe and deny. libsecret answers over the D-Bus session bus, which a mount namespace does not hide, so `sandbox` is a denial on Linux until a test proves `secret-tool lookup` fails inside. `/proc/$PPID/environ` stays readable unless `mintrun` makes itself non-dumpable (`PR_SET_DUMPABLE`, untested).
-   - **Tests:** the denials (no `sandbox-exec`, Linux) pinned in `TestCheckPolicyMatchesExecBlind`; a stub `sandbox-exec` that records the profile and the resolved paths; a `-tags integration` test that runs the real profile against a throwaway home and Keychain item.
+1. **Child Sandbox on Linux, design only:**
+   - **Goal:** what Workstream Y does on macOS: the blind command cannot read `mintrun`'s home or ask the keystore for a master secret. Until it is built, `sandbox` is a denial on Linux. It is not isolation either: the command still runs as the user, keeps the network and the rest of `HOME`, and can leave something behind that runs later outside the sandbox (rule 23).
+   - **Design:** Landlock only grants access, so hiding one directory means granting every other path. Instead `mintrun` re-executes itself in new user and mount namespaces (`SysProcAttr.Cloneflags`), mounts an empty `tmpfs` over its home, and then `exec`s the command. Ubuntu 24.04 blocks unprivileged user namespaces by default (`kernel.apparmor_restrict_unprivileged_userns=1`), so the check must probe and deny. libsecret answers over the D-Bus session bus, which a mount namespace does not hide, so `sandbox` is a denial on Linux until a test proves `secret-tool lookup` fails inside. `/proc/$PPID/environ` stays readable unless `mintrun` makes itself non-dumpable (`PR_SET_DUMPABLE`, untested).
+   - **Tests:** a `-tags integration` test on a Linux host like `TestSandboxHidesHome`, plus `secret-tool lookup` of a throwaway item failing inside.
    - **`no_network` stays open:** every built-in provider's CLI calls a network API, so it fits offline commands only, and a macOS `(deny network*)` also blocks Unix sockets (`ssh-agent`, Docker).
 2. **Linux Host Verification:**
    - Run integration tests against real `secret-tool` on Linux, and `-approve` with Telegram and Slack as the only channels (`OSApproval` is macOS-only).

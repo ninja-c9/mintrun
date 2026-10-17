@@ -15,7 +15,7 @@ Engineered with **100% Go standard library**, **zero external dependencies**, an
   <a href="https://github.com/ninja-c9/mintrun/blob/main/go.mod"><img src="https://img.shields.io/badge/Go-1.24.0-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go 1.24.0" /></a>
   <a href="#architecture-everything-is-a-plugin"><img src="https://img.shields.io/badge/Dependencies-Zero_(100%25_stdlib)-10B981?style=flat-square" alt="Zero Dependencies" /></a>
   <a href="#ai-agent-integration-mcp"><img src="https://img.shields.io/badge/MCP-JSON--RPC_2.0_Ready-38BDF8?style=flat-square" alt="MCP Ready" /></a>
-  <a href="#verification--testing"><img src="https://img.shields.io/badge/Coverage-94.4%25_Verified-A78BFA?style=flat-square" alt="94.4% Coverage" /></a>
+  <a href="#verification--testing"><img src="https://img.shields.io/badge/Coverage-95.0%25_Verified-A78BFA?style=flat-square" alt="95.0% Coverage" /></a>
 </p>
 
 <p align="center">
@@ -128,7 +128,8 @@ mintrun/
 │   │   ├── plugin.go                     # Plugin ABI, Registry, SHA-256 pinning & ExternalPlugin SDK
 │   │   ├── runner.go                     # ExecBlind lifecycle, Policy Engine, 5-Encoding Scrubber, Output Cap, TailAudit
 │   │   ├── procgroup_*.go                # Process-group kill on timeout/cancel (Unix; no-op elsewhere)
-│   │   └── core_test.go                  # Core JIT mint, scrub, revoke, policy & MCP test suite
+│   │   ├── core_test.go                  # Core JIT mint, scrub, revoke, policy & MCP test suite
+│   │   └── sandbox_integration_test.go   # Real macOS sandbox-exec checks (`-tags integration` only)
 │   └── builtin/
 │       ├── keychain.go                   # macOS Keychain / Linux libsecret + AES-256-GCM fallback & 1Password vault
 │       ├── cloudflare.go                 # Built-in Cloudflare, GitHub (RS256 JWT), AWS STS (SigV4) & GCP (JWT bearer) providers
@@ -327,9 +328,9 @@ Connect `mintrun` to **Google Antigravity**, **Claude Code**, **Cursor**, or **W
 
 | Tool Name | Description | Key Parameters |
 | :--- | :--- | :--- |
-| **`mintrun_exec`** | Mints a scoped JIT credential, runs the target CLI command in a blind subprocess, scrubs all secret strings from `stdout`/`stderr`, and revokes the credential before returning where the provider allows it (AWS STS and GCP credentials can only expire; `revoked` reports which). Each output stream is capped at 4 MiB; `truncated: true` marks a cut. The command is killed after 5 minutes. | `provider` (`"cloudflare"`), `scope` (`"example.com"`), `permissions` (`["dns:write","workers:write"]`), `command` (`["wrangler","deploy"]`), `cwd`, `ttl_seconds`, `clean_env`, `params` (`{"installation_id":"12345678"}` picks a `github` App installation), `approve` (`true` asks a human first) |
+| **`mintrun_exec`** | Mints a scoped JIT credential, runs the target CLI command in a blind subprocess, scrubs all secret strings from `stdout`/`stderr`, and revokes the credential before returning where the provider allows it (AWS STS and GCP credentials can only expire; `revoked` reports which). Each output stream is capped at 4 MiB; `truncated: true` marks a cut. The command is killed after 5 minutes. | `provider` (`"cloudflare"`), `scope` (`"example.com"`), `permissions` (`["dns:write","workers:write"]`), `command` (`["wrangler","deploy"]`), `cwd`, `ttl_seconds`, `clean_env`, `sandbox` (`true` runs the command in the [macOS sandbox](#1-declarative-policy-guardrails-mintrunpolicyjson)), `params` (`{"installation_id":"12345678"}` picks a `github` App installation), `approve` (`true` asks a human first) |
 | **`mintrun_plugins`** | Lists all registered built-in and external plugins (`vault`, `provider`, `bridge`) along with their supported permission scopes. | *(none)* |
-| **`mintrun_policy_check`** | Dry-runs a `mintrun_exec` request against `policy.json` and the anti-exfiltration guard, through the same gate `mintrun_exec` enforces. Never opens the vault, mints, runs the command, or asks a human. Returns `allowed`, the denial `reason` (the exact error `mintrun_exec` would return), `approval_required`, `ttl_seconds` (the TTL requested from the provider after `max_ttl_seconds`; `gcp` tokens always live up to 1h), and `clean_env`. | Same as `mintrun_exec` |
+| **`mintrun_policy_check`** | Dry-runs a `mintrun_exec` request against `policy.json` and the anti-exfiltration guard, through the same gate `mintrun_exec` enforces. Never opens the vault, mints, runs the command, or asks a human. Returns `allowed`, the denial `reason` (the exact error `mintrun_exec` would return), `approval_required`, `ttl_seconds` (the TTL requested from the provider after `max_ttl_seconds`; `gcp` tokens always live up to 1h), `clean_env`, and `sandbox`. | Same as `mintrun_exec` |
 | **`mintrun_audit`** | Returns recent audit entries, oldest first, filtered like `mintrun audit`. Each command is cut to its binary name plus `[MINTRUN:REDACTED]`: a policy-denied entry keeps the raw `argv` (no secret is loaded yet to scrub against), and a secret typed into `argv` is one the runner never holds, so arguments never reach an agent. The on-disk log keeps the full `argv` for the operator. | `provider` (case-insensitive), `failed_only`, `limit` (default 20, max 100) |
 
 The vault is yours to pick, never the agent's: `mintrun mcp` reads every master secret from the vault it was started with (`MINTRUN_VAULT`, or `keychain`). A `mintrun_exec` or `mintrun_policy_check` request that names a vault (`vault`), even that same one, is denied with the same reason by both, and the denied `mintrun_exec` goes to the audit log like any other denial. Nor does an agent set the time limit: its command is killed after 5 minutes, like one run with `mintrun exec`, and a request that sets `timeout_seconds` is denied the same way.
@@ -404,6 +405,8 @@ If `~/.mintrun/policy.json` exists but cannot be read (a directory, a file witho
 
 **Child environment isolation:** `clean_env: true` (or any non-empty `allowed_env`) runs the command with only `PATH`, `HOME`, `TMPDIR`, `USER`, `LANG`, `TERM`, `SSL_CERT_FILE`, the `allowed_env` globs, and the lease env, so ambient host secrets such as `SSH_AUTH_SOCK` or other cloud keys never reach the child. A caller can request the same per run with `-clean-env` (CLI) or `clean_env` (MCP), but cannot switch off a policy that enables it. `MINTRUN_VAULT_KEY` is never passed to a child, even when allowlisted.
 
+**Sandbox (macOS):** `"sandbox": true` runs every command for that provider under `/usr/bin/sandbox-exec`, with a profile that denies reads and writes in `mintrun`'s home (`~/.mintrun`: `vault.json`, `policy.json`, `audit.jsonl`) and in your Keychain folder (`~/Library/Keychains`), and denies the system services the Security framework reaches the Keychain through. A caller can ask for it per run with `-sandbox` (CLI) or `sandbox` (MCP), but cannot switch off a policy that enables it. When the sandbox is on but cannot be set up (no `sandbox-exec`, so on every OS but macOS, or a folder that cannot be resolved), the request is denied before any secret is loaded, never run without it. See [what it blocks and what it does not](#5-what-the-vault-protects-and-what-it-does-not).
+
 **GitHub App installations:** a credential stored as `<app_id>:<installation_id>:<private_key_pem>` or `<installation_id>:<app_jwt>` pins one installation, and `github` refuses an MCP `params.installation_id` that names a different one before any request reaches GitHub, so a pinned credential needs no policy rule. To let agents pick among several installations, store `<app_id>::<private_key_pem>` (no installation) and list the IDs they may use:
 
 ```json
@@ -438,11 +441,19 @@ On Unix the command runs in its own process group. A timeout (5 minutes) or a `S
 | **macOS Keychain / Linux libsecret** | Other users and a copy of the disk; the secret never touches `argv`, `ps`, or shell history | Any process running as your user while the keychain is unlocked: it can run `security find-generic-password` or `secret-tool lookup` itself |
 | **Encrypted file vault** (`~/.mintrun/vault.json`) | A copy of `vault.json` (backup, sync folder, lost disk) without the passphrase: AES-256-GCM with a key derived from `MINTRUN_VAULT_KEY` (PBKDF2-HMAC-SHA256, 210,000 iterations, per-vault random salt); a tampered file fails to decrypt | Any process running as your user that can read both `vault.json` and the passphrase (from a shell profile, an MCP config file, or, on Linux, `mintrun`'s environment), a keylogger, or offline guessing of a weak passphrase |
 
-The blind command is such a process. `mintrun` never passes `MINTRUN_VAULT_KEY` to it, which stops accidental exposure (an `env` dump, a debug log), but a command written to steal secrets can still query the keystore, or read `vault.json` and look for the passphrase (a shell profile, an MCP config file, and on Linux `mintrun`'s own environment through `/proc/$PPID/environ`). On macOS 27.0, `ps -E` and `sysctl` showed another process's arguments but not its environment in our test; older releases are untested. `mintrun` keeps raw secrets out of the agent's context and transcripts; it does not sandbox the command it runs. Block what an agent must not run with `blocked_commands`, and use `require_approval` (macOS dialog or Telegram) to see each command before it runs.
+The blind command is such a process. `mintrun` never passes `MINTRUN_VAULT_KEY` to it, which stops accidental exposure (an `env` dump, a debug log), but a command written to steal secrets can still query the keystore, or read `vault.json` and look for the passphrase (a shell profile, an MCP config file, and on Linux `mintrun`'s own environment through `/proc/$PPID/environ`). On macOS 27.0, `ps -E` and `sysctl` showed another process's arguments but not its environment in our test; older releases are untested. `mintrun` keeps raw secrets out of the agent's context and transcripts; unless the [sandbox](#1-declarative-policy-guardrails-mintrunpolicyjson) is on, it does not confine the command it runs. Block what an agent must not run with `blocked_commands`, and use `require_approval` (macOS dialog, Telegram, or Slack) to see each command before it runs.
+
+**What the sandbox blocks.** `TestSandboxHidesHome` runs real commands under `sandbox-exec` on macOS 27.0: a sandboxed command cannot read, list, or write `mintrun`'s home or the Keychain folder by its path, nor read `mintrun`'s home through a symlink or in other letter case, while its exit code and environment (where the lease travels) come through unchanged. In a manual check on macOS 27.0, `security find-generic-password` also failed inside the sandbox (exit 44, as for a missing item). `TestSandboxHidesKeychainItem`, opt-in because it stores a throwaway item in your login Keychain and then deletes it, shows the same for a real item on macOS 27.0: without the sandbox, a command read the item with `security` and read the login Keychain file; inside it, `security` exited 44 and reading the file was denied. What it does **not** do:
+
+- **Block the network.** The same test fetches a local URL with `curl` from inside the sandbox, and in the manual check `curl`, `git`, and `python3` reached HTTPS sites, so a command can still send its lease credential anywhere (see [6](#6-known-gap-no-network-sandbox)).
+- **Block a hard link made beforehand.** The profile matches paths, so a hard link to a file in `mintrun`'s home, made beforehand in another folder, stays readable (the test shows this).
+- **Confine other processes.** A sandboxed command could ask a process outside the sandbox to act for it (an Apple Event to Terminal, `launchctl`, `ssh` to this machine). None of that is blocked, and none of it has been tested. The agent itself is not confined either: an agent with its own shell can query the Keychain without `mintrun`.
+- **Keep Keychain logins working.** In the manual check, a tool that reads its own login from the Keychain (`gh` storing its token there, `git` with the `osxkeychain` helper) failed inside the sandbox; use the lease `mintrun` injects instead.
+- **Work beyond macOS, or beyond `sandbox-exec`.** On every other OS a sandboxed request is denied. Apple marks `sandbox-exec` deprecated; it works on macOS 27.0, and if a later release drops it, sandboxed requests are denied, not run.
 
 ### 6. Known Gap: No Network Sandbox
 
-A blind command keeps network access, so it can send its lease credential elsewhere (`curl`, `nc`, any script interpreter). `blocked_commands` (e.g. `curl`, `wget`, `nc`), `clean_env`, and short TTLs narrow this; they do not stop an interpreter. A planned `no_network: true` policy flag would run the command in a Linux network namespace or a macOS `sandbox-exec` deny-network profile, and refuse to run when neither is available. It needs per-OS integration tests before it can be trusted, so it is not built yet.
+A blind command keeps network access, in the sandbox too, so it can send its lease credential elsewhere (`curl`, `nc`, any script interpreter). `blocked_commands` (e.g. `curl`, `wget`, `nc`), `clean_env`, and short TTLs narrow this; they do not stop an interpreter. A planned `no_network: true` policy flag would run the command in a Linux network namespace or under a `sandbox-exec` profile that also denies the network, and refuse to run when neither is available. It needs per-OS integration tests before it can be trusted, so it is not built yet.
 
 ---
 
@@ -553,13 +564,19 @@ A reply that does not decode, such as text that is not JSON or an `expires_at` t
 
 ## Verification & Testing
 
-`mintrun` ships with a deterministic, offline unit and integration test suite (**94.4%** total statement coverage, measured without build tags) that mocks Cloudflare, GitHub App RS256, AWS STS SigV4 (plus a fixed AWS signing vector), Google OAuth2 JWT-bearer, Telegram Bot, and Slack Web APIs plus the macOS `security` and `osascript`, Linux `secret-tool`, 1Password `op`, and `stty` CLIs, checks child environment isolation, the output cap, and the process-group kill, verifies AES-256-GCM encryption at rest, tests multi-encoding leak scrubbing, enforces policy guardrails, validates external plugin execution and the governance tools over MCP, installs and runs the [example plugins](examples/plugins/README.md) against a stub `bw`, a stub `psql`, and a local Vercel API (skipped without `python3`), and runs `mintrun init`, `mintrun doctor`, and `mintrun shim` in a throwaway home directory against stub `git`, `claude`, and `open`. It never touches the real Keychain, Telegram, Slack, Bitwarden, Vercel, a database, or your IDE configs:
+`mintrun` ships with a deterministic, offline unit and integration test suite (**95.0%** total statement coverage, measured without build tags) that mocks Cloudflare, GitHub App RS256, AWS STS SigV4 (plus a fixed AWS signing vector), Google OAuth2 JWT-bearer, Telegram Bot, and Slack Web APIs plus the macOS `security`, `osascript`, and `sandbox-exec`, Linux `secret-tool`, 1Password `op`, and `stty` CLIs, checks child environment isolation, the sandbox gate, the output cap, and the process-group kill, verifies AES-256-GCM encryption at rest, tests multi-encoding leak scrubbing, enforces policy guardrails, validates external plugin execution and the governance tools over MCP, installs and runs the [example plugins](examples/plugins/README.md) against a stub `bw`, a stub `psql`, and a local Vercel API (skipped without `python3`), and runs `mintrun init`, `mintrun doctor`, and `mintrun shim` in a throwaway home directory against stub `git`, `claude`, and `open`. It never touches the real Keychain, Telegram, Slack, Bitwarden, Vercel, a database, or your IDE configs:
 
 ```bash
 go test -v -cover ./...
 
 # macOS only: round-trip throwaway single-item and multi-part secrets through the real Keychain
 go test -tags integration -count=1 -v -run TestKeychainVaultRealKeychain ./internal/builtin
+
+# macOS only: run real commands under sandbox-exec against a throwaway home and Keychain folder
+go test -tags integration -count=1 -v -run TestSandboxHidesHome ./internal/core
+
+# macOS only: store a throwaway item in your login Keychain, check that a sandboxed command cannot read it, then delete it
+go test -tags integration -count=1 -v -run TestSandboxHidesKeychainItem ./internal/core
 ```
 
 ---
