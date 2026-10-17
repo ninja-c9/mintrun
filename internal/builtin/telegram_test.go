@@ -40,8 +40,8 @@ func TestTelegramApproval(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	if _, err := approve(ctx, req); err == nil || !strings.Contains(err.Error(), "not configured") {
-		t.Fatalf("no config: got %v, want a not-configured error", err)
+	if _, err := approve(ctx, req); err == nil || err.Error() != `telegram approval: not configured: secret "approval-telegram" not found in vault (run mintrun init telegram)` {
+		t.Fatalf("no config: got %v, want a not-configured error naming mintrun init telegram once", err)
 	}
 	for _, bad := range []string{"SECRETVALUE", "abc:123:SECRETVALUE", "0:123:SECRETVALUE", "4242:SECRETVALUE", "4242:123:SECRET/VALUE"} {
 		if err := kv.SetSecret(ctx, TelegramApprovalKey, bad); err != nil {

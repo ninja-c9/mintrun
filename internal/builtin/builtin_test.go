@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -795,6 +796,36 @@ func TestFileVaultPassphraseRequiredPhase45PRC(t *testing.T) {
 	}
 	if onDisk2["__salt__"] == onDisk["__salt__"] {
 		t.Fatal("expected a fresh salt on re-write")
+	}
+}
+
+// TestSecretNotFoundHint pins the fix a missing secret names: the mintrun init step for a key init
+// sets up, mintrun secret set for any other. The miss still wraps ErrSecretNotFound (mintrun doctor
+// reads it as "not set"), and ExecBlind passes it on without a second hint.
+func TestSecretNotFoundHint(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	kv := &KeychainVault{HomeDir: home, ForceFile: true}
+	for key, want := range map[string]string{
+		"github":            `secret "github" not found in vault (run mintrun init github)`,
+		" AWS ":             `secret " AWS " not found in vault (run mintrun init aws)`,
+		TelegramApprovalKey: `secret "approval-telegram" not found in vault (run mintrun init telegram)`,
+		SlackApprovalKey:    `secret "approval-slack" not found in vault (run mintrun init slack)`,
+		"vercel":            `secret "vercel" not found in vault (run mintrun secret set vercel)`,
+	} {
+		if _, err := kv.GetSecret(ctx, key); err == nil || err.Error() != want || !errors.Is(err, ErrSecretNotFound) {
+			t.Errorf("GetSecret(%q) = %v, want %q wrapping ErrSecretNotFound", key, err, want)
+		}
+	}
+
+	reg := core.NewRegistry()
+	_ = reg.Register(kv)
+	_ = reg.Register(NewGitHubProvider())
+	rt := core.NewRuntime(home, "keychain", reg)
+	_, err := rt.ExecBlind(ctx, core.ExecRequest{MintRequest: core.MintRequest{Provider: "github", Scope: "owner/repo"}, Command: []string{"true"}})
+	want := `vault "keychain" could not load master secret for "github": secret "github" not found in vault (run mintrun init github)`
+	if err == nil || err.Error() != want || !errors.Is(err, ErrSecretNotFound) {
+		t.Fatalf("ExecBlind = %v, want %q wrapping ErrSecretNotFound", err, want)
 	}
 }
 

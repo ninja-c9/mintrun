@@ -531,9 +531,25 @@ func (k *KeychainVault) getFileSecret(key string) (string, error) {
 	}
 	v, ok := m[k.serviceName(key)]
 	if !ok || v == "" {
-		return "", fmt.Errorf("secret %q %w", key, ErrSecretNotFound)
+		return "", fmt.Errorf("secret %q %w (run %s)", key, ErrSecretNotFound, setupHint(key))
 	}
 	return v, nil
+}
+
+// setupHint names the command that stores key: the mintrun init step for a key init sets up
+// (initSteps in cmd/mintrun/setup.go), otherwise mintrun secret set. It folds case and space as
+// serviceName does.
+func setupHint(key string) string {
+	switch k := strings.TrimSpace(strings.ToLower(key)); k {
+	case "github", "aws", "gcp", "cloudflare":
+		return "mintrun init " + k
+	case TelegramApprovalKey:
+		return "mintrun init telegram"
+	case SlackApprovalKey:
+		return "mintrun init slack"
+	default:
+		return "mintrun secret set " + k
+	}
 }
 
 func (k *KeychainVault) setFileSecret(key, value string) error {

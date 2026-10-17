@@ -131,7 +131,7 @@ func TelegramApproval(rt *core.Runtime) func(context.Context, core.ExecRequest) 
 		}
 		cfg, err := vault.GetSecret(ctx, TelegramApprovalKey)
 		if err != nil {
-			return false, fmt.Errorf("telegram approval: not configured (mintrun secret set %s): %v", TelegramApprovalKey, err)
+			return false, fmt.Errorf("telegram approval: not configured: %v", err)
 		}
 		userID, token, err := ParseTelegramConfig(cfg)
 		if err != nil {

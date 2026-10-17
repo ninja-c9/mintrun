@@ -49,7 +49,7 @@ func SlackApproval(rt *core.Runtime) func(context.Context, core.ExecRequest) (bo
 		}
 		cfg, err := vault.GetSecret(ctx, SlackApprovalKey)
 		if err != nil {
-			return false, fmt.Errorf("slack approval: not configured (mintrun secret set %s): %v", SlackApprovalKey, err)
+			return false, fmt.Errorf("slack approval: not configured: %v", err)
 		}
 		user, token, err := ParseSlackConfig(cfg)
 		if err != nil {

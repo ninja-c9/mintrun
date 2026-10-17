@@ -41,8 +41,8 @@ func TestSlackApproval(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	if _, err := approve(ctx, req); err == nil || !strings.Contains(err.Error(), "not configured") {
-		t.Fatalf("no config: got %v, want a not-configured error", err)
+	if _, err := approve(ctx, req); err == nil || err.Error() != `slack approval: not configured: secret "approval-slack" not found in vault (run mintrun init slack)` {
+		t.Fatalf("no config: got %v, want a not-configured error naming mintrun init slack once", err)
 	}
 	for _, bad := range []string{"SECRETVALUE", "U0OWNER:SECRETVALUE", "u0owner:xoxb-SECRETVALUE", "C0CHAN:xoxb-SECRETVALUE",
 		":xoxb-SECRETVALUE", "U0OWNER:xoxb-SECRET/VALUE", "U0OWNER:xoxp-SECRETVALUE"} {
