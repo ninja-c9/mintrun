@@ -403,11 +403,14 @@ func (k *KeychainVault) vaultKey(salt []byte) ([32]byte, error) {
 }
 
 func (k *KeychainVault) readMap() (map[string]string, error) {
-	raw, err := os.ReadFile(k.vaultFilePath())
+	p := k.vaultFilePath()
+	// Only a missing vault.json is an empty vault. Lstat, so a link to a missing file (a volume
+	// that is not mounted) fails instead of reading as empty, which the next store would replace.
+	if _, err := os.Lstat(p); errors.Is(err, fs.ErrNotExist) {
+		return make(map[string]string), nil
+	}
+	raw, err := os.ReadFile(p)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return make(map[string]string), nil
-		}
 		// Keep only the cause: the path names the home, and the text reaches agents (rule 36).
 		var pe *fs.PathError
 		if errors.As(err, &pe) {
@@ -498,7 +501,11 @@ func (k *KeychainVault) writeMap(m map[string]string) error {
 	if err != nil {
 		return err
 	}
-	return WriteFileAtomic(k.vaultFilePath(), raw, 0o600)
+	p := k.vaultFilePath()
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		p = r // a linked vault.json is written where it lives, not replaced by a file in the home
+	}
+	return WriteFileAtomic(p, raw, 0o600)
 }
 
 // WriteFileAtomic writes to a temp file in the same directory, fsyncs it, then

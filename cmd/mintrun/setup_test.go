@@ -377,6 +377,15 @@ func TestCLIDoctor(t *testing.T) {
 			setSecret(t, "github", "1:2:"+leak)
 			t.Setenv("MINTRUN_VAULT_KEY", "another-passphrase")
 		}, 1, []string{"FAIL  secret github: decrypt vault (wrong MINTRUN_VAULT_KEY?)"}},
+		{"vault.json links to a missing file", func(t *testing.T, home, self string) {
+			p := filepath.Join(home, ".mintrun", "vault.json")
+			if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(p+".missing", p); err != nil {
+				t.Fatal(err)
+			}
+		}, 1, []string{"FAIL  secret github: read vault.json: no such file or directory\n", "FAIL  approval: read vault.json: no such file or directory\n"}},
 		{"nothing on PATH", func(t *testing.T, home, self string) {
 			t.Setenv("PATH", t.TempDir())
 		}, 0, []string{"warn  PATH: no mintrun on it"}},

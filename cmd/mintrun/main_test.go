@@ -268,7 +268,8 @@ func TestCLISecretArgvWarning(t *testing.T) {
 }
 
 // TestCLISecretCheckReportsVaultError: a miss shows the vault's hint once, and a vault that cannot
-// be read (a wrong MINTRUN_VAULT_KEY) says so instead of calling the secret missing.
+// be read (a wrong MINTRUN_VAULT_KEY, or a vault.json that links to a missing file) says so instead
+// of calling the secret missing.
 func TestCLISecretCheckReportsVaultError(t *testing.T) {
 	for _, c := range []struct {
 		name  string
@@ -280,6 +281,15 @@ func TestCLISecretCheckReportsVaultError(t *testing.T) {
 			setSecret(t, "cloudflare", "cf-"+leak)
 			t.Setenv("MINTRUN_VAULT_KEY", "wrong-"+leak)
 		}, `could not read vault "keychain" to check secret "cloudflare": decrypt vault (wrong MINTRUN_VAULT_KEY?): cipher: message authentication failed`},
+		{"vault.json links to a missing file", func(t *testing.T, home string) {
+			p := filepath.Join(home, ".mintrun", "vault.json")
+			if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(p+".missing", p); err != nil {
+				t.Fatal(err)
+			}
+		}, `could not read vault "keychain" to check secret "cloudflare": read vault.json: no such file or directory`},
 		{"empty value", func(t *testing.T, home string) {
 			dir := filepath.Join(home, ".mintrun", "plugins", "emptyvault")
 			writeFile(t, filepath.Join(dir, "plugin.json"), `{"name":"emptyvault","kind":"vault"}`)

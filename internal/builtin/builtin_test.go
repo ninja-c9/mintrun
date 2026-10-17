@@ -853,6 +853,61 @@ func TestSecretNotFoundHint(t *testing.T) {
 	}
 }
 
+// TestFileVaultSymlink: only a missing vault.json is an empty vault (rule 36). A link to a missing
+// file (a volume that is not mounted) fails every read and write with the cause alone, never a miss,
+// and stays in place; once the file is back, reads and writes go through the link to it.
+func TestFileVaultSymlink(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	kv := &KeychainVault{HomeDir: home, ForceFile: true}
+	p := filepath.Join(home, "vault.json")
+	if _, err := kv.GetSecret(ctx, "github"); !errors.Is(err, ErrSecretNotFound) {
+		t.Fatalf("GetSecret with no vault.json = %v, want a miss", err)
+	}
+
+	target := filepath.Join(home, "volume", "vault.json")
+	if err := os.Symlink(target, p); err != nil {
+		t.Fatal(err)
+	}
+	const want = "read vault.json: no such file or directory"
+	_, getErr := kv.GetSecret(ctx, "github")
+	for name, err := range map[string]error{
+		"GetSecret":    getErr,
+		"SetSecret":    kv.SetSecret(ctx, "github", "gh-secret"),
+		"DeleteSecret": kv.DeleteSecret(ctx, "github"),
+	} {
+		if err == nil || err.Error() != want || errors.Is(err, ErrSecretNotFound) {
+			t.Errorf("%s = %v, want %q, not a miss", name, err, want)
+		}
+	}
+	if got, err := os.Readlink(p); err != nil || got != target {
+		t.Fatalf("vault.json is no longer the link: %q %v", got, err)
+	}
+
+	vol := &KeychainVault{HomeDir: filepath.Dir(target), ForceFile: true}
+	if err := vol.SetSecret(ctx, "github", "gh-secret"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := kv.GetSecret(ctx, "github"); err != nil || got != "gh-secret" {
+		t.Fatalf("GetSecret through the link = %q %v", got, err)
+	}
+	if err := kv.SetSecret(ctx, "aws", "aws-secret"); err != nil {
+		t.Fatal(err)
+	}
+	if err := kv.DeleteSecret(ctx, "github"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.Readlink(p); err != nil || got != target {
+		t.Fatalf("a write replaced the link: %q %v", got, err)
+	}
+	if got, err := vol.GetSecret(ctx, "aws"); err != nil || got != "aws-secret" {
+		t.Fatalf("the store missed the linked file: %q %v", got, err)
+	}
+	if _, err := vol.GetSecret(ctx, "github"); !errors.Is(err, ErrSecretNotFound) {
+		t.Fatalf("the delete missed the linked file: %v", err)
+	}
+}
+
 // TestGCPProviderPhase5 drives the GCP provider against an offline mock OAuth2 server: the
 // JWT bearer assertion must be RS256-signed by the service-account key with the expected
 // claims, and every error path must stay scrubbed of the assertion and private key.
@@ -1147,6 +1202,29 @@ esac
 	t.Setenv("MINTRUN_VAULT_KEY", "mintrun-unit-test-passphrase")
 	if got, err := kv.getFileSecret("rotated"); err != nil || got != "file_copy_val" {
 		t.Fatalf("a store without a passphrase must leave vault.json as it was: %q %v", got, err)
+	}
+
+	// A vault.json that links to a missing file may still hold a copy: a libsecret store succeeds
+	// and warns that it may remain, a delete fails, neither names the path, and the link stays.
+	p := kv.vaultFilePath()
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(p+".missing", p); err != nil {
+		t.Fatal(err)
+	}
+	warn.Reset()
+	if err := kv.SetSecret(ctx, "rotated", "linked_val"); err != nil {
+		t.Fatalf("a libsecret store must succeed while vault.json links to a missing file: %v", err)
+	}
+	if w := warn.String(); !strings.Contains(w, `stored "rotated" in the OS keystore, but an older copy may remain in the encrypted file vault (read vault.json: no such file or directory)`) || strings.Contains(w, "linked_val") || strings.Contains(w, dir) {
+		t.Fatalf("expected a warning that the file-vault copy may remain, without the secret or path:\n%s", w)
+	}
+	if err := kv.DeleteSecret(ctx, "rotated"); err == nil || err.Error() != "read vault.json: no such file or directory" {
+		t.Fatalf("a delete that cannot read vault.json must fail with the cause alone: %v", err)
+	}
+	if got, err := os.Readlink(p); err != nil || got != p+".missing" {
+		t.Fatalf("vault.json is no longer the link: %q %v", got, err)
 	}
 }
 
@@ -1642,9 +1720,10 @@ func TestMCPBridgeAuditUnreadable(t *testing.T) {
 }
 
 // TestMCPBridgeExecUnreadable runs mintrun_exec when the master secret or the lease cannot be had:
-// vault.json is a directory or a file without read permission (which root reads anyway), a plugin
-// provider's entrypoint is gone, or a plugin vault's entrypoint is not executable. The agent and
-// audit.jsonl get the cause, never the path, which names the home (rule 36).
+// vault.json is a directory, a link to a missing file, or a file without read permission (which
+// root reads anyway), a plugin provider's entrypoint is gone, or a plugin vault's entrypoint is
+// not executable. The agent and audit.jsonl get the cause, never the path, which names the home
+// (rule 36).
 func TestMCPBridgeExecUnreadable(t *testing.T) {
 	t.Setenv("MINTRUN_VAULT_KEY", "mintrun-mcp-unreadable-test-passphrase")
 	t.Setenv("MINTRUN_APPROVE", "")
@@ -1668,6 +1747,13 @@ func TestMCPBridgeExecUnreadable(t *testing.T) {
 			}
 			return os.Mkdir(p, 0o700)
 		}, `vault "keychain" could not load master secret for "canary": read vault.json: is a directory`},
+		{"vault.json links to a missing file", "keychain", false, func(home string) error {
+			p := filepath.Join(home, "vault.json")
+			if err := os.Remove(p); err != nil {
+				return err
+			}
+			return os.Symlink(p+".missing", p)
+		}, `vault "keychain" could not load master secret for "canary": read vault.json: no such file or directory`},
 		{"vault.json without read permission", "keychain", true, func(home string) error {
 			return os.Chmod(filepath.Join(home, "vault.json"), 0)
 		}, `vault "keychain" could not load master secret for "canary": read vault.json: permission denied`},
