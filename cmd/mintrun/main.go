@@ -22,8 +22,10 @@ import (
 
 // Swapped by tests.
 var (
-	exitFunc = os.Exit
-	sttyPath = "/bin/stty"
+	exitFunc     = os.Exit
+	sttyPath     = "/bin/stty"
+	osExecutable = os.Executable
+	openPath     = "/usr/bin/open"
 )
 
 func defaultHomeDir() string {
@@ -87,6 +89,10 @@ func main() {
 		cmdMCP(ctx, rt, os.Args[2:])
 	case "audit":
 		cmdAudit(rt, os.Args[2:])
+	case "init":
+		cmdInit(ctx, rt, os.Args[2:])
+	case "doctor":
+		cmdDoctor(ctx, rt, os.Args[2:])
 	case "-h", "--help", "help":
 		printUsage()
 	default:
@@ -321,6 +327,8 @@ func printUsage() {
 	fmt.Println(`mintrun — Zero-knowledge JIT credential minter & blind CLI runner for AI Agents
 
 Usage:
+  mintrun init [step]                                         Set up secrets, approval, policy and IDEs step by step
+  mintrun doctor                                              Check the setup without changing anything
   mintrun secret set <provider> [secret]                      Store master secret in OS Keychain vault
   mintrun secret check <provider>                             Verify secret exists without exposing value
   mintrun secret delete <provider>                            Delete master secret from vault
