@@ -303,6 +303,18 @@ func TestCLISecretCheckReportsVaultError(t *testing.T) {
 	}
 }
 
+// TestCLISecretCheckConfigured: a stored secret prints one line that names the key and the vault,
+// and nothing derived from the value, not even its length.
+func TestCLISecretCheckConfigured(t *testing.T) {
+	setupEnv(t)
+	setSecret(t, "cloudflare", "cf-"+leak)
+	r := runCLI(t, "", nil, "secret", "check", "cloudflare")
+	want := `Secret "cloudflare" is configured in vault "keychain" (value hidden).` + "\n"
+	if r.code != 0 || r.out != want || r.err != "" {
+		t.Fatalf("got exit %d, stdout %q, stderr %q; want exit 0 and stdout %q", r.code, r.out, r.err, want)
+	}
+}
+
 // TestCLISecretPromptHidesEcho drives the interactive prompt (stdin is a character device) with a
 // stub stty: echo goes off before the read and back on after it, unless stty failed to turn it off.
 func TestCLISecretPromptHidesEcho(t *testing.T) {

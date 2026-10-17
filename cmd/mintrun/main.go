@@ -212,8 +212,9 @@ func cmdSecret(ctx context.Context, rt *core.Runtime, args []string) {
 		fmt.Printf("Deleted master secret for %q from vault %q.\n", key, vault.Manifest().Name)
 
 	case "check":
-		// Verify existence without ever printing the secret value. Only the vault can tell a miss
-		// from a failure (a wrong MINTRUN_VAULT_KEY), and its error already names the fix.
+		// Verify existence without ever printing the secret value or anything derived from it, its
+		// length included. Only the vault can tell a miss from a failure (a wrong
+		// MINTRUN_VAULT_KEY), and its error already names the fix.
 		val, err := vault.GetSecret(ctx, key)
 		switch {
 		case errors.Is(err, builtin.ErrSecretNotFound):
@@ -223,7 +224,7 @@ func cmdSecret(ctx context.Context, rt *core.Runtime, args []string) {
 		case val == "":
 			fatal("secret %q is NOT configured in vault %q", key, vault.Manifest().Name)
 		}
-		fmt.Printf("Secret %q is configured in vault %q (length=%d chars, value hidden).\n", key, vault.Manifest().Name, len(val))
+		fmt.Printf("Secret %q is configured in vault %q (value hidden).\n", key, vault.Manifest().Name)
 
 	default:
 		fatal("unknown secret action %q (use set, delete, or check)", action)
