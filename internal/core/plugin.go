@@ -238,8 +238,9 @@ func (e *ExternalPlugin) call(ctx context.Context, req rpcRequest) (*rpcResponse
 		return nil, fmt.Errorf("plugin %q failed: %w (%s)", e.manifest.Name, err, strings.TrimSpace(stderr.String()))
 	}
 	var resp rpcResponse
-	if err := json.Unmarshal(stdout.Bytes(), &resp); err != nil {
-		return nil, fmt.Errorf("plugin %q invalid JSON response: %w", e.manifest.Name, err)
+	if json.Unmarshal(stdout.Bytes(), &resp) != nil {
+		// Never wrap the error: Go's JSON errors quote stdout, which can hold a secret Scrub does not know yet.
+		return nil, fmt.Errorf("plugin %q returned an invalid JSON response", e.manifest.Name)
 	}
 	if resp.Error != "" {
 		return nil, fmt.Errorf("plugin %q error: %s", e.manifest.Name, resp.Error)

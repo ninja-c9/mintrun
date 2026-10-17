@@ -405,6 +405,64 @@ esac
 	}
 }
 
+// Go's JSON errors quote stdout, and Scrub cannot know a secret from a response that did not parse.
+func TestPluginInvalidJSONNeverQuotesStdout(t *testing.T) {
+	const canary = "hunter2-CANARY"
+	// get_secret prints the bare secret; mint prints a lease whose expires_at (a time.Time) holds it.
+	script := `#!/bin/sh
+read input
+case "$input" in
+  *'"op":"get_secret"'*) echo '` + canary + `' ;;
+  *) echo '{"lease":{"id":"canary-lease","provider":"canary","expires_at":"` + canary + `"}}' ;;
+esac
+`
+	pluginSrc := t.TempDir()
+	if err := os.WriteFile(filepath.Join(pluginSrc, "plugin.json"), []byte(`{"name":"canary","version":"0.1.0","entrypoint":"run"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pluginSrc, "run"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	reg := core.NewRegistry()
+	vault := &builtin.KeychainVault{HomeDir: home, ForceFile: true}
+	_ = reg.Register(vault)
+	rt := core.NewRuntime(home, "keychain", reg)
+	ctx := context.Background()
+	if _, err := core.InstallPlugin(ctx, rt.PluginsDir(), pluginSrc); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.LoadExternalPlugins(rt.PluginsDir(), reg); err != nil {
+		t.Fatal(err)
+	}
+	if err := vault.SetSecret(ctx, "canary", "canary_master_secret"); err != nil {
+		t.Fatal(err)
+	}
+
+	const reply = `plugin "canary" returned an invalid JSON response`
+	for _, c := range []struct{ name, vault, want string }{
+		{"bare_secret", "canary", `vault "canary" could not load master secret for "canary": ` + reply},
+		{"expires_at", "keychain", `provider "canary" mint failed: ` + reply},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := rt.ExecBlind(ctx, core.ExecRequest{Vault: c.vault, MintRequest: core.MintRequest{Provider: "canary"}, Command: []string{"echo"}})
+			if err == nil || err.Error() != c.want || strings.Contains(err.Error(), canary) {
+				t.Fatalf("got error %v, want %q", err, c.want)
+			}
+		})
+	}
+
+	// Only the mint failure is audited; finding its error proves the scan below read that entry.
+	audit, err := os.ReadFile(filepath.Join(home, "audit.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	quoted, _ := json.Marshal(reply)
+	if !strings.Contains(string(audit), `"error":`+string(quoted)) || strings.Contains(string(audit), canary) {
+		t.Fatalf("expected the audited reply error and no canary, got:\n%s", audit)
+	}
+}
+
 func TestPolicyFailClosedPhase45PRB(t *testing.T) {
 	ctx := context.Background()
 	newRT := func(t *testing.T, policyJSON string) (*core.Runtime, string) {
