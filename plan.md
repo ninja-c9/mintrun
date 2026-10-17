@@ -436,3 +436,199 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
      - Static mode is always refused over the relay, because it would send the master itself to the laptop.
    - **Open questions:** who enrolls and retires devices, per-device rate limits, where the server keeps masters (the Keychain on macOS, the file vault on Linux), and failing closed while the server is down.
    - **First slice:** per-device tokens, no static mode, Telegram approval, tests against `httptest.NewTLSServer`.
+
+---
+
+## 4. Workstream X — macOS App Hooks (approved 2026-10-17)
+
+> The Go side of the private design canvas for the mintrun macOS app. Approved on 2026-10-17, with the open questions answered by their recommended defaults (below); Phase 1 is built first. It was planned as Workstream N while Workstream M (onboarding: `mintrun init` and `mintrun doctor`) was in progress in another checkout; `main` gave N and every letter through W to other work, so this is Workstream X, with steps X0–X8.
+
+| Hook | Steps |
+| :--- | :--- |
+| 1. In-app approval broker that races the dialog, Telegram, and Slack, with a timeout that denies | X1a, X1b, X1c, X7 |
+| 2. Global pause | X2 |
+| 3. Client identity in `audit.jsonl` and `mintrun_audit` | X0, X3 |
+| 4. Stopping a running task, which is still revoked and audited | X4, X1b (`AppTrack`), X7 |
+| 5. Plain-language purpose in `mintrun_exec` and the approval prompt | X0, X5, X3 (schema) |
+| 6. Installer for the Claude Code, Claude Desktop, and Cursor configs | X6 |
+| 7. Settings: key store and notifications | X7 |
+| Reload `policy.json` on every request (approved with question 5) | X8 |
+
+- **Order:**
+  - Phase 1: `[SERIAL]` X0 → X2 → X5 → X1a → X4 → X8, all in `internal/core/runner.go` and `internal/core/core_test.go`. Built on 2026-10-17; the evidence is in [checks.md](checks.md) (Workstream X, Phase 1).
+  - Phase 2: `[PARALLEL]` X1b and X3, which need Phase 1's fields. Their files are disjoint but compile as one package, so each runs in its own worktree and they merge one at a time, with `go test -count=1 ./internal/builtin` after each merge. Built on 2026-10-17, with X3b (agent-written text kept out of `mintrun_audit`) and the fork-race fix (rule 20), and brought up to date with `main` through its shim profile fix; the evidence is in [checks.md](checks.md) (Workstream X, Phase 2).
+  - Phase 3, now that Workstream M has landed (it edits `cmd/mintrun/main.go`, `README.md`, and `internal/builtin/telegram.go` and `slack.go` with their tests, and exports what X6 reuses): `[PARALLEL]` X1c alongside `[SERIAL]` X6 → X7; then the docs and the full §1 pipeline.
+- Every check runs with `-v`, and each new test must show `--- PASS` (rule 15). On 2026-10-17, `go test -list` showed each check's regex selecting the existing tests it names, and none of the new test names exists yet.
+- **Merging Phase 1:** merge X3 first or together with it, because until X3, `mintrun_audit` hands agents the `purpose` an agent wrote. Workstream M's `cmd/mintrun/setup.go` reads `Runtime.Policies`, which X8 removed: in `policy()`, replace `if _, ok := w.rt.Policies["github"]; ok {` with `rules, _ := w.rt.LoadPolicies()` and `if _, ok := rules["github"]; ok {` (verified on a trial merge). `doctorPolicy` should call `rt.LoadPolicies()` too: after X8 its FAIL text (`exec then allows every request`) is wrong, since a file that fails to load now denies every exec.
+
+### X0 — Activity Record
+- **Files:** `internal/core/runner.go`, `internal/core/core_test.go`
+- **Deliverables:**
+  1. `[SERIAL]` `ExecRequest` gains `Purpose` (`json:"purpose,omitempty"`) and `Client`, `Via`, `Task` (`json:"-"`: MCP arguments unmarshal straight into `ExecRequest`, so an agent cannot set them).
+  2. `[SERIAL]` `ExecBlind` gives each call a `Task` (`rand.Text()`, an opaque handle; rule 7) and builds one base entry up front (`ts`, `task`, `provider`, `scope`, `permissions`, `command`, `purpose`, `client`, `via`) that every exit path completes, so the policy-denial entry gains `permissions`. The three exits that write no entry today (unknown vault, unknown provider, a master the vault cannot load) are audited as `failed`, exit 1. Tests that count entries change.
+  3. `[SERIAL]` `AuditEntry` gains `task`, `via`, `client`, `purpose`, `outcome`, `blocked_by`, `decided_at` (when a human answered), and `expires_at` (ephemeral leases only, because a static lease is the master secret, whose expiry `mintrun` does not know). Every entry written after the master is loaded scrubs `client` and `purpose` like `command` (rule 8).
+  4. `[SERIAL]` `outcome`:
+     - `blocked`: `CheckPolicy` denied. `blocked_by` names why: `invalid_request`, `paused`, `purpose`, `policy_file`, `env_dump`, `static`, `scope`, `permission`, `installation`, `command`. `PolicyDecision` gains the same `blocked_by`, so `mintrun_policy_check` reports it.
+     - Approval: `denied` (a human said no), `no_answer` (the approval deadline passed), `failed` (every channel failed first), `interrupted` (the caller's context ended), and `blocked` when the re-check after an allow denies (X2).
+     - `failed`: the vault, provider, or mint failed, or the command could not start or exited non-zero.
+     - Run: a clean exit (exit 0, or `exec.ErrWaitDelay` after one) is `done`, even if a stop raced it. Otherwise, in order: `stopped` (X4), `interrupted` (a signal to `mintrun` or the MCP server shutting down; never shown as "you stopped it"), `timed_out` (the exec timeout), `failed`.
+  5. Older entries have no `outcome`; the app shows them by exit code.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestAuditActivityFields|TestCheckPolicyMatchesExecBlind|TestExecBlindCleanEnv|TestExecBlindOutputCap' ./internal/core
+  ```
+
+### X2 — Global Pause
+- **Files:** `internal/core/runner.go`, `internal/core/core_test.go`
+- **Deliverables:**
+  1. `[SERIAL]` While `<home>/paused` exists, `CheckPolicy` denies every request (`blocked_by: paused`, reason `policy denied: mintrun is paused`) right after the empty-command and empty-provider checks. `os.Lstat` decides: any entry, a dangling symlink included, means paused, and so does any error other than not-exist (fail closed). `ExecBlind`, `mintrun_policy_check` (rule 16), and the CLI all stop. The reason never says how to resume, because an agent with a shell could.
+  2. `[SERIAL]` After an approval allows, `checkPolicy` runs `CheckPolicy` again and uses that decision, so a pause (and, with X8, a rule change) made while the request waited still applies.
+  3. No CLI subcommand: the app creates and removes the file, and a terminal user can `touch` or `rm` it.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCheckPolicyMatchesExecBlind|TestPauseRecheckAfterApproval' ./internal/core
+  ```
+
+### X5 — Plain-Language Purpose
+- **Files:** `internal/core/runner.go`, `internal/core/core_test.go`
+- **Deliverables:**
+  1. `[SERIAL]` After the pause check, `CheckPolicy` denies (`blocked_by: purpose`) a purpose over 300 bytes, not valid UTF-8, or holding a Unicode `Cc`, `Cf`, `Zl`, or `Zp` character (newlines, bidi controls, zero-width characters). An empty purpose is fine. No rule reads it and the CLI has no flag for it: it is the agent's claim, never trusted.
+  2. `[SERIAL]` `core.ApprovalText` adds quoted `Purpose:` and `Client:` lines after `Command:`, its last line today, only when they are set. The dialog, Telegram, and Slack all show them with no other change; a long request is cut through these claims before any fact; and the existing approval tests keep their text.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestPurposeValidation|TestOSApproval|TestCheckPolicyMatchesExecBlind' ./internal/core
+  ```
+
+### X1a — Approval Timeout
+- **Files:** `internal/core/runner.go`, `internal/core/core_test.go`
+- **Deliverables:**
+  1. `[SERIAL]` `Runtime.ApprovalTimeout` (0, or more than 10 minutes, means 10 minutes; question 9) bounds the approval through `context.WithTimeout`. The deadline kills the `osascript` dialog (`exec.CommandContext`), ends the Telegram and Slack polls (both return when their context ends), and closes the app's connection (X1b). The reason is `policy denied: no answer within <timeout>`, and the outcome is `no_answer`.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestApprovalTimeout|TestFirstApproval|TestOSApproval' ./internal/core
+  ```
+  `TestApprovalTimeout`: a stub `osascript` that sleeps is killed at a short deadline (`no_answer`), and a caller context cancelled first gives `interrupted`.
+
+### X4 — Stopping a Running Task
+- **Files:** `internal/core/runner.go`, `internal/core/core_test.go`
+- **Deliverables:**
+  1. `[SERIAL]` `Runtime.Track func(ctx context.Context, started AuditEntry) <-chan struct{}` (nil: no tracking) runs after `Mint` and before the command starts. `started` holds the base fields (`command` scrubbed) plus the scrubbed lease ID, `ephemeral`, and `expires_at`. Its `ctx` comes from `context.WithoutCancel` and ends right after the final entry is written, so the app sees a task end only once its outcome is in the log.
+  2. `[SERIAL]` Closing the returned channel cancels the run through `context.WithCancelCause` with `errStopped`, and the exec timeout derives from that context. On Unix the whole process group is killed (rule 20). Revoke and audit run as on any exit. A stop before the command starts makes `Start` fail, and the task is still revoked and recorded as `stopped`.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestExecBlindStop|TestExecBlindTrackEndsAfterAudit|TestExecBlindKillsProcessGroup' ./internal/core
+  ```
+  `TestExecBlindStop`: a stopped `sleep 60` returns in under 5 s, its process group is gone, revoke ran, and the entry says `stopped`. Its `TimeoutSec: 1` case says `timed_out`, and a cancelled caller context says `interrupted`.
+
+### X8 — Policy Reload (approved; changes behavior)
+- **Files:** `internal/core/runner.go`, `internal/core/core_test.go`
+- **Deliverables:**
+  1. `[SERIAL]` `CheckPolicy` reads `policy.json` on every call. A missing file means no rules, as at boot today. A malformed or unreadable one denies everything (`blocked_by: policy_file`); today an unreadable file is skipped at boot, as if there were no rules. `Runtime.Policies` and `policyErr` go away, and the boot warning stays. Only `runner.go` used them on this branch, but Workstream M's `cmd/mintrun/setup.go` reads `Runtime.Policies`, so merging needs the fix in **Merging Phase 1** above.
+  2. `[SERIAL]` As built: `decide` (the body of `CheckPolicy`) returns the checked rule's `allowed_env` beside the decision, and `ExecBlind` passes it to `childEnv`, so `ExecBlind` enforces the rule it checked instead of reading the policy again. A slice field on `PolicyDecision` would make it incomparable, and the `builtin` tests compare decisions with `!=`. `LoadPolicies` is exported for the app; a directory or a dangling symlink at `policy.json` denies like a malformed file, and the reason leaves out the path.
+  3. Why: each AI app keeps its own `mintrun mcp` running, so without a reload a rule saved in the app's Rules screen waits until that app restarts it.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestPolicyReload|TestPolicyFailClosedPhase45PRB|TestCheckPolicyMatchesExecBlind' ./internal/core
+  ```
+
+### X1b — In-App Approval Broker and Task Tracking
+- **Files:** `internal/builtin/appbroker.go`, `internal/builtin/appbroker_test.go` (new)
+- **Deliverables:**
+  1. `[PARALLEL]` The macOS app listens on `<home>/app.sock` (mode 0600, inside the 0700 home), and `mintrun` dials it: one connection per approval and one per running task, newline-delimited JSON with `"v":1`.
+  2. `[PARALLEL]` `AppApproval(rt, fallback)`: when the dial fails it calls `fallback` (`OSApproval`), so a running app replaces the dialog while Telegram and Slack still race. It sends `{"v":1,"type":"approve","task":…,"request":{provider,scope,permissions,params,command,cwd,purpose,client,via,ttl_seconds}}` and reads one line of at most 4 KiB: `{"task":…,"decision":"allow"|"deny"}`. A wrong task, a malformed or oversized line, or EOF is an error, never an approval, and no dialog follows. When `ctx` ends it closes the connection, and the app drops the card. The command is sent whole, so the app must say when it shortens it.
+  3. `[PARALLEL]` `AppTrack(rt)` returns a `Runtime.Track`. It dials with a 1 s timeout and a write deadline, and a failure means no tracking. It sends `{"v":1,"type":"started","entry":…}`, closes the stop channel on a `{"type":"stop"}` line, and closes the connection when `ctx` ends. A connection that closes with no audit entry for its task means `mintrun` died, and the app says so rather than guess.
+  4. `[PARALLEL]` Trust matches `policy.json`'s: there is no owner or peer check, because a same-user process can already edit the home (rule 23) and the check would need per-OS `syscall` code. No build tags: where no app listens, the dial fails.
+  5. Tests serve the socket from a short `os.MkdirTemp("", "mr")` directory, because macOS limits a socket path to 104 bytes; a longer `MINTRUN_HOME` just means no app channel.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestAppApproval|TestAppTrack' ./internal/builtin
+  ```
+
+### X3 — Client Identity Over MCP
+- **Files:** `internal/builtin/mcp.go`, `internal/builtin/builtin_test.go`
+- **Deliverables:**
+  1. `[PARALLEL]` `Serve` keeps `initialize`'s `params.clientInfo.name` in a local variable (one `MCPBridge` value serves every `Serve` call), keeps only `[A-Za-z0-9._ ()-]` characters, cuts it to 64 bytes, and sets `Client` and `Via: "mcp"` on each `mintrun_exec`. An empty result records no client, and a `client` in an agent's arguments is ignored (`json:"-"`). The name is self-reported.
+  2. `[PARALLEL]` `execSchema` gains `purpose`. `mintrun_audit` returns the new fields, `task`, `client`, `via`, `outcome`, and `blocked_by` among them, but never `purpose`, which `readAudit` blanks because one agent could use it to slip text to another.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestMCPBridgeClientInfo|TestMCPBridgeGovernanceTools|TestMCPBridgeComprehensive' ./internal/builtin
+  ```
+
+### X1c — Deadline Text in Telegram and Slack
+- **Files:** `internal/builtin/telegram.go`, `internal/builtin/slack.go`, `internal/builtin/telegram_test.go`, `internal/builtin/slack_test.go`
+- **Deliverables:**
+  1. `[PARALLEL]` Today, when the context ends first, both return `ctx.Err()` and leave the edited message at `⌛ Closed: answered on another channel, or canceled.`; only their own 10-minute timer sets `⌛ Expired: …`. When `ctx.Err()` is `context.DeadlineExceeded` (the approval deadline of X1a), the message says `⌛ Expired: no answer in time, so not approved.` instead, so the phone never claims that another channel answered.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestTelegramApproval|TestSlackApproval' ./internal/builtin
+  ```
+
+### X6 — App Config Installer
+- **Files:** `cmd/mintrun/apps.go`, `cmd/mintrun/apps_test.go` (new), `cmd/mintrun/main.go`
+- **Deliverables:**
+  1. `[SERIAL]` `mintrun apps status|connect|disconnect [-app claude-code,claude-desktop,cursor] [-dry-run] [-command <abs path>]`, non-interactive with JSON output, for the macOS app. A dry run writes nothing and reports `{app, config, change: add|update|remove|none, old, new}` per app; status reports `{app, found, config, installed, matches}`, where `matches` compares `command` and `args`.
+  2. `[SERIAL]` The entry is `{"command":<path>,"args":["mcp"]}`, with no `env` and no `type`. The path follows Workstream M's rule (`os.Executable` plus `EvalSymlinks`, a `go run` build refused) unless `-command` names an absolute path to an executable file.
+  3. `[SERIAL]` Claude Code goes through its own CLI, as Workstream M's `init mcp` does, found with `exec.LookPath` (`err == nil` only; rule 14). The macOS app passes its login shell's `PATH`, because an app started from the Dock lacks `~/.local/bin`. Status reads the user-scope `mcpServers.mintrun` in `~/.claude.json` and never writes it. Connect runs `claude mcp add -s user mintrun -- <path> mcp`, after `claude mcp remove -s user mintrun` when a stale entry exists. A stale entry that holds anything besides `type`, `command`, `args`, and an empty `env` is refused with an error naming those keys, never their values: the CLI would need them on argv (rule 14), and dropping them is an edit nobody asked for. Disconnect runs `claude mcp remove -s user mintrun` when an entry exists.
+  4. `[SERIAL]` Claude Desktop (`<os.UserConfigDir()>/Claude/claude_desktop_config.json`, created only when its `Claude` directory exists) and Cursor (`~/.cursor/mcp.json`, created only when `~/.cursor/` exists) get a byte-level splice, so nothing else in the file changes. It checks `json.Valid`, then finds spans with `json.Decoder` tokens and `InputOffset`. It refuses a root, `mcpServers`, or `mintrun` value that is not an object, and a duplicate `mcpServers` or `mintrun` key. A new entry goes in right after the `{` of `mcpServers`, as its first member, with the old first member's leading whitespace (a newline and the `mcpServers` line's indentation plus two spaces when there is none). A missing `mcpServers` is added, and disconnect then leaves it empty. Connect sets `command` and `args` and keeps every other key in the entry, such as a user's `env`; an entry that already matches is not rewritten. Disconnect removes the member, its leading whitespace, and one comma next to it. When `mcpServers` already held another server, connect then disconnect restores the original bytes.
+  5. `[SERIAL]` A write resolves the target with `filepath.EvalSymlinks`, reads it again and stops if it changed since the first read, then writes through M's `builtin.WriteFileAtomic` (temp file in the same directory, `Sync`, `os.Rename`), keeping the file's mode (0600 for a new file).
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCLIApps' ./cmd/mintrun
+  ```
+  The tests pass `-command`, because test binaries live under `os.TempDir()`, and point `HOME`, `XDG_CONFIG_HOME`, and `PATH` (a stub `claude` that logs its argv) at temporary directories.
+
+### X7 — Settings and Wiring
+- **Files:** `cmd/mintrun/main.go`, `cmd/mintrun/main_test.go`
+- **Deliverables:**
+  1. `[SERIAL]` `bootRuntime` reads `<home>/settings.json` (`{"vault":"keychain"|"1password"|"file","approval_timeout_seconds":1..600}`) before it registers the vaults. `file` sets `ForceFile: true` and an empty `SecretTool` on the vault `NewKeychainVault` returns. A non-empty `MINTRUN_VAULT` or `MINTRUN_FILE_VAULT=1` wins over the file's `vault`. Unknown keys are ignored; malformed JSON or a bad known value stops boot with an error. The file is read only at boot. The timeout tops out at 600 s because Telegram and Slack stop at their own 10 minutes.
+  2. `[SERIAL]` Wiring: `rt.ApprovalFunc = core.FirstApproval(builtin.AppApproval(rt, core.OSApproval), builtin.TelegramApproval(rt), builtin.SlackApproval(rt))`, `rt.Track = builtin.AppTrack(rt)`, `rt.ApprovalTimeout` from the settings, and `Via: "cli"` on CLI requests.
+  3. Notifications need no Go code: the app watches `outcome` in `audit.jsonl` and its own approval connections, and keeps the on/off switch in its own preferences.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestBootRuntimeSettings|TestCLIExecPaused|TestCLISubcommandsEndToEnd' ./cmd/mintrun
+  ```
+
+### Coverage Gate and Hermeticity
+- Total coverage stays above 90%; it was 94.1% in this tree before Workstream X and 94.5% after Phase 1 (rule 5). The new files must appear in the profile, and none of their functions may sit at 0.0%:
+  ```bash
+  go test -count=1 -coverprofile=coverage.out ./... && go tool cover -func=coverage.out | tail -n 1
+  go tool cover -func=coverage.out | grep -c -E '/(appbroker|apps)\.go:'   # > 0 (positive control)
+  go tool cover -func=coverage.out | grep -E '/(appbroker|apps)\.go:' | grep -c -E '[[:space:]]0\.0%$'   # must print 0
+  printf 'm/apps.go:1:\tf\t0.0%%\n' | grep -E '/(appbroker|apps)\.go:' | grep -c -E '[[:space:]]0\.0%$'   # must print 1 (planted control)
+  rm -f coverage.out
+  ```
+- The installer tests set `HOME`, `XDG_CONFIG_HOME`, and `PATH` to temporary directories (rule 22). To prove it, run the suite with an empty `HOME` and check that no file appears in it outside Go's own caches, then plant a write with the rebuilt binary as the positive control. On 2026-10-17 the first line printed nothing on this tree, and a planted `.cursor/mcp.json` printed:
+  ```bash
+  S="$(mktemp -d)"; GOCACHE="$(go env GOCACHE)" GOMODCACHE="$(go env GOMODCACHE)" GOPATH="$(go env GOPATH)" HOME="$S" go test -count=1 ./... && find "$S" -type f -not -path "$S/Library/Caches/*" -not -path "$S/Library/Application Support/go/*"   # must print nothing
+  mkdir "$S/.cursor" && HOME="$S" ./mintrun apps connect -app cursor && find "$S" -type f -not -path "$S/Library/Caches/*" -not -path "$S/Library/Application Support/go/*"   # must list .cursor/mcp.json
+  ```
+
+### Live Checks (`unresolved` until the user runs them)
+- **L1:** which `clientInfo` names Claude Code, Claude Desktop, and Cursor send. An agent's `mintrun_exec` with an empty command is audited as `blocked` with its client and needs no stored secret.
+- **L2:** `mintrun apps connect` for each real app: each starts `mintrun mcp` and lists its tools, `mintrun apps status` reports each as installed and matching, and `disconnect` removes only the `mintrun` entry (the Claude Desktop and Cursor files compared byte for byte with copies taken before connect).
+- **L3:** the macOS app end to end: allow, deny, no answer, stop, and pause.
+- **L4:** the real macOS dialog closes at the approval deadline.
+
+### What the Docs Must Say (rules 21 and 23)
+- Pause blocks new requests only: running tasks and credentials already handed out keep working.
+- An agent with its own shell can get around pause and the rules: run `security` itself, point `MINTRUN_HOME` elsewhere (no `policy.json` or pause file there, while the Keychain items stay readable), or delete the pause file.
+- Stop kills the command's process group on Unix (only the process elsewhere), and a daemon that left the group survives. On stop, as on any exit, `cloudflare` and `github` JIT tokens are deleted; `aws` and `gcp` credentials keep working until they expire (rules 13 and 21); a plugin's lease ends early only when its own revoke succeeds, which the entry's `revoked` reports; and a static lease is the master secret itself, never revoked.
+- Approval does not stop code already running as the user, which can answer on the socket, edit `policy.json`, or delete the pause file.
+- Client names are self-reported, and the purpose is the agent's claim: the app labels both so.
+- The macOS dialog now closes at the approval deadline instead of waiting forever, so the README approval section and rule 31 change.
+
+### Docs and Rules (Phase 3)
+- README: approval (the app channel, the timeout), the MCP tools table (`purpose`, the new audit fields), pause, stop, `mintrun apps`, `settings.json`, and the points above.
+- AGENTS.md: Phase 1 amended rules 4 (the `Purpose` and `Client` lines), 8 (one entry per exit), 16 (pause, purpose, and the policy reload in `CheckPolicy`), 20 (the `Track` stop), 22 (mutants must compile; stubs `exec` their helper), and 31 (the deadline). Phase 3 adds the app channel to rule 31 and the Expired text to rule 34, and new rules after Workstream M's rule 35, one per hook, written from what the tests pinned.
+- `checks.md`: one row per hook and per live check. `progress.md`: a checkpoint.
+
+### Open Questions (decided 2026-10-17: the recommended defaults)
+1. Which `clientInfo` names do the three apps send? L1 answers it; until then `mintrun` records whatever arrives. **Decided:** record whatever arrives.
+2. X6 builds on Workstream M. Agree with M's owner that M's Claude Desktop writer uses X6's splice, so neither rewrites the rest of the file; that `apps connect` updates a stale entry while `init mcp` leaves one alone; that `apps` writes `~/.cursor/mcp.json`, because a dry run and status need a file, while `init mcp` opens Cursor's link; and how the app passes `PATH`. If M is dropped, X6 exports the atomic write and the command-path check itself. **Decided:** proceed as written and agree the four points with M's owner before Phase 3.
+3. Should the app offer the file vault? Recommended no: it needs `MINTRUN_VAULT_KEY` in plain text in every AI app's config. The Go side supports it, as the brief asks. **Decided:** no; the Go side still supports it.
+4. The key store and approval timeout are read at boot, so a running `mintrun mcp` keeps the old values until its AI app restarts it. Is that acceptable, and does the app show a timeout control? **Decided:** the boot-time read is accepted. The app shows a 1–600 s timeout control and says a change applies once each AI app restarts `mintrun mcp`.
+5. Approve X8, which re-reads `policy.json` on every request and turns an unreadable file into deny-all. **Decided:** approved.
+6. MCP `notifications/cancelled` is ignored, because `Serve` handles one request at a time: stopping from inside the AI app is a follow-up. **Decided:** a follow-up, outside Workstream X.
+7. Switching key stores moves no secrets, and there is no `secret get` to copy them. The app must tell the user to set them again. **Decided:** the app tells the user to set them again.
+8. "Access ends when the task is done" holds only where the provider deletes the credential. Recommended: while a task runs, the app promises an early end only for `cloudflare` and `github` JIT leases (`ephemeral` alone cannot tell `aws` from `cloudflare`); once it ends, the app reports the entry's `revoked`, shows `expires_at` for an ephemeral lease that was not revoked (`aws`, `gcp`, a plugin), and says a static lease is the master secret itself and stays valid. **Decided:** as recommended.
+9. Should the approval timeout go above 10 minutes? Telegram and Slack would then need to follow the context's deadline instead of their own 10 minutes. **Decided:** no; it stays at most 600 s.
