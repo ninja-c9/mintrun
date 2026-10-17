@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -211,9 +212,15 @@ func cmdSecret(ctx context.Context, rt *core.Runtime, args []string) {
 		fmt.Printf("Deleted master secret for %q from vault %q.\n", key, vault.Manifest().Name)
 
 	case "check":
-		// Verify existence without ever printing the secret value.
+		// Verify existence without ever printing the secret value. Only the vault can tell a miss
+		// from a failure (a wrong MINTRUN_VAULT_KEY), and its error already names the fix.
 		val, err := vault.GetSecret(ctx, key)
-		if err != nil || val == "" {
+		switch {
+		case errors.Is(err, builtin.ErrSecretNotFound):
+			fatal("secret %q is NOT configured in vault %q: %v", key, vault.Manifest().Name, err)
+		case err != nil:
+			fatal("could not read vault %q to check secret %q: %v", vault.Manifest().Name, key, err)
+		case val == "":
 			fatal("secret %q is NOT configured in vault %q", key, vault.Manifest().Name)
 		}
 		fmt.Printf("Secret %q is configured in vault %q (length=%d chars, value hidden).\n", key, vault.Manifest().Name, len(val))

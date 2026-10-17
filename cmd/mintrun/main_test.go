@@ -264,6 +264,45 @@ func TestCLISecretArgvWarning(t *testing.T) {
 	}
 }
 
+// TestCLISecretCheckReportsVaultError: a miss shows the vault's hint once, and a vault that cannot
+// be read (a wrong MINTRUN_VAULT_KEY) says so instead of calling the secret missing.
+func TestCLISecretCheckReportsVaultError(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		setup func(t *testing.T, home string)
+		want  string
+	}{
+		{"miss", nil, `secret "cloudflare" is NOT configured in vault "keychain": secret "cloudflare" not found in vault (run mintrun init cloudflare)`},
+		{"wrong passphrase", func(t *testing.T, home string) {
+			setSecret(t, "cloudflare", "cf-"+leak)
+			t.Setenv("MINTRUN_VAULT_KEY", "wrong-"+leak)
+		}, `could not read vault "keychain" to check secret "cloudflare": decrypt vault (wrong MINTRUN_VAULT_KEY?): cipher: message authentication failed`},
+		{"empty value", func(t *testing.T, home string) {
+			dir := filepath.Join(home, ".mintrun", "plugins", "emptyvault")
+			writeFile(t, filepath.Join(dir, "plugin.json"), `{"name":"emptyvault","kind":"vault"}`)
+			writeFile(t, filepath.Join(dir, "run"), "#!/bin/sh\necho '{\"value\":\"\"}'\n")
+			if err := os.Chmod(filepath.Join(dir, "run"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("MINTRUN_VAULT", "emptyvault")
+		}, `secret "cloudflare" is NOT configured in vault "emptyvault"`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			home, _ := setupEnv(t)
+			if c.setup != nil {
+				c.setup(t, home)
+			}
+			r := runCLI(t, "", nil, "secret", "check", "cloudflare")
+			if !r.exited || r.code != 1 || r.out != "" || r.err != c.want+"\n" {
+				t.Fatalf("got exit %d (exited %v), stdout %q, stderr %q; want exit 1 and stderr %q", r.code, r.exited, r.out, r.err, c.want)
+			}
+			if strings.Contains(r.out+r.err, leak) {
+				t.Fatal("secret check printed a planted secret or passphrase")
+			}
+		})
+	}
+}
+
 // TestCLISecretPromptHidesEcho drives the interactive prompt (stdin is a character device) with a
 // stub stty: echo goes off before the read and back on after it, unless stty failed to turn it off.
 func TestCLISecretPromptHidesEcho(t *testing.T) {
