@@ -333,6 +333,24 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
   go test -count=1 -v -run 'TestCLIShim|TestCLIDoctor' ./cmd/mintrun
   ```
 
+### Workstream U — An Agent Cannot Pick the Vault
+- **Files:** `internal/core/runner.go`, `internal/core/core_test.go`, `internal/builtin/mcp.go`, `internal/builtin/builtin_test.go`, `README.md`
+- **Gap:** `mintrun_exec` and `mintrun_policy_check` decode their arguments straight into `core.ExecRequest`, so an agent could send `vault` and pick the vault its master secret is read from, although the tools' input schema and README's MCP table never listed it. No policy rule gates the vault: policy is per provider.
+- **Design:**
+  - The vault is the operator's choice: `MINTRUN_VAULT` (or `keychain`) for `mintrun mcp`, `-vault` on the CLI. The schema still leaves `vault` out.
+  - The bridge sets `ExecRequest.FromAgent` after decoding, for both tools. The field is `json:"-"`, so no argument reaches it. `CheckPolicy` denies a request with `FromAgent` and a non-empty `Vault` right after request validation, so `ExecBlind` audits the denial with exit 126 before any vault opens, and `mintrun_policy_check` returns the same reason (rule 16). The CLI never sets the flag, so `-vault` works as before.
+  - The reason quotes the vault the agent sent (the agent's own input, never a secret) and names `MINTRUN_VAULT`.
+- **Deliverables:**
+  1. `[SERIAL]` core: `FromAgent` and the denial in `CheckPolicy`; `TestCheckPolicyMatchesExecBlind` with an agent's request naming a vault (denied by both) and the same request without the flag (allowed, as the CLI's `-vault`).
+  2. `[SERIAL]` builtin: the bridge sets the flag; `TestMCPBridgeRefusesVault` (`mintrun_policy_check` and `mintrun_exec` naming the vault the server already uses give the same exact reason, the exec is a tool error audited with exit 126, and the same request without `vault` runs).
+  3. `[SERIAL]` Mutants on a copy of the repo, each failing a test: the denial removed, the flag left unset by `mintrun_exec` or by `mintrun_policy_check`, the check in `ExecBlind` only, the check in the bridge only (not audited), the flag ignored (the CLI's `-vault` denied).
+- **Not built:** `mintrun_exec` also decodes `timeout_seconds` and `approve`, which the schema and README do not list either; `approve` can only add a human check, but `timeout_seconds` lifts the 5-minute default (progress.md §3).
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCheckPolicyMatchesExecBlind' ./internal/core
+  go test -count=1 -v -run 'TestMCPBridgeRefusesVault|TestMCPBridgeGovernanceTools' ./internal/builtin
+  ```
+
 ---
 
 ## 3. Deferred Backlog (Next Actionable Items)
