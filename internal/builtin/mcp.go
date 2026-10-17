@@ -214,6 +214,7 @@ func (m *MCPBridge) handleToolCall(ctx context.Context, rt *core.Runtime, id jso
 		if err := json.Unmarshal(rawArgs, &execReq); err != nil {
 			return toolTextResult(id, fmt.Sprintf("invalid arguments: %v", err), true)
 		}
+		execReq.FromAgent = true // after decoding: no argument can set or clear it
 		res, err := rt.ExecBlind(ctx, execReq)
 		if err != nil {
 			return toolTextResult(id, fmt.Sprintf("mintrun execution error: %v", err), true)
@@ -226,6 +227,7 @@ func (m *MCPBridge) handleToolCall(ctx context.Context, rt *core.Runtime, id jso
 		if err := json.Unmarshal(rawArgs, &execReq); err != nil {
 			return toolTextResult(id, fmt.Sprintf("invalid arguments: %v", err), true)
 		}
+		execReq.FromAgent = true // after decoding: no argument can set or clear it
 		b, _ := json.MarshalIndent(rt.CheckPolicy(execReq), "", "  ")
 		return toolTextResult(id, string(b), false)
 

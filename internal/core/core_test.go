@@ -971,6 +971,11 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 		req.Params = map[string]string{"installation_id": id}
 		return req
 	}
+	agentVault := func(vault string) core.ExecRequest {
+		req := probe("ok.com", []string{"dns:read"}, "true")
+		req.FromAgent, req.Vault = true, vault
+		return req
+	}
 
 	for _, c := range []struct {
 		rt  *core.Runtime
@@ -988,6 +993,7 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 		{rt, inst("")},
 		{rt, inst("777")},
 		{rt, inst("555/../777")},
+		{rt, agentVault("keychain")},
 	} {
 		d := c.rt.CheckPolicy(c.req)
 		if _, err := c.rt.ExecBlind(ctx, c.req); d.Allowed || d.Reason == "" || err == nil || err.Error() != d.Reason {
@@ -1040,6 +1046,16 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 		res, err := rt.ExecBlind(ctx, req)
 		if !d.Allowed || d.ApprovalRequired || !d.CleanEnv || d.TTLSeconds != tc.want || err != nil || res.ExitCode != 0 || minted != tc.want {
 			t.Fatalf("ttl %d: decision %+v, minted %d, res=%+v err=%v", tc.ttl, d, minted, res, err)
+		}
+	}
+
+	// The vault stays the operator's: an agent's request without one runs, and so does the CLI's -vault.
+	cli := probe("ok.com", []string{"dns:read"}, "true")
+	cli.Vault = "keychain"
+	for _, req := range []core.ExecRequest{agentVault(""), cli} {
+		d := rt.CheckPolicy(req)
+		if res, err := rt.ExecBlind(ctx, req); !d.Allowed || err != nil || res.ExitCode != 0 {
+			t.Fatalf("%+v: decision %+v, res=%+v err=%v", req, d, res, err)
 		}
 	}
 

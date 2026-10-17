@@ -1569,6 +1569,89 @@ func TestMCPBridgeExecCleanEnv(t *testing.T) {
 	}
 }
 
+// TestMCPBridgeRefusesVault pins that the vault is the operator's choice. An agent naming one,
+// even the vault the server already uses, is denied with the same reason by mintrun_policy_check
+// and mintrun_exec, no argument clears the flag the bridge sets, and the exec is audited with
+// exit 126 before any vault opens. The same exec without vault runs.
+func TestMCPBridgeRefusesVault(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	t.Setenv("MINTRUN_HOME", home)
+	t.Setenv("MINTRUN_APPROVE", "")
+	if err := os.WriteFile(filepath.Join(home, "policy.json"), []byte(`{"cloudflare":{"allow_static":true}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reg := core.NewRegistry()
+	vault := &KeychainVault{HomeDir: home, ForceFile: true}
+	_ = reg.Register(vault)
+	_ = reg.Register(NewCloudflareProvider())
+	if err := vault.SetSecret(ctx, "cloudflare", "cf_static_tok_mcp_vault"); err != nil {
+		t.Fatal(err)
+	}
+	rt := core.NewRuntime(home, "keychain", reg)
+	rt.ApprovalFunc = func(context.Context, core.ExecRequest) (bool, error) {
+		t.Error("no request here requires approval")
+		return false, nil
+	}
+
+	call := func(name, args string) string {
+		return `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + name + `","arguments":{"provider":"cloudflare","permissions":["static"],"command":["true"]` + args + `}}}`
+	}
+	var out bytes.Buffer
+	in := strings.Join([]string{
+		call("mintrun_policy_check", `,"vault":"keychain"`),
+		call("mintrun_exec", `,"vault":"keychain","FromAgent":false`),
+		call("mintrun_exec", ``),
+	}, "\n") + "\n"
+	if err := NewMCPBridge().Serve(ctx, rt, strings.NewReader(in), &out); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 responses, got:\n%s", out.String())
+	}
+	var resps [3]struct {
+		Result struct {
+			IsError bool                    `json:"isError"`
+			Content []struct{ Text string } `json:"content"`
+		} `json:"result"`
+	}
+	for i, line := range lines {
+		if err := json.Unmarshal([]byte(line), &resps[i]); err != nil || len(resps[i].Result.Content) != 1 {
+			t.Fatalf("response %d: %s (err=%v)", i, line, err)
+		}
+	}
+
+	const reason = `policy denied: an agent cannot pick the vault (got "keychain"); omit it to use the vault mintrun was started with (MINTRUN_VAULT)`
+	var d core.PolicyDecision
+	if err := json.Unmarshal([]byte(resps[0].Result.Content[0].Text), &d); err != nil || resps[0].Result.IsError || d != (core.PolicyDecision{Reason: reason}) {
+		t.Fatalf("policy_check naming a vault: got %+v (err=%v), want a denial with %q", resps[0].Result, err, reason)
+	}
+	if r := resps[1].Result; !r.IsError || r.Content[0].Text != "mintrun execution error: "+reason {
+		t.Fatalf("exec naming a vault: got %+v, want the policy_check reason", r)
+	}
+	var res core.ExecResult
+	if r := resps[2].Result; r.IsError || json.Unmarshal([]byte(r.Content[0].Text), &res) != nil || res.ExitCode != 0 {
+		t.Fatalf("exec without a vault: got %+v, want exit 0", r)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(home, "audit.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var es []core.AuditEntry
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var e core.AuditEntry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatal(err)
+		}
+		es = append(es, e)
+	}
+	if len(es) != 2 || es[0].ExitCode != 126 || es[0].Error != reason || es[1].ExitCode != 0 || es[1].Error != "" {
+		t.Fatalf("audit: got %+v, want the refusal (exit 126) then the run (exit 0)", es)
+	}
+}
+
 // TestMain supplies a deterministic file-vault passphrase for the suite. The
 // AES-256-GCM fallback now mandates MINTRUN_VAULT_KEY (audit C3); tests that need
 // the "no passphrase" error path override it locally with t.Setenv.
