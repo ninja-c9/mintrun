@@ -306,7 +306,7 @@ Connect `mintrun` to **Google Antigravity**, **Claude Code**, **Cursor**, or **W
 
 ### Approve From Your Phone (Telegram or Slack)
 
-`mintrun exec -approve`, `MINTRUN_APPROVE=1` in `mintrun`'s environment, and `"require_approval": true` in a provider's policy ask a human before anything is minted; the last two also cover an agent's `mintrun_exec` calls. On macOS a dialog asks. With a Telegram or Slack bot set up (or both), your phone is asked at the same time, so you can approve an agent's commands away from the machine. The first answer, from any of them, wins and closes the others.
+`mintrun exec -approve`, `MINTRUN_APPROVE=1` in `mintrun`'s environment, and `"require_approval": true` in a provider's policy ask a human before anything is minted; the last two also cover an agent's `mintrun_exec` calls. On macOS a dialog asks; Deny is its default button, so pressing Return denies. With a Telegram or Slack bot set up (or both), your phone is asked at the same time, so you can approve an agent's commands away from the machine. The first answer, from any of them, wins and closes the others.
 
 **Telegram:**
 
@@ -337,8 +337,8 @@ The bot sends you a direct message with ✅ and ❌ already on it: tap one. `min
 - **A Telegram bot of its own.** `mintrun` reads taps with `getUpdates`, which Telegram refuses while the bot has a webhook.
 - **Slack polls.** `mintrun` reads the message's reactions every 3 seconds, so an answer takes a few seconds to land, and each waiting request spends about 20 `reactions.get` calls a minute of the app's Tier 3 limit (50 or more a minute). When Slack rate-limits it, it waits as long as `Retry-After` says. A missing scope, a revoked token, or any other refusal ends the Slack request with that error, never an approval.
 - **The default vault only.** The settings are read from the default vault (`MINTRUN_VAULT`, or `keychain`), never from the vault a request names, so an agent cannot send approvals to a bot it controls.
-- **Every field quoted.** The dialog and the messages show each field an agent sets in quotes, so a line break in an argument shows as `\n` and cannot pose as a line of the request. Slack's message also escapes `&`, `<`, and `>`, so an argument cannot mention `@channel` or a person, or hide a link behind other text. A request too long to show ends in a TRUNCATED warning: deny it unless you know the rest.
-- **What Telegram and Slack see.** The message carries the provider, scope, permissions, params, and command through Telegram's or Slack's servers, and stays in the chat. It holds no secret, because approval comes before any secret is loaded, but a secret typed into the command's arguments would be in it.
+- **Every field quoted.** The dialog and the messages show each field an agent sets in quotes, the vault and the working directory included, so a line break in an argument shows as `\n` and cannot pose as a line of the request. A vault or working directory the request leaves empty shows as `(not set: …)` without quotes: the default vault, or the directory `mintrun` itself runs in. Slack's message also escapes `&`, `<`, and `>`, so an argument cannot mention `@channel` or a person, or hide a link behind other text. A request too long to show ends in a TRUNCATED warning: deny it unless you know the rest.
+- **What Telegram and Slack see.** The message carries the provider, vault, scope, permissions, params, command, and working directory through Telegram's or Slack's servers, and stays in the chat. It holds no secret, because approval comes before any secret is loaded, but a secret typed into the command's arguments would be in it, and a working directory is often a local path that holds your user name.
 - **Tested against stand-ins.** Both channels, and `mintrun init`'s link and test request, have run only against a local Bot API and a local Slack Web API in `go test`, never a real Telegram bot or Slack workspace.
 
 ---

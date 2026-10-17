@@ -293,6 +293,22 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
   go test -count=1 -v -run 'TestPluginInvalidJSONNeverQuotesStdout' ./internal/core
   ```
 
+### Workstream S — The Approval Dialog Defaults to Deny and Shows the Vault and Working Directory
+- **Files:** `internal/core/runner.go`, `internal/core/core_test.go`, `internal/builtin/telegram_test.go`, `internal/builtin/slack_test.go`
+- **Design:**
+  - The dialog's default button was "Allow", so a stray Return approved the request. Deny is now both the default and the cancel button, so Return and Esc both raise `-128`, which stays the one `(false, nil)` answer (rule 31).
+  - `ApprovalText` did not show `ExecRequest.Vault` or `ExecRequest.WorkingDir`, which an agent sets through MCP `mintrun_exec` (`vault`, `cwd`) and a user through `-vault` and `-cwd`. A `Vault:` line now follows the provider and a `Working directory:` line ends the text, both `strconv.Quote`d (rule 4). An empty value shows `(not set: the default vault)` or `(not set: mintrun's own)`, unquoted, so no agent value can pass for it. Neither is resolved, so no local path reaches Telegram or Slack unless the request set one.
+  - The working directory comes after the command, so a long command pushes it behind the TRUNCATED warning, which already says to deny. The caps are unchanged: 1,000 bytes in the dialog, 3,500 in Telegram, and Slack per rule 34.
+  - The new `Vault:` line moved the long request's cut onto a rune boundary, and `TestOSApproval` stopped catching a missing UTF-8 trim. The long check now runs with and without a 1-byte pad, so one of the two cuts always lands inside a rune.
+- **Deliverables:**
+  1. `[SERIAL]` the dialog script and `ApprovalText` in `internal/core/runner.go`.
+  2. `[SERIAL]` `TestOSApproval` (the script with Deny as the default, the not-set text, a working directory holding a fake `Working directory:` line and U+202E written as escapes, the padded long check) and the expected text in `TestTelegramApproval` and `TestSlackApproval`; 13 mutants run on copies of the repo.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestOSApproval' ./internal/core
+  go test -count=1 -v -run 'TestTelegramApproval|TestSlackApproval' ./internal/builtin
+  ```
+
 ---
 
 ## 3. Deferred Backlog (Next Actionable Items)
