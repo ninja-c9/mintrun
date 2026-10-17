@@ -492,6 +492,9 @@ func TestCLIShim(t *testing.T) {
 		if got := takeCalls(t, home); got != "gh repo view\n" {
 			t.Errorf("calls = %q, want %q", got, "gh repo view\n")
 		}
+		if e := lastAudit(t, filepath.Join(home, ".mintrun")); e.Outcome != "done" || e.Via != "cli" {
+			t.Errorf("audit entry = %+v, want a done run via cli", e)
+		}
 
 		// MINTRUN_SHIM_MODE=block tightens auto mode to block without running gh.
 		t.Setenv("MINTRUN_SHIM_MODE", "block")

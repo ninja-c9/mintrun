@@ -13,8 +13,10 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/ninja-c9/mintrun/examples/plugins"
 	"github.com/ninja-c9/mintrun/internal/builtin"
@@ -40,12 +42,65 @@ func defaultHomeDir() string {
 	return filepath.Join(h, ".mintrun")
 }
 
+// settings is <home>/settings.json, which the macOS app writes. Each field is a pointer, so a key
+// that is present must hold a valid value.
+type settings struct {
+	Vault           *string `json:"vault"`
+	ApprovalTimeout *int    `json:"approval_timeout_seconds"`
+}
+
+// loadSettings reads <home>/settings.json. Only a missing file means no settings (rule 36), and
+// unknown keys are ignored, so a newer app's file still loads. Errors quote the cause, never the path.
+func loadSettings(home string) (settings, error) {
+	var s settings
+	p := filepath.Join(home, "settings.json")
+	if _, err := os.Lstat(p); errors.Is(err, fs.ErrNotExist) {
+		return s, nil
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		var pe *fs.PathError
+		if errors.As(err, &pe) {
+			err = pe.Err
+		}
+		return s, fmt.Errorf("settings.json cannot be read (%v)", err)
+	}
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return s, fmt.Errorf("settings.json is malformed (%v)", err)
+	}
+	if s.Vault != nil && !slices.Contains([]string{"keychain", "1password", "file"}, *s.Vault) {
+		return s, errors.New(`settings.json: vault must be "keychain", "1password" or "file"`)
+	}
+	// Telegram and Slack stop at their own 10 minutes.
+	if t := s.ApprovalTimeout; t != nil && (*t < 1 || *t > 600) {
+		return s, errors.New("settings.json: approval_timeout_seconds must be 1 to 600")
+	}
+	return s, nil
+}
+
+// bootRuntime reads settings.json once, so a change applies from the next mintrun process on (a
+// running `mintrun mcp` keeps what it read).
 func bootRuntime() (*core.Runtime, error) {
 	home := defaultHomeDir()
+	s, err := loadSettings(home)
+	if err != nil {
+		return nil, err
+	}
 	reg := core.NewRegistry()
+	kv := builtin.NewKeychainVault(home)
+	vault := os.Getenv("MINTRUN_VAULT")
+	// MINTRUN_VAULT and MINTRUN_FILE_VAULT=1 win over the app's choice.
+	if s.Vault != nil && vault == "" && os.Getenv("MINTRUN_FILE_VAULT") != "1" {
+		switch *s.Vault {
+		case "1password":
+			vault = "1password"
+		case "file":
+			kv.ForceFile, kv.SecretTool = true, ""
+		}
+	}
 
 	// Register built-in core plugins.
-	_ = reg.Register(builtin.NewKeychainVault(home))
+	_ = reg.Register(kv)
 	_ = reg.Register(builtin.NewOnePasswordVault())
 	_ = reg.Register(builtin.NewCloudflareProvider())
 	_ = reg.Register(builtin.NewGitHubProvider())
@@ -54,8 +109,13 @@ func bootRuntime() (*core.Runtime, error) {
 	_ = reg.Register(builtin.NewMCPBridge())
 
 	// Discover and register all externally installed plugins from ~/.mintrun/plugins.
-	rt := core.NewRuntime(home, os.Getenv("MINTRUN_VAULT"), reg)
-	rt.ApprovalFunc = core.FirstApproval(core.OSApproval, builtin.TelegramApproval(rt), builtin.SlackApproval(rt))
+	rt := core.NewRuntime(home, vault, reg)
+	// The app answers instead of the dialog when it runs; Telegram and Slack race either one.
+	rt.ApprovalFunc = core.FirstApproval(builtin.AppApproval(rt, core.OSApproval), builtin.TelegramApproval(rt), builtin.SlackApproval(rt))
+	rt.Track = builtin.AppTrack(rt)
+	if s.ApprovalTimeout != nil {
+		rt.ApprovalTimeout = time.Duration(*s.ApprovalTimeout) * time.Second
+	}
 	if err := core.LoadExternalPlugins(rt.PluginsDir(), reg); err != nil {
 		return nil, err
 	}
@@ -127,7 +187,7 @@ func cmdExec(ctx context.Context, rt *core.Runtime, args []string) {
 	vault := fs.String("vault", "", "Vault plugin override (default: keychain, or 1password)")
 	ttl := fs.Int("ttl", 600, "Ephemeral token TTL in seconds")
 	cwd := fs.String("cwd", "", "Working directory for command")
-	approve := fs.Bool("approve", false, "Ask a human before minting: macOS dialog, plus Telegram or Slack when approval-telegram or approval-slack is set")
+	approve := fs.Bool("approve", false, "Ask a human before minting: the mintrun app (a macOS dialog when it is not running), plus Telegram or Slack when approval-telegram or approval-slack is set")
 	cleanEnv := fs.Bool("clean-env", false, "Run the command with only PATH/HOME/TMPDIR/USER/LANG/TERM/SSL_CERT_FILE, policy allowed_env, and the lease env")
 	sandbox := fs.Bool("sandbox", false, "Run the command in a macOS sandbox that cannot read mintrun's home or the Keychain")
 
@@ -171,6 +231,7 @@ func cmdExec(ctx context.Context, rt *core.Runtime, args []string) {
 		Approve:    *approve,
 		CleanEnv:   *cleanEnv,
 		Sandbox:    *sandbox,
+		Via:        "cli",
 	})
 	if err != nil {
 		fatal("%v", err)

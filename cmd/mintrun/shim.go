@@ -543,6 +543,7 @@ func runShim(ctx context.Context, rt *core.Runtime, origPath, tool string, args 
 		},
 		Command: append([]string{realBin}, args...),
 		Approve: entry.Approve,
+		Via:     "cli",
 	})
 	if err != nil {
 		if strings.HasPrefix(err.Error(), "policy denied:") || strings.HasPrefix(err.Error(), "exec requires") {
