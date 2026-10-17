@@ -1630,6 +1630,101 @@ func TestMCPBridgeAuditUnreadable(t *testing.T) {
 	}
 }
 
+// TestMCPBridgeExecUnreadable runs mintrun_exec when the master secret or the lease cannot be had:
+// vault.json is a directory or a file without read permission (which root reads anyway), a plugin
+// provider's entrypoint is gone, or a plugin vault's entrypoint is not executable. The agent and
+// audit.jsonl get the cause, never the path, which names the home (rule 36).
+func TestMCPBridgeExecUnreadable(t *testing.T) {
+	t.Setenv("MINTRUN_VAULT_KEY", "mintrun-mcp-unreadable-test-passphrase")
+	t.Setenv("MINTRUN_APPROVE", "")
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "plugin.json"), []byte(`{"name":"canary","version":"0.1.0","entrypoint":"run"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "run"), []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name, vault string
+		noRead      bool // root reads the file anyway
+		breakIt     func(home string) error
+		want        string
+	}{
+		{"vault.json is a directory", "keychain", false, func(home string) error {
+			p := filepath.Join(home, "vault.json")
+			if err := os.Remove(p); err != nil {
+				return err
+			}
+			return os.Mkdir(p, 0o700)
+		}, `vault "keychain" could not load master secret for "canary": read vault.json: is a directory`},
+		{"vault.json without read permission", "keychain", true, func(home string) error {
+			return os.Chmod(filepath.Join(home, "vault.json"), 0)
+		}, `vault "keychain" could not load master secret for "canary": read vault.json: permission denied`},
+		{"plugin provider entrypoint gone", "keychain", false, func(home string) error {
+			return os.Remove(filepath.Join(home, "plugins", "canary", "run"))
+		}, `provider "canary" mint failed: plugin "canary" failed: no such file or directory ()`},
+		{"plugin vault entrypoint not executable", "canary", false, func(home string) error {
+			return os.Chmod(filepath.Join(home, "plugins", "canary", "run"), 0o600)
+		}, `vault "canary" could not load master secret for "canary": plugin "canary" failed: permission denied ()`},
+	}
+	req := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mintrun_exec","arguments":{"provider":"canary","command":["echo"]}}}` + "\n"
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if c.noRead && os.Geteuid() <= 0 {
+				t.Skip("root reads a file without read permission")
+			}
+			ctx := context.Background()
+			home := t.TempDir()
+			reg := core.NewRegistry()
+			vault := &KeychainVault{HomeDir: home, ForceFile: true}
+			_ = reg.Register(vault)
+			rt := core.NewRuntime(home, c.vault, reg)
+			rt.ApprovalFunc = func(context.Context, core.ExecRequest) (bool, error) {
+				t.Error("an exec without require_approval must never ask a human")
+				return false, nil
+			}
+			if _, err := core.InstallPlugin(ctx, rt.PluginsDir(), src); err != nil {
+				t.Fatal(err)
+			}
+			if err := core.LoadExternalPlugins(rt.PluginsDir(), reg); err != nil {
+				t.Fatal(err)
+			}
+			if err := vault.SetSecret(ctx, "canary", "canary_master_secret"); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.breakIt(home); err != nil {
+				t.Fatal(err)
+			}
+			var out bytes.Buffer
+			if err := NewMCPBridge().Serve(ctx, rt, strings.NewReader(req), &out); err != nil {
+				t.Fatal(err)
+			}
+			var resp struct {
+				Result struct {
+					IsError bool                    `json:"isError"`
+					Content []struct{ Text string } `json:"content"`
+				} `json:"result"`
+			}
+			if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+				t.Fatal(err)
+			}
+			if want := "mintrun execution error: " + c.want; !resp.Result.IsError || len(resp.Result.Content) != 1 ||
+				resp.Result.Content[0].Text != want || strings.Contains(out.String(), home) {
+				t.Fatalf("got %s, want the tool error %q and no path", out.String(), want)
+			}
+			// The failure is audited (rule 8) with the same text, so the operator's log holds no path either.
+			audit, err := os.ReadFile(filepath.Join(home, "audit.jsonl"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			quoted, _ := json.Marshal(c.want)
+			if !strings.Contains(string(audit), `"error":`+string(quoted)) || strings.Contains(string(audit), home) {
+				t.Fatalf("expected the audited error %s and no path, got:\n%s", quoted, audit)
+			}
+		})
+	}
+}
+
 // TestMCPBridgeExecCleanEnv runs a successful mintrun_exec with clean_env over JSON-RPC. The
 // policy allows static mode but does not force clean mode, so only the request's clean_env can
 // strip the host variable. The child prints the lease token: the agent must see only the

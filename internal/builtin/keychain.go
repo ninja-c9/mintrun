@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -407,7 +408,12 @@ func (k *KeychainVault) readMap() (map[string]string, error) {
 		if os.IsNotExist(err) {
 			return make(map[string]string), nil
 		}
-		return nil, err
+		// Keep only the cause: the path names the home, and the text reaches agents (rule 36).
+		var pe *fs.PathError
+		if errors.As(err, &pe) {
+			err = pe.Err
+		}
+		return nil, fmt.Errorf("read vault.json: %v", err)
 	}
 	var m map[string]string
 	if err := json.Unmarshal(raw, &m); err != nil {

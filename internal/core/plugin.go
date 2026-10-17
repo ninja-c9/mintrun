@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
@@ -235,7 +236,13 @@ func (e *ExternalPlugin) call(ctx context.Context, req rpcRequest) (*rpcResponse
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("plugin %q failed: %w (%s)", e.manifest.Name, err, strings.TrimSpace(stderr.String()))
+		// Keep only the cause of a failed start: the entrypoint's path names the home, and the
+		// text reaches agents (rule 36).
+		var pe *fs.PathError
+		if errors.As(err, &pe) {
+			err = pe.Err
+		}
+		return nil, fmt.Errorf("plugin %q failed: %v (%s)", e.manifest.Name, err, strings.TrimSpace(stderr.String()))
 	}
 	var resp rpcResponse
 	if json.Unmarshal(stdout.Bytes(), &resp) != nil {
