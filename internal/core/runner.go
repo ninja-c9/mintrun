@@ -416,7 +416,8 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 
 	masterSecret, err := vault.GetSecret(ctx, req.Provider)
 	if err != nil {
-		return nil, fmt.Errorf("vault %q could not load master secret for %q: %w (run `mintrun secret set %s` first)", vaultName, req.Provider, err, req.Provider)
+		// No hint here: only the vault can tell a miss from a failure, so a miss names its own fix.
+		return nil, fmt.Errorf("vault %q could not load master secret for %q: %w", vaultName, req.Provider, err)
 	}
 
 	lease, err := provider.Mint(ctx, masterSecret, req.MintRequest)
