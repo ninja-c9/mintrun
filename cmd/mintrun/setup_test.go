@@ -270,13 +270,19 @@ func idePaths() []string {
 	return ps
 }
 
-// snapshot maps every path under dir to its contents ("<dir>" for a directory).
+// snapshot maps every path under dir to its contents ("<dir>" for a directory, "-> target" for
+// a symlink).
 func snapshot(t *testing.T, dir string) map[string]string {
 	t.Helper()
 	m := map[string]string{}
 	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			m[p] = "<dir>"
+			return err
+		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			target, err := os.Readlink(p)
+			m[p] = "-> " + target
 			return err
 		}
 		b, err := os.ReadFile(p)
@@ -323,7 +329,17 @@ func TestCLIDoctor(t *testing.T) {
 			if err := os.MkdirAll(policy(home), 0o700); err != nil {
 				t.Fatal(err)
 			}
-		}, 1, []string{"FAIL  policy: ", "is a directory; exec then allows every request"}},
+		}, 1, []string{"FAIL  policy: ", "is a directory, so exec denies every request",
+			"mintrun: WARNING: policy.json cannot be read (is a directory); denying all exec until fixed"}},
+		{"policy links to a missing file", func(t *testing.T, home, self string) {
+			if err := os.MkdirAll(filepath.Dir(policy(home)), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(policy(home)+".missing", policy(home)); err != nil {
+				t.Fatal(err)
+			}
+		}, 1, []string{"FAIL  policy: ", "no such file or directory, so exec denies every request",
+			"mintrun: WARNING: policy.json cannot be read (no such file or directory); denying all exec until fixed"}},
 		{"rule for no provider", func(t *testing.T, home, self string) {
 			setSecret(t, "github", "1:2:"+leak)
 			writeFile(t, policy(home), `{"nosuch":{}}`)

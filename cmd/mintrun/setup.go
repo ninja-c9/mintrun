@@ -288,13 +288,13 @@ func doctorVault(ctx context.Context, rt *core.Runtime, report reportFunc) map[s
 // know, so a misspelled one silently drops the limit it was meant to set.
 func doctorPolicy(rt *core.Runtime, stored map[string]bool, report reportFunc) {
 	p := filepath.Join(rt.HomeDir, "policy.json")
-	raw, err := os.ReadFile(p)
-	if errors.Is(err, fs.ErrNotExist) {
+	if _, err := os.Lstat(p); errors.Is(err, fs.ErrNotExist) {
 		report("warn", "policy: no policy.json, so exec allows any scope and permission (run mintrun init policy)")
 		return
 	}
+	raw, err := os.ReadFile(p)
 	if err != nil {
-		report("FAIL", "policy: %v; exec then allows every request", err)
+		report("FAIL", "policy: %v, so exec denies every request", err)
 		return
 	}
 	var rules map[string]core.PolicyRule
