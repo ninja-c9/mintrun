@@ -324,7 +324,8 @@ func TestCLIDoctor(t *testing.T) {
 		}, 1, []string{`FAIL  policy: json: unknown field "allowed_scope"; exec ignores that field`}},
 		{"malformed policy", func(t *testing.T, home, self string) {
 			writeFile(t, policy(home), `{"github":`)
-		}, 1, []string{"FAIL  policy: ", "is malformed (unexpected end of JSON input), so exec denies every request"}},
+		}, 1, []string{"FAIL  policy: ", "is malformed (unexpected end of JSON input), so exec denies every request",
+			"mintrun: WARNING: policy.json is malformed (unexpected end of JSON input); denying all exec until fixed"}},
 		{"unreadable policy", func(t *testing.T, home, self string) {
 			if err := os.MkdirAll(policy(home), 0o700); err != nil {
 				t.Fatal(err)

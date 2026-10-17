@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/ninja-c9/mintrun/internal/core"
 )
@@ -52,6 +53,10 @@ func (m *MCPBridge) Serve(ctx context.Context, rt *core.Runtime, in io.Reader, o
 	scanner := bufio.NewScanner(in)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	enc := json.NewEncoder(out)
+	// The AI app's name from initialize. It is self-reported, so it labels the audit log and the
+	// approval text but is never identity. It lives here, not on the bridge, because one
+	// MCPBridge serves every Serve call.
+	var client string
 
 	for scanner.Scan() {
 		select {
@@ -71,7 +76,10 @@ func (m *MCPBridge) Serve(ctx context.Context, rt *core.Runtime, in io.Reader, o
 		if len(req.ID) == 0 || string(req.ID) == "null" {
 			continue
 		}
-		resp := m.handleRequest(ctx, rt, req)
+		if req.Method == "initialize" {
+			client = clientName(req.Params)
+		}
+		resp := m.handleRequest(ctx, rt, req, client)
 		if err := enc.Encode(resp); err != nil {
 			return err
 		}
@@ -79,7 +87,25 @@ func (m *MCPBridge) Serve(ctx context.Context, rt *core.Runtime, in io.Reader, o
 	return scanner.Err()
 }
 
-func (m *MCPBridge) handleRequest(ctx context.Context, rt *core.Runtime, req jsonRPCRequest) jsonRPCResponse {
+// clientName returns initialize's params.clientInfo.name with only [A-Za-z0-9._ ()-] kept, cut to
+// 64 bytes, or "" when the params hold no name.
+func clientName(params json.RawMessage) string {
+	var p struct {
+		ClientInfo struct {
+			Name string `json:"name"`
+		} `json:"clientInfo"`
+	}
+	_ = json.Unmarshal(params, &p)
+	name := strings.Map(func(r rune) rune {
+		if strings.ContainsRune("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._ ()-", r) {
+			return r
+		}
+		return -1
+	}, p.ClientInfo.Name)
+	return name[:min(len(name), 64)] // every kept character is one byte
+}
+
+func (m *MCPBridge) handleRequest(ctx context.Context, rt *core.Runtime, req jsonRPCRequest, client string) jsonRPCResponse {
 	switch req.Method {
 	case "initialize":
 		return jsonRPCResponse{
@@ -140,6 +166,10 @@ func (m *MCPBridge) handleRequest(ctx context.Context, rt *core.Runtime, req jso
 					"additionalProperties": map[string]any{"type": "string"},
 					"description":          "Provider parameters, e.g. {\"installation_id\": \"12345678\"} to pick a github App installation; a credential that pins an installation refuses any other, and policy allowed_installations, when set, must list it",
 				},
+				"purpose": map[string]any{
+					"type":        "string",
+					"description": "Why you are running this command, in plain words for the human who approves it: one line, at most 300 bytes",
+				},
 			},
 			"required": []string{"provider", "command"},
 		}
@@ -168,7 +198,7 @@ func (m *MCPBridge) handleRequest(ctx context.Context, rt *core.Runtime, req jso
 					},
 					{
 						"name":        "mintrun_audit",
-						"description": "Return recent entries of the mintrun_exec audit log, oldest first. Each command is cut to its binary name: arguments are never shown, because a secret typed into argv is not one the runner can scrub.",
+						"description": "Return recent entries of the mintrun_exec audit log, oldest first. Each command is cut to its binary name and no purpose is shown: a secret typed into argv is not one the runner can scrub, and a blocked request keeps the agent's text as written.",
 						"inputSchema": map[string]any{
 							"type": "object",
 							"properties": map[string]any{
@@ -199,14 +229,14 @@ func (m *MCPBridge) handleRequest(ctx context.Context, rt *core.Runtime, req jso
 		if err := json.Unmarshal(req.Params, &callParams); err != nil {
 			return rpcErr(req.ID, -32602, "invalid tool call params")
 		}
-		return m.handleToolCall(ctx, rt, req.ID, callParams.Name, callParams.Arguments)
+		return m.handleToolCall(ctx, rt, req.ID, callParams.Name, callParams.Arguments, client)
 
 	default:
 		return rpcErr(req.ID, -32601, fmt.Sprintf("method %q not found", req.Method))
 	}
 }
 
-func (m *MCPBridge) handleToolCall(ctx context.Context, rt *core.Runtime, id json.RawMessage, toolName string, rawArgs json.RawMessage) jsonRPCResponse {
+func (m *MCPBridge) handleToolCall(ctx context.Context, rt *core.Runtime, id json.RawMessage, toolName string, rawArgs json.RawMessage, client string) jsonRPCResponse {
 	switch toolName {
 	case "mintrun_plugins":
 		manifests := rt.Registry.Manifests()
@@ -218,6 +248,8 @@ func (m *MCPBridge) handleToolCall(ctx context.Context, rt *core.Runtime, id jso
 		if err := json.Unmarshal(rawArgs, &execReq); err != nil {
 			return toolTextResult(id, fmt.Sprintf("invalid arguments: %v", err), true)
 		}
+		// Client and Via are json:"-", so a "client" in the arguments never reaches the request.
+		execReq.Client, execReq.Via = client, "mcp"
 		execReq.FromAgent = true // after decoding: no argument can set or clear it
 		res, err := rt.ExecBlind(ctx, execReq)
 		if err != nil {
@@ -262,7 +294,9 @@ func (m *MCPBridge) handleToolCall(ctx context.Context, rt *core.Runtime, id jso
 // (case-insensitive) and failedOnly, filtered like `mintrun audit`. Every command is cut to
 // argv[0]: policy-denied entries keep the raw argv (no secret is loaded yet to scrub against),
 // and a secret a human typed into argv is one the runner never holds, so arguments never reach
-// an agent. The on-disk log keeps the full argv for the operator.
+// an agent. The purpose is blanked for the same reason: a blocked entry keeps the agent's raw
+// text, which one agent could use to slip text to another. The on-disk log keeps both for the
+// operator.
 func readAudit(home, provider string, failedOnly bool, limit int) ([]core.AuditEntry, error) {
 	if limit <= 0 {
 		limit = 20
@@ -280,6 +314,7 @@ func readAudit(home, provider string, failedOnly bool, limit int) ([]core.AuditE
 		if len(e.Command) > 1 {
 			e.Command = []string{e.Command[0], core.RedactedPlaceholder}
 		}
+		e.Purpose = ""
 		entries = append(entries, e)
 	})
 	if err != nil {

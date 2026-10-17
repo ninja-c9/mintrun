@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -20,6 +21,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 const RedactedPlaceholder = "[MINTRUN:REDACTED]"
@@ -33,7 +36,12 @@ type ExecRequest struct {
 	TimeoutSec int      `json:"timeout_seconds,omitempty"`
 	Approve    bool     `json:"approve,omitempty"`   // Require interactive human-in-the-loop approval
 	CleanEnv   bool     `json:"clean_env,omitempty"` // Child gets only the base env + policy allowed_env + Lease.Env (can only tighten policy)
-	FromAgent  bool     `json:"-"`                   // Set by the MCP bridge after decoding: CheckPolicy then refuses any Vault or TimeoutSec, neither of which an agent picks
+	Purpose    string   `json:"purpose,omitempty"`   // The agent's reason in plain words: shown to the approver, never trusted
+	// Set by mintrun, never by an agent: MCP arguments unmarshal straight into ExecRequest.
+	Client    string `json:"-"` // MCP clientInfo name, self-reported by the AI app
+	Via       string `json:"-"` // "cli" or "mcp"
+	Task      string `json:"-"` // ExecBlind's per-call handle (rand.Text): opaque, never a secret
+	FromAgent bool   `json:"-"` // Set by the MCP bridge after decoding: CheckPolicy then refuses any Vault or TimeoutSec, neither of which an agent picks
 }
 
 // ExecResult contains the scrubbed output of a blind command execution.
@@ -48,22 +56,36 @@ type ExecResult struct {
 	Truncated  bool   `json:"truncated,omitempty"` // stdout or stderr passed MaxOutputBytes and was cut
 }
 
-// AuditEntry is written to `~/.mintrun/audit.jsonl` for every mint/exec action.
-// Secrets the runner holds are scrubbed; a policy-denied entry keeps the raw command (no secret
-// is loaded yet to scrub against), so MCP mintrun_audit hands agents argv[0] only.
+// AuditEntry is written to `~/.mintrun/audit.jsonl` once for every ExecBlind call.
+// Secrets the runner holds are scrubbed; an entry written before the master secret loads (a
+// denial, an unknown vault or provider, a missing master) keeps the raw command, client, and
+// purpose (no secret is loaded yet to scrub against), so MCP mintrun_audit hands agents argv[0] only.
 type AuditEntry struct {
 	Timestamp   string   `json:"ts"`
+	Task        string   `json:"task,omitempty"`
+	Via         string   `json:"via,omitempty"`
+	Client      string   `json:"client,omitempty"`
 	Provider    string   `json:"provider"`
 	Scope       string   `json:"scope,omitempty"`
 	Permissions []string `json:"permissions,omitempty"`
 	Command     []string `json:"command,omitempty"`
-	LeaseID     string   `json:"lease_id,omitempty"`
-	Ephemeral   bool     `json:"ephemeral"`
-	Revoked     bool     `json:"revoked"`
-	ExitCode    int      `json:"exit_code"`
-	DurationMs  int64    `json:"duration_ms"`
-	Truncated   bool     `json:"truncated,omitempty"`
-	Error       string   `json:"error,omitempty"`
+	Purpose     string   `json:"purpose,omitempty"`
+	// Outcome is blocked (CheckPolicy denied; see BlockedBy), denied (a human said no), no_answer
+	// (nobody answered within ApprovalTimeout), failed (every approval channel failed, or the
+	// vault, provider, mint, or command did), stopped (Track stopped the run), interrupted (the
+	// caller's context ended), timed_out (the exec timeout), or done (a clean exit). Entries
+	// written before it existed have none.
+	Outcome    string `json:"outcome,omitempty"`
+	BlockedBy  string `json:"blocked_by,omitempty"` // PolicyDecision.BlockedBy
+	DecidedAt  string `json:"decided_at,omitempty"` // When a human answered the approval
+	LeaseID    string `json:"lease_id,omitempty"`
+	Ephemeral  bool   `json:"ephemeral"`
+	ExpiresAt  string `json:"expires_at,omitempty"` // Ephemeral leases only: a static lease is the master, whose expiry is unknown
+	Revoked    bool   `json:"revoked"`
+	ExitCode   int    `json:"exit_code"`
+	DurationMs int64  `json:"duration_ms"`
+	Truncated  bool   `json:"truncated,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 // PolicyRule controls which scopes, permissions, and commands are permitted for a provider.
@@ -109,10 +131,18 @@ type Runtime struct {
 	HomeDir      string
 	DefaultVault string
 	Registry     *Registry
-	Policies     map[string]PolicyRule
 	ApprovalFunc func(ctx context.Context, req ExecRequest) (bool, error)
-	policyErr    error // Non-nil if policy.json exists but cannot be read or parsed → every exec fails closed.
+	// ApprovalTimeout bounds the wait for a human. 0, or more than 10 minutes, means 10 minutes,
+	// because Telegram and Slack stop at their own 10.
+	ApprovalTimeout time.Duration
+	// Track, if set, learns of each run once its lease is minted, before the command starts.
+	// Closing the channel it returns stops the run; its ctx ends once the run's final audit entry
+	// is written.
+	Track func(ctx context.Context, started AuditEntry) <-chan struct{}
 }
+
+// errStopped is the cause a Track stop cancels a run with.
+var errStopped = errors.New("stopped")
 
 func NewRuntime(homeDir, defaultVault string, reg *Registry) *Runtime {
 	if defaultVault == "" {
@@ -122,10 +152,16 @@ func NewRuntime(homeDir, defaultVault string, reg *Registry) *Runtime {
 		HomeDir:      homeDir,
 		DefaultVault: defaultVault,
 		Registry:     reg,
-		Policies:     make(map[string]PolicyRule),
 		ApprovalFunc: OSApproval,
 	}
-	rt.loadPolicyFile()
+	if _, err := rt.LoadPolicies(); err != nil {
+		what := "cannot be read"
+		switch err.(type) {
+		case *json.SyntaxError, *json.UnmarshalTypeError:
+			what = "is malformed"
+		}
+		fmt.Fprintf(os.Stderr, "mintrun: WARNING: policy.json %s (%v); denying all exec until fixed\n", what, err)
+	}
 	return rt
 }
 
@@ -133,40 +169,41 @@ func (rt *Runtime) PluginsDir() string {
 	return filepath.Join(rt.HomeDir, "plugins")
 }
 
-func (rt *Runtime) loadPolicyFile() {
+// LoadPolicies reads <home>/policy.json, which CheckPolicy does on every call, so a saved rule
+// applies to the next request. No file means no rules. A file that cannot be read or parsed
+// (a dangling symlink too) is an error, and CheckPolicy then denies every exec: a broken policy
+// must not degrade to allow-all.
+func (rt *Runtime) LoadPolicies() (map[string]PolicyRule, error) {
 	p := filepath.Join(rt.HomeDir, "policy.json")
 	// Only a missing policy.json means no rules. Lstat, so a symlink to a missing file still
 	// counts as a policy that cannot be read.
 	if _, err := os.Lstat(p); errors.Is(err, fs.ErrNotExist) {
-		return
+		return nil, nil
 	}
 	raw, err := os.ReadFile(p)
 	if err != nil {
-		// Fail closed: a policy that cannot be read (a directory, no permission, an I/O error)
-		// denies every exec. Keep only the cause, so the path never reaches an agent.
+		// Keep only the cause, so the path never reaches an agent.
 		var pe *fs.PathError
 		if errors.As(err, &pe) {
 			err = pe.Err
 		}
-		rt.policyErr = err
-		fmt.Fprintf(os.Stderr, "mintrun: WARNING: policy.json cannot be read (%v); denying all exec until fixed\n", err)
-		return
+		return nil, err
 	}
-	if err := json.Unmarshal(raw, &rt.Policies); err != nil {
-		// Fail closed: a malformed policy must not silently degrade to allow-all.
-		rt.Policies = make(map[string]PolicyRule)
-		rt.policyErr = err
-		fmt.Fprintf(os.Stderr, "mintrun: WARNING: policy.json is malformed (%v); denying all exec until fixed\n", err)
+	var rules map[string]PolicyRule
+	if err := json.Unmarshal(raw, &rules); err != nil {
+		return nil, err
 	}
+	return rules, nil
 }
 
 // PolicyDecision is the static verdict of the exec gate for one ExecRequest (MCP mintrun_policy_check).
 type PolicyDecision struct {
 	Allowed          bool   `json:"allowed"`
-	Reason           string `json:"reason,omitempty"`  // Denial reason: the exact error ExecBlind returns
-	ApprovalRequired bool   `json:"approval_required"` // ExecBlind would ask a human (approve, require_approval, MINTRUN_APPROVE=1)
-	TTLSeconds       int    `json:"ttl_seconds"`       // Lease TTL requested from the provider after max_ttl_seconds and the 600s default
-	CleanEnv         bool   `json:"clean_env"`         // Child gets the clean env (request, policy clean_env, or allowed_env)
+	Reason           string `json:"reason,omitempty"`     // Denial reason: the exact error ExecBlind returns
+	BlockedBy        string `json:"blocked_by,omitempty"` // Which check denied: invalid_request, paused, purpose, policy_file, env_dump, static, scope, permission, installation, command
+	ApprovalRequired bool   `json:"approval_required"`    // ExecBlind would ask a human (approve, require_approval, MINTRUN_APPROVE=1)
+	TTLSeconds       int    `json:"ttl_seconds"`          // Lease TTL requested from the provider after max_ttl_seconds and the 600s default
+	CleanEnv         bool   `json:"clean_env"`            // Child gets the clean env (request, policy clean_env, or allowed_env)
 }
 
 // CheckPolicy runs every static rule of the exec gate: request validation, the fail-closed
@@ -174,27 +211,46 @@ type PolicyDecision struct {
 // a vault, mints, executes, or prompts a human. ExecBlind enforces this same verdict, so a dry
 // run and a real exec cannot drift.
 func (rt *Runtime) CheckPolicy(req ExecRequest) PolicyDecision {
-	deny := func(format string, a ...any) PolicyDecision {
-		return PolicyDecision{Reason: fmt.Sprintf(format, a...)}
+	d, _ := rt.decide(req)
+	return d
+}
+
+// decide is CheckPolicy plus the rule's allowed_env, so ExecBlind builds the child env from the
+// policy.json it checked. (A slice field would make PolicyDecision incomparable.)
+func (rt *Runtime) decide(req ExecRequest) (PolicyDecision, []string) {
+	deny := func(by, format string, a ...any) (PolicyDecision, []string) {
+		return PolicyDecision{Reason: fmt.Sprintf(format, a...), BlockedBy: by}, nil
 	}
 	if len(req.Command) == 0 {
-		return deny("exec requires a non-empty command")
+		return deny("invalid_request", "exec requires a non-empty command")
 	}
 	if req.Provider == "" {
-		return deny("exec requires a provider name")
+		return deny("invalid_request", "exec requires a provider name")
 	}
 	// The vault is the operator's choice (MINTRUN_VAULT, or the CLI's -vault), never an agent's.
 	if req.FromAgent && req.Vault != "" {
-		return deny("policy denied: an agent cannot pick the vault (got %q); omit it to use the vault mintrun was started with (MINTRUN_VAULT)", req.Vault)
+		return deny("invalid_request", "policy denied: an agent cannot pick the vault (got %q); omit it to use the vault mintrun was started with (MINTRUN_VAULT)", req.Vault)
 	}
 	// Nor is the timeout an agent's: its timeout_seconds would lift the 5-minute limit to any length.
 	if req.FromAgent && req.TimeoutSec != 0 {
-		return deny("policy denied: an agent cannot set timeout_seconds (got %d); omit it to run with the 5-minute limit", req.TimeoutSec)
+		return deny("invalid_request", "policy denied: an agent cannot set timeout_seconds (got %d); omit it to run with the 5-minute limit", req.TimeoutSec)
+	}
+	// The app's Pause creates <home>/paused. Lstat, so a dangling symlink pauses too; any error
+	// but "not there" fails closed.
+	if _, err := os.Lstat(filepath.Join(rt.HomeDir, "paused")); !errors.Is(err, os.ErrNotExist) {
+		return deny("paused", "policy denied: mintrun is paused")
+	}
+	// The purpose is agent text a human reads before approving: short, one line, and nothing
+	// that hides or reorders the text around it.
+	if len(req.Purpose) > 300 || !utf8.ValidString(req.Purpose) || strings.IndexFunc(req.Purpose, func(r rune) bool {
+		return unicode.In(r, unicode.Cc, unicode.Cf, unicode.Zl, unicode.Zp)
+	}) >= 0 {
+		return deny("purpose", "policy denied: purpose must be at most 300 bytes of plain text (no control, format, or line-break characters)")
 	}
 
-	// Fail closed: a policy.json that exists but cannot be read or parsed denies everything.
-	if rt.policyErr != nil {
-		return deny("policy denied: policy.json failed to load (%v)", rt.policyErr)
+	rules, err := rt.LoadPolicies()
+	if err != nil {
+		return deny("policy_file", "policy denied: policy.json failed to load (%v)", err)
 	}
 
 	// Built-in guardrail: block trivial secret-dumping shell commands in blind runner.
@@ -203,17 +259,17 @@ func (rt *Runtime) CheckPolicy(req ExecRequest) PolicyDecision {
 		joined := strings.ToLower(strings.Join(req.Command, " "))
 		if bin == "env" || bin == "printenv" || bin == "export" ||
 			strings.Contains(joined, "printenv") || strings.Contains(joined, "/proc/self/environ") {
-			return deny("policy denied: command %q attempts to dump environment variables", req.Command[0])
+			return deny("env_dump", "policy denied: command %q attempts to dump environment variables", req.Command[0])
 		}
 	}
 
-	rule, hasRule := rt.Policies[req.Provider]
+	rule, hasRule := rules[req.Provider]
 
 	// Non-JIT static mode (direct long-lived secret, no ephemeral token or revoke) must be
 	// explicitly opted into via policy; an agent cannot silently downgrade by requesting it.
 	if req.Params["mode"] == "static" || hasToken(req.Permissions, "static") {
 		if !(hasRule && rule.AllowStatic) {
-			return deny("policy denied: static (non-JIT) mode for provider %q requires \"allow_static\": true in policy.json", req.Provider)
+			return deny("static", "policy denied: static (non-JIT) mode for provider %q requires \"allow_static\": true in policy.json", req.Provider)
 		}
 	}
 
@@ -228,13 +284,13 @@ func (rt *Runtime) CheckPolicy(req ExecRequest) PolicyDecision {
 				}
 			}
 			if !allowed {
-				return deny("policy denied: scope %q is not in allowed_scopes for provider %q", req.Scope, req.Provider)
+				return deny("scope", "policy denied: scope %q is not in allowed_scopes for provider %q", req.Scope, req.Provider)
 			}
 		}
 		if len(rule.AllowedPermissions) > 0 {
 			// Fail closed: a request declaring no permissions is denied unless '*' is allowed.
 			if len(req.Permissions) == 0 && !hasToken(rule.AllowedPermissions, "*") {
-				return deny("policy denied: provider %q requires declared permissions within allowed_permissions", req.Provider)
+				return deny("permission", "policy denied: provider %q requires declared permissions within allowed_permissions", req.Provider)
 			}
 			for _, perm := range req.Permissions {
 				allowed := false
@@ -245,7 +301,7 @@ func (rt *Runtime) CheckPolicy(req ExecRequest) PolicyDecision {
 					}
 				}
 				if !allowed {
-					return deny("policy denied: permission %q is not in allowed_permissions for provider %q", perm, req.Provider)
+					return deny("permission", "policy denied: permission %q is not in allowed_permissions for provider %q", perm, req.Provider)
 				}
 			}
 		}
@@ -253,13 +309,13 @@ func (rt *Runtime) CheckPolicy(req ExecRequest) PolicyDecision {
 		// token is minted for. The gate never sees the master, so a request must name a listed ID
 		// even when the master pins one.
 		if inst := req.Params["installation_id"]; len(rule.AllowedInstallations) > 0 && !hasToken(rule.AllowedInstallations, inst) {
-			return deny("policy denied: params.installation_id %q is not in allowed_installations for provider %q", inst, req.Provider)
+			return deny("installation", "policy denied: params.installation_id %q is not in allowed_installations for provider %q", inst, req.Provider)
 		}
 		if len(rule.BlockedCommands) > 0 && len(req.Command) > 0 {
 			cmdLine := strings.ToLower(strings.Join(req.Command, " "))
 			for _, blocked := range rule.BlockedCommands {
 				if blocked != "" && strings.Contains(cmdLine, strings.ToLower(blocked)) {
-					return deny("policy denied: command matches blocked pattern %q", blocked)
+					return deny("command", "policy denied: command matches blocked pattern %q", blocked)
 				}
 			}
 		}
@@ -276,32 +332,62 @@ func (rt *Runtime) CheckPolicy(req ExecRequest) PolicyDecision {
 		ApprovalRequired: req.Approve || (hasRule && rule.RequireApproval) || os.Getenv("MINTRUN_APPROVE") == "1",
 		TTLSeconds:       req.TTLSeconds,
 		CleanEnv:         req.CleanEnv || rule.CleanEnv || len(rule.AllowedEnv) > 0,
-	}
+	}, rule.AllowedEnv
 }
 
 // checkPolicy enforces CheckPolicy's verdict on req (effective TTL, clean mode) and asks a
-// human through ApprovalFunc when the verdict requires approval.
-func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest) error {
-	d := rt.CheckPolicy(*req)
+// human through ApprovalFunc when the verdict requires approval. It returns the allowed_env of
+// the rule it enforced; e records why it denied.
+func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest, e *AuditEntry) ([]string, error) {
+	d, env := rt.decide(*req)
+	if d.Allowed && d.ApprovalRequired {
+		req.TTLSeconds, req.CleanEnv = d.TTLSeconds, d.CleanEnv
+		if err := rt.approve(ctx, *req, e); err != nil {
+			return nil, err
+		}
+		// A pause or rule change made while the request waited for a human still applies. Fed
+		// the first verdict's TTL and clean mode, the second one can only tighten them.
+		d, env = rt.decide(*req)
+	}
 	if !d.Allowed {
-		return errors.New(d.Reason)
+		e.Outcome, e.BlockedBy = "blocked", d.BlockedBy
+		return nil, errors.New(d.Reason)
 	}
 	req.TTLSeconds, req.CleanEnv = d.TTLSeconds, d.CleanEnv
+	return env, nil
+}
 
-	if d.ApprovalRequired {
-		approveFn := rt.ApprovalFunc
-		if approveFn == nil {
-			approveFn = OSApproval
-		}
-		ok, err := approveFn(ctx, *req)
-		if err != nil {
-			return fmt.Errorf("policy denied: human-in-the-loop approval rejected (%v)", err)
-		}
-		if !ok {
-			return errors.New("policy denied: human-in-the-loop approval rejected (denied)")
-		}
+// approve asks a human through ApprovalFunc. Only an allow returns nil; e records the outcome of
+// anything else, and when a human answered.
+func (rt *Runtime) approve(ctx context.Context, req ExecRequest, e *AuditEntry) error {
+	approveFn := rt.ApprovalFunc
+	if approveFn == nil {
+		approveFn = OSApproval
 	}
-	return nil
+	timeout := rt.ApprovalTimeout
+	if timeout <= 0 || timeout > 10*time.Minute {
+		timeout = 10 * time.Minute
+	}
+	actx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ok, err := approveFn(actx, req)
+	switch {
+	case err == nil:
+		e.DecidedAt = time.Now().UTC().Format(time.RFC3339)
+		if ok {
+			return nil
+		}
+		e.Outcome = "denied"
+		return errors.New("policy denied: human-in-the-loop approval rejected (denied)")
+	case ctx.Err() != nil:
+		e.Outcome = "interrupted"
+	case actx.Err() != nil:
+		e.Outcome = "no_answer"
+		return fmt.Errorf("policy denied: no answer within %s", timeout)
+	default:
+		e.Outcome = "failed" // every channel failed before anyone answered
+	}
+	return fmt.Errorf("policy denied: human-in-the-loop approval rejected (%v)", err)
 }
 
 // OsascriptPath is the AppleScript runner OSApproval calls, a var so tests can stub it.
@@ -357,6 +443,12 @@ func ApprovalText(header string, req ExecRequest, limit int) string {
 	text := fmt.Sprintf("%s\n\nProvider: %q\nVault: %s\nScope: %q\nPermissions: %s\nParams: %s\nCommand: %s\nWorking directory: %s",
 		header, req.Provider, orUnset(req.Vault, "(not set: the default vault)"), req.Scope, quote(req.Permissions),
 		strings.Join(params, " "), quote(req.Command), orUnset(req.WorkingDir, "(not set: mintrun's own)"))
+	if req.Purpose != "" {
+		text += "\nPurpose: " + strconv.Quote(req.Purpose)
+	}
+	if req.Client != "" {
+		text += "\nClient: " + strconv.Quote(req.Client)
+	}
 	if len(text) > limit {
 		text = strings.ToValidUTF8(text[:limit], "") + "\n\n⚠️ TRUNCATED: the request is longer than this message. Deny unless you know the rest."
 	}
@@ -404,18 +496,26 @@ func FirstApproval(approvers ...func(context.Context, ExecRequest) (bool, error)
 
 // ExecBlind resolves the master credential from Vault, mints a scoped JIT lease from the Provider,
 // executes the target command with injected environment variables, scrubs all secrets from output,
-// and immediately revokes the ephemeral lease before returning.
+// and immediately revokes the ephemeral lease before returning. Every call writes one audit entry.
 func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult, error) {
 	start := time.Now()
-	if err := rt.checkPolicy(ctx, &req); err != nil {
-		rt.writeAudit(AuditEntry{
-			Timestamp: start.UTC().Format(time.RFC3339),
-			Provider:  req.Provider,
-			Scope:     req.Scope,
-			Command:   req.Command,
-			ExitCode:  126,
-			Error:     err.Error(),
-		})
+	req.Task = rand.Text()
+	e := AuditEntry{
+		Timestamp: start.UTC().Format(time.RFC3339), Task: req.Task, Via: req.Via, Client: req.Client,
+		Provider: req.Provider, Scope: req.Scope, Permissions: req.Permissions, Command: req.Command, Purpose: req.Purpose,
+	}
+	write := func(exitCode int, errMsg string) {
+		e.ExitCode, e.Error, e.DurationMs = exitCode, errMsg, time.Since(start).Milliseconds()
+		rt.writeAudit(e)
+	}
+	failed := func(err error) (*ExecResult, error) {
+		e.Outcome = "failed"
+		write(1, err.Error())
+		return nil, err
+	}
+	allowedEnv, err := rt.checkPolicy(ctx, &req, &e)
+	if err != nil {
+		write(126, err.Error())
 		return nil, err
 	}
 
@@ -425,36 +525,38 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 	}
 	vault, err := rt.Registry.Vault(vaultName)
 	if err != nil {
-		return nil, err
+		return failed(err)
 	}
 	provider, err := rt.Registry.Provider(req.Provider)
 	if err != nil {
-		return nil, err
+		return failed(err)
 	}
 
 	masterSecret, err := vault.GetSecret(ctx, req.Provider)
 	if err != nil {
 		// No hint here: only the vault can tell a miss from a failure, so a miss names its own fix.
-		return nil, fmt.Errorf("vault %q could not load master secret for %q: %w", vaultName, req.Provider, err)
+		return failed(fmt.Errorf("vault %q could not load master secret for %q: %w", vaultName, req.Provider, err))
 	}
 
+	// From here on the entry is scrubbed of every secret known so far.
 	lease, err := provider.Mint(ctx, masterSecret, req.MintRequest)
+	secrets := leaseSecrets(masterSecret, lease)
+	scrub := func(set []string) {
+		e.Command, e.Client, e.Purpose = scrubAll(req.Command, set), Scrub(req.Client, set), Scrub(req.Purpose, set)
+	}
 	if err != nil {
 		// Mint errors may echo the master secret (plugin stderr, API response bodies).
 		// Return a scrubbed string, not %w: the raw error must never reach the caller.
-		secrets := leaseSecrets(masterSecret, lease)
-		errMsg := Scrub(err.Error(), secrets)
-		rt.writeAudit(AuditEntry{
-			Timestamp:   start.UTC().Format(time.RFC3339),
-			Provider:    req.Provider,
-			Scope:       req.Scope,
-			Permissions: req.Permissions,
-			Command:     scrubAll(req.Command, secrets),
-			ExitCode:    1,
-			DurationMs:  time.Since(start).Milliseconds(),
-			Error:       errMsg,
-		})
-		return nil, fmt.Errorf("provider %q mint failed: %s", req.Provider, errMsg)
+		scrub(secrets)
+		return failed(fmt.Errorf("provider %q mint failed: %s", req.Provider, Scrub(err.Error(), secrets)))
+	}
+	// A plugin may (wrongly) use a secret as lease.ID: report it scrubbed, and redact the raw ID everywhere else.
+	leaseID := Scrub(lease.ID, secrets)
+	redactSet := append(secrets, lease.ID)
+	scrub(redactSet)
+	e.LeaseID, e.Ephemeral = leaseID, lease.Ephemeral
+	if lease.Ephemeral && !lease.ExpiresAt.IsZero() {
+		e.ExpiresAt = lease.ExpiresAt.UTC().Format(time.RFC3339)
 	}
 
 	revoked := false
@@ -468,11 +570,31 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 		}
 	}()
 
+	runCtx, stop := context.WithCancelCause(ctx)
+	defer stop(nil)
+	if rt.Track != nil {
+		trackCtx, untrack := context.WithCancel(context.WithoutCancel(ctx))
+		defer untrack() // after the final write
+		stopped := rt.Track(trackCtx, e)
+		select {
+		case <-stopped: // before the command starts, so Start fails
+			stop(errStopped)
+		default:
+			go func() {
+				select {
+				case <-stopped:
+					stop(errStopped)
+				case <-trackCtx.Done():
+				}
+			}()
+		}
+	}
+
 	timeout := 5 * time.Minute
 	if req.TimeoutSec > 0 {
 		timeout = time.Duration(req.TimeoutSec) * time.Second
 	}
-	execCtx, cancel := context.WithTimeout(ctx, timeout)
+	execCtx, cancel := context.WithTimeout(runCtx, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(execCtx, req.Command[0], req.Command[1:]...)
@@ -483,9 +605,9 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 	}
 
 	// Build child environment (audit M1): clean-env (req.CleanEnv already folds in policy
-	// clean_env/allowed_env via CheckPolicy) keeps only the base set plus policy allowed_env
-	// names; otherwise the host env is inherited. Lease.Env always wins.
-	cmd.Env = childEnv(req.CleanEnv, rt.Policies[req.Provider].AllowedEnv, lease.Env)
+	// clean_env/allowed_env via CheckPolicy) keeps only the base set plus the checked rule's
+	// allowed_env names; otherwise the host env is inherited. Lease.Env always wins.
+	cmd.Env = childEnv(req.CleanEnv, allowedEnv, lease.Env)
 
 	stdoutBuf := &cappedBuffer{limit: MaxOutputBytes}
 	stderrBuf := &cappedBuffer{limit: MaxOutputBytes}
@@ -501,6 +623,18 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 	case runErr != nil && !errors.Is(runErr, exec.ErrWaitDelay): // ErrWaitDelay follows a clean exit
 		exitCode = 1
 	}
+	switch {
+	case exitCode == 0:
+		e.Outcome = "done"
+	case errors.Is(context.Cause(runCtx), errStopped):
+		e.Outcome = "stopped"
+	case ctx.Err() != nil: // a signal to mintrun, or the MCP server shutting down
+		e.Outcome = "interrupted"
+	case errors.Is(execCtx.Err(), context.DeadlineExceeded):
+		e.Outcome = "timed_out"
+	default:
+		e.Outcome = "failed"
+	}
 
 	// Revoke before returning so we can report accurate revocation status.
 	if lease.Ephemeral {
@@ -511,11 +645,6 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 		}
 		cancelRevoke()
 	}
-
-	// A plugin may (wrongly) use a secret as lease.ID: report it scrubbed, and redact the raw ID everywhere else.
-	secrets := leaseSecrets(masterSecret, lease)
-	leaseID := Scrub(lease.ID, secrets)
-	redactSet := append(secrets, lease.ID)
 
 	stdout, outCut := stdoutBuf.scrubbed(redactSet)
 	stderr, errCut := stderrBuf.scrubbed(redactSet)
@@ -534,21 +663,8 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 	if runErr != nil {
 		errMsg = Scrub(runErr.Error(), redactSet)
 	}
-	rt.writeAudit(AuditEntry{
-		Timestamp:   start.UTC().Format(time.RFC3339),
-		Provider:    req.Provider,
-		Scope:       req.Scope,
-		Permissions: req.Permissions,
-		Command:     scrubAll(req.Command, redactSet),
-		LeaseID:     leaseID,
-		Ephemeral:   res.Ephemeral,
-		Revoked:     revoked,
-		ExitCode:    exitCode,
-		DurationMs:  res.DurationMs,
-		Truncated:   res.Truncated,
-		Error:       errMsg,
-	})
-
+	e.Revoked, e.Truncated = revoked, res.Truncated
+	write(exitCode, errMsg)
 	return res, nil
 }
 

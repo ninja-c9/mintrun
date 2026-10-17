@@ -440,10 +440,11 @@ esac
 	}
 
 	const reply = `plugin "canary" returned an invalid JSON response`
-	for _, c := range []struct{ name, vault, want string }{
+	cases := []struct{ name, vault, want string }{
 		{"bare_secret", "canary", `vault "canary" could not load master secret for "canary": ` + reply},
 		{"expires_at", "keychain", `provider "canary" mint failed: ` + reply},
-	} {
+	}
+	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			_, err := rt.ExecBlind(ctx, core.ExecRequest{Vault: c.vault, MintRequest: core.MintRequest{Provider: "canary"}, Command: []string{"echo"}})
 			if err == nil || err.Error() != c.want || strings.Contains(err.Error(), canary) {
@@ -452,14 +453,16 @@ esac
 		})
 	}
 
-	// Only the mint failure is audited; finding its error proves the scan below read that entry.
+	// Both failures are audited (rule 8); finding each error proves the scan below read that entry.
 	audit, err := os.ReadFile(filepath.Join(home, "audit.jsonl"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	quoted, _ := json.Marshal(reply)
-	if !strings.Contains(string(audit), `"error":`+string(quoted)) || strings.Contains(string(audit), canary) {
-		t.Fatalf("expected the audited reply error and no canary, got:\n%s", audit)
+	for _, c := range cases {
+		quoted, _ := json.Marshal(c.want)
+		if !strings.Contains(string(audit), `"error":`+string(quoted)) || strings.Contains(string(audit), canary) {
+			t.Fatalf("expected the audited error %s and no canary, got:\n%s", quoted, audit)
+		}
 	}
 }
 
@@ -944,12 +947,15 @@ func (p ttlProbe) Revoke(context.Context, string, *core.Lease) error { return ni
 func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 	ctx := context.Background()
 	t.Setenv("MINTRUN_APPROVE", "")
-	home, badHome := t.TempDir(), t.TempDir()
+	home, badHome, pausedHome := t.TempDir(), t.TempDir(), t.TempDir()
 	policy := `{"probe":{"allowed_scopes":["ok.com"],"allowed_permissions":["dns:*"],"blocked_commands":["rm -rf"],"max_ttl_seconds":120,"allowed_env":["MINTRUN_TEST_*"],"allowed_installations":["555"]},"gated":{"require_approval":true}}`
 	if err := os.WriteFile(filepath.Join(home, "policy.json"), []byte(policy), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(badHome, "policy.json"), []byte("{oops"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pausedHome, "paused"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var minted int
@@ -960,7 +966,7 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 	if err := vault.SetSecret(ctx, "probe", "probe_master_secret"); err != nil {
 		t.Fatal(err)
 	}
-	rt, badRT := core.NewRuntime(home, "keychain", reg), core.NewRuntime(badHome, "keychain", reg)
+	rt, badRT, pausedRT := core.NewRuntime(home, "keychain", reg), core.NewRuntime(badHome, "keychain", reg), core.NewRuntime(pausedHome, "keychain", reg)
 	approvals := 0
 	rt.ApprovalFunc = func(context.Context, core.ExecRequest) (bool, error) { approvals++; return false, nil }
 	probe := func(scope string, perms []string, cmd ...string) core.ExecRequest {
@@ -969,6 +975,11 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 	inst := func(id string) core.ExecRequest {
 		req := probe("ok.com", []string{"dns:read"}, "true")
 		req.Params = map[string]string{"installation_id": id}
+		return req
+	}
+	purpose := func(p string) core.ExecRequest {
+		req := probe("ok.com", []string{"dns:read"}, "true")
+		req.Purpose = p
 		return req
 	}
 	agentVault := func(vault string) core.ExecRequest {
@@ -991,27 +1002,32 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 	for _, c := range []struct {
 		rt  *core.Runtime
 		req core.ExecRequest
+		by  string
 	}{
-		{rt, core.ExecRequest{}},
-		{rt, core.ExecRequest{Command: []string{"true"}}},
-		{badRT, probe("ok.com", []string{"dns:read"}, "true")},
-		{rt, probe("ok.com", []string{"dns:read"}, "printenv")},
-		{rt, probe("evil.com", []string{"dns:read"}, "true")},
-		{rt, probe("ok.com", nil, "true")},
-		{rt, probe("ok.com", []string{"workers:write"}, "true")},
-		{rt, probe("ok.com", []string{"static"}, "true")},
-		{rt, probe("ok.com", []string{"dns:read"}, "sh", "-c", "RM -RF /tmp/x")},
-		{rt, inst("")},
-		{rt, inst("777")},
-		{rt, inst("555/../777")},
-		{rt, agentVault("keychain")},
-		{rt, norule(agentVault("keychain"))},
-		{rt, agentTimeout(3600)},
-		{rt, agentTimeout(-1)},
-		{rt, norule(agentTimeout(3600))},
+		{rt, core.ExecRequest{}, "invalid_request"},
+		{rt, core.ExecRequest{Command: []string{"true"}}, "invalid_request"},
+		{pausedRT, probe("ok.com", []string{"dns:read"}, "true"), "paused"},
+		{rt, purpose("a\nb"), "purpose"},
+		{badRT, probe("ok.com", []string{"dns:read"}, "true"), "policy_file"},
+		{rt, probe("ok.com", []string{"dns:read"}, "printenv"), "env_dump"},
+		{rt, probe("evil.com", []string{"dns:read"}, "true"), "scope"},
+		{rt, probe("ok.com", nil, "true"), "permission"},
+		{rt, probe("ok.com", []string{"workers:write"}, "true"), "permission"},
+		{rt, probe("ok.com", []string{"static"}, "true"), "static"},
+		{rt, probe("ok.com", []string{"dns:read"}, "sh", "-c", "RM -RF /tmp/x"), "command"},
+		{rt, inst(""), "installation"},
+		{rt, inst("777"), "installation"},
+		{rt, inst("555/../777"), "installation"},
+		{rt, agentVault("keychain"), "invalid_request"},
+		{rt, norule(agentVault("keychain")), "invalid_request"},
+		{rt, agentTimeout(3600), "invalid_request"},
+		{rt, agentTimeout(-1), "invalid_request"},
+		{rt, norule(agentTimeout(3600)), "invalid_request"},
+		{pausedRT, agentVault("keychain"), "invalid_request"}, // request validation, before the pause
+		{pausedRT, agentTimeout(3600), "invalid_request"},
 	} {
 		d := c.rt.CheckPolicy(c.req)
-		if _, err := c.rt.ExecBlind(ctx, c.req); d.Allowed || d.Reason == "" || err == nil || err.Error() != d.Reason {
+		if _, err := c.rt.ExecBlind(ctx, c.req); d.Allowed || d.Reason == "" || d.BlockedBy != c.by || err == nil || err.Error() != d.Reason {
 			t.Fatalf("dry run drifted from ExecBlind for %+v: decision %+v, exec error %v", c.req, d, err)
 		}
 	}
@@ -1178,6 +1194,367 @@ func TestExecBlindKillsProcessGroup(t *testing.T) {
 	raw, _ := os.ReadFile(filepath.Join(home, "audit.jsonl"))
 	if !strings.Contains(string(raw), "WaitDelay expired") {
 		t.Fatalf("audit log does not record the held pipe:\n%s", raw)
+	}
+}
+
+// lastAudit returns the newest entry of home's audit log.
+func lastAudit(t *testing.T, home string) core.AuditEntry {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(home, "audit.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	var e core.AuditEntry
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &e); err != nil {
+		t.Fatal(err)
+	}
+	return e
+}
+
+// TestPauseRecheckAfterApproval pins the pause file: while <home>/paused exists (a dangling
+// symlink too) every exec is denied before anyone is asked, a pause made while a request waited
+// for a human still blocks it, and removing the file resumes.
+func TestPauseRecheckAfterApproval(t *testing.T) {
+	t.Setenv("MINTRUN_APPROVE", "")
+	ctx := context.Background()
+	rt, home := probeRuntime(t, "pause_master_secret")
+	paused := filepath.Join(home, "paused")
+	req := core.ExecRequest{MintRequest: core.MintRequest{Provider: "probe"}, Command: []string{"true"}, Approve: true}
+	rt.ApprovalFunc = func(context.Context, core.ExecRequest) (bool, error) {
+		if err := os.WriteFile(paused, nil, 0o600); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if _, err := rt.ExecBlind(ctx, req); err == nil || err.Error() != "policy denied: mintrun is paused" {
+		t.Fatalf("a pause during approval must block the request, got %v", err)
+	}
+	if e := lastAudit(t, home); e.Outcome != "blocked" || e.BlockedBy != "paused" || e.DecidedAt == "" || e.ExitCode != 126 {
+		t.Fatalf("paused-after-approval entry: %+v", e)
+	}
+
+	approvals := 0
+	rt.ApprovalFunc = func(context.Context, core.ExecRequest) (bool, error) { approvals++; return true, nil }
+	if _, err := rt.ExecBlind(ctx, req); err == nil || approvals != 0 {
+		t.Fatalf("a paused exec must be denied before anyone is asked: err=%v approvals=%d", err, approvals)
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.Remove(paused); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(home, "missing"), paused); err != nil {
+			t.Fatal(err)
+		}
+		if d := rt.CheckPolicy(req); d.Allowed || d.BlockedBy != "paused" {
+			t.Fatalf("a dangling symlink must pause: %+v", d)
+		}
+		if os.Geteuid() != 0 { // root reads a mode-0 directory anyway
+			locked := t.TempDir()
+			if err := os.Chmod(locked, 0); err != nil {
+				t.Fatal(err)
+			}
+			defer os.Chmod(locked, 0o700)
+			if d := core.NewRuntime(locked, "keychain", rt.Registry).CheckPolicy(req); d.Allowed || d.BlockedBy != "paused" {
+				t.Fatalf("a pause file that cannot be checked must pause: %+v", d)
+			}
+		}
+	}
+	if err := os.Remove(paused); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := rt.ExecBlind(ctx, req); err != nil || res.ExitCode != 0 || approvals != 1 {
+		t.Fatalf("removing the pause must resume: res=%+v err=%v approvals=%d", res, err, approvals)
+	}
+}
+
+// TestPolicyReload pins the read of policy.json on every request: a rule saved, removed, or
+// changed while a request waited for a human applies without a new runtime, allowed_env comes
+// from the rule that was checked, and a file that cannot be read or parsed (a directory, a
+// dangling symlink) denies with policy_file and without the file's path.
+func TestPolicyReload(t *testing.T) {
+	t.Setenv("MINTRUN_APPROVE", "")
+	t.Setenv("N8_RELOAD_VAR", "kept")
+	ctx := context.Background()
+	rt, home := probeRuntime(t, "reload_master_secret")
+	policy := filepath.Join(home, "policy.json")
+	save := func(rules string) {
+		t.Helper()
+		if err := os.WriteFile(policy, []byte(rules), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	req := core.ExecRequest{MintRequest: core.MintRequest{Provider: "probe"}, Command: []string{"sh", "-c", `echo "${N8_RELOAD_VAR:-gone}"`}}
+	// child runs req and checks whether the child kept N8_RELOAD_VAR.
+	child := func(name, want string) {
+		t.Helper()
+		if res, err := rt.ExecBlind(ctx, req); err != nil || res.Stdout != want+"\n" {
+			t.Errorf("%s: res=%+v err=%v, want %s", name, res, err, want)
+		}
+	}
+	child("no policy.json", "kept")
+	save(`{"probe":{"allowed_env":["N8_RELOAD_*"]}}`)
+	child("allowed_env saved", "kept")
+	save(`{"probe":{"clean_env":true}}`)
+	child("clean_env saved", "gone")
+
+	broken := []struct {
+		name string
+		make func() error
+	}{
+		{"malformed", func() error { return os.WriteFile(policy, []byte("{oops"), 0o600) }},
+		{"directory", func() error { return os.Mkdir(policy, 0o700) }},
+		{"dangling symlink", func() error { return os.Symlink(filepath.Join(home, "missing"), policy) }},
+	}
+	for _, b := range broken {
+		if b.name == "dangling symlink" && runtime.GOOS == "windows" {
+			continue
+		}
+		if err := errors.Join(os.RemoveAll(policy), b.make()); err != nil {
+			t.Fatal(err)
+		}
+		d := rt.CheckPolicy(req)
+		_, err := rt.ExecBlind(ctx, req)
+		e := lastAudit(t, home)
+		if d.Allowed || d.BlockedBy != "policy_file" || !strings.HasPrefix(d.Reason, "policy denied: policy.json failed to load (") ||
+			strings.Contains(d.Reason, home) || err == nil || err.Error() != d.Reason || e.Outcome != "blocked" || e.BlockedBy != "policy_file" || e.ExitCode != 126 {
+			t.Errorf("%s: decision %+v, err %v, entry %+v", b.name, d, err, e)
+		}
+	}
+	if err := os.Remove(policy); err != nil {
+		t.Fatal(err)
+	}
+	child("policy.json removed", "kept")
+	// Only a missing file means no rules. CheckPolicy's pause check fails first on a broken
+	// home, so this pins LoadPolicies itself, which the app calls too.
+	if runtime.GOOS != "windows" {
+		notDir := filepath.Join(home, "not-a-dir")
+		if err := os.WriteFile(notDir, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if rules, err := (&core.Runtime{HomeDir: notDir}).LoadPolicies(); err == nil || strings.Contains(err.Error(), notDir) {
+			t.Errorf("a policy.json that cannot be looked up: rules %v, err %v", rules, err)
+		}
+	}
+
+	// The second check after an approval reads the file again.
+	save(`{"probe":{"require_approval":true,"allowed_env":["N8_RELOAD_*"]}}`)
+	rt.ApprovalFunc = func(context.Context, core.ExecRequest) (bool, error) {
+		save(`{"probe":{"clean_env":true}}`)
+		return true, nil
+	}
+	child("allowed_env dropped during approval", "gone")
+	save(`{"probe":{"require_approval":true}}`)
+	rt.ApprovalFunc = func(context.Context, core.ExecRequest) (bool, error) {
+		save(`{"probe":{"blocked_commands":["n8_reload"]}}`)
+		return true, nil
+	}
+	if _, err := rt.ExecBlind(ctx, req); err == nil || err.Error() != `policy denied: command matches blocked pattern "n8_reload"` {
+		t.Errorf("a rule saved during approval must block the request, got %v", err)
+	}
+	if e := lastAudit(t, home); e.Outcome != "blocked" || e.BlockedBy != "command" || e.DecidedAt == "" {
+		t.Errorf("blocked-after-approval entry: %+v", e)
+	}
+}
+
+// TestPurposeValidation pins the purpose check (at most 300 bytes of valid UTF-8 with no
+// control, format, or line-break character) and the approval text's quoted Purpose and Client
+// lines, which appear only when set.
+func TestPurposeValidation(t *testing.T) {
+	rt, _ := probeRuntime(t, "purpose_master_secret")
+	req := core.ExecRequest{MintRequest: core.MintRequest{Provider: "probe"}, Command: []string{"true"}}
+	for _, c := range []struct {
+		purpose string
+		ok      bool
+	}{
+		{"", true},
+		{"Rebuild the docs site, caf\u00e9 \u2705", true},
+		{strings.Repeat("\u00e9", 150), true}, // 300 bytes
+		{strings.Repeat("a", 301), false},
+		{"docs \xff", false},
+		{"line\nbreak", false},
+		{"tab\there", false},
+		{"color \x1b[31m", false},
+		{"looks safe \u202e", false},
+		{"zero\u200bwidth", false},
+		{"line\u2028separator", false},
+		{"paragraph\u2029separator", false},
+	} {
+		req.Purpose = c.purpose
+		d := rt.CheckPolicy(req)
+		if d.Allowed != c.ok || !c.ok && (d.BlockedBy != "purpose" || !strings.HasPrefix(d.Reason, "policy denied: purpose must be at most 300 bytes")) {
+			t.Errorf("purpose %q: %+v", c.purpose, d)
+		}
+	}
+	req.Purpose, req.Client = `rebuild "docs"`, "Claude Code"
+	if text := core.ApprovalText("Allow?", req, 1000); !strings.HasSuffix(text, `Working directory: (not set: mintrun's own)`+"\n"+`Purpose: "rebuild \"docs\""`+"\n"+`Client: "Claude Code"`) {
+		t.Errorf("approval text with purpose and client = %q", text)
+	}
+	req.Purpose, req.Client = "", ""
+	if text := core.ApprovalText("Allow?", req, 1000); !strings.HasSuffix(text, `Working directory: (not set: mintrun's own)`) {
+		t.Errorf("approval text without purpose and client = %q", text)
+	}
+}
+
+// leaseProbe mints an ephemeral lease that expires in an hour and counts its revokes; scope
+// "fail" makes Mint fail with an error that quotes the master secret.
+type leaseProbe struct{ revokes *atomic.Int32 }
+
+func (p leaseProbe) Manifest() core.Manifest {
+	return core.Manifest{Name: "leased", Kind: core.KindProvider}
+}
+func (p leaseProbe) Mint(_ context.Context, master string, req core.MintRequest) (*core.Lease, error) {
+	if req.Scope == "fail" {
+		return nil, errors.New("mint refused for " + master)
+	}
+	return &core.Lease{ID: "leased-1", Ephemeral: true, ExpiresAt: time.Now().Add(time.Hour)}, nil
+}
+func (p leaseProbe) Revoke(context.Context, string, *core.Lease) error { p.revokes.Add(1); return nil }
+
+// TestAuditActivityFields pins the activity record: every ExecBlind call writes exactly one entry
+// with a fresh task handle and an outcome, a denial keeps the request fields, and every entry
+// written after the master loads is scrubbed, agent-supplied purpose and client included.
+func TestAuditActivityFields(t *testing.T) {
+	t.Setenv("MINTRUN_APPROVE", "")
+	const master = "activity_master_secret"
+	rt, home := probeRuntime(t, master)
+	revokes := new(atomic.Int32)
+	if err := rt.Registry.Register(leaseProbe{revokes}); err != nil {
+		t.Fatal(err)
+	}
+	var approverTask string
+	rt.ApprovalFunc = func(ctx context.Context, req core.ExecRequest) (bool, error) {
+		approverTask = req.Task
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		switch req.Scope {
+		case "allow":
+			return true, nil
+		case "deny":
+			return false, nil
+		}
+		return false, errors.New("no channel")
+	}
+	ctx := context.Background()
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	lines, seen := 0, map[string]bool{}
+	run := func(ctx context.Context, req core.ExecRequest) core.AuditEntry {
+		t.Helper()
+		_, _ = rt.ExecBlind(ctx, req)
+		raw, err := os.ReadFile(filepath.Join(home, "audit.jsonl"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		all := strings.Split(strings.TrimSpace(string(raw)), "\n")
+		if len(all) != lines+1 {
+			t.Fatalf("%+v wrote %d audit entries, want 1", req, len(all)-lines)
+		}
+		lines = len(all)
+		var e core.AuditEntry
+		if err := json.Unmarshal([]byte(all[lines-1]), &e); err != nil {
+			t.Fatal(err)
+		}
+		if e.Task == "" || seen[e.Task] || e.Timestamp == "" {
+			t.Fatalf("entry needs a fresh task and a timestamp: %+v", e)
+		}
+		seen[e.Task] = true
+		return e
+	}
+	type verdict struct {
+		outcome, blockedBy string
+		exitCode           int
+		decided, expires   bool
+	}
+	check := func(name string, e core.AuditEntry, want verdict) {
+		t.Helper()
+		if got := (verdict{e.Outcome, e.BlockedBy, e.ExitCode, e.DecidedAt != "", e.ExpiresAt != ""}); got != want {
+			t.Errorf("%s: got %+v, want %+v (entry %+v)", name, got, want, e)
+		}
+	}
+	probe := func(scope string, cmd ...string) core.ExecRequest {
+		return core.ExecRequest{MintRequest: core.MintRequest{Provider: "probe", Scope: scope}, Command: cmd}
+	}
+
+	req := probe("s", "true")
+	req.Permissions, req.Purpose, req.Client, req.Via = []string{"p:read"}, "deploy the docs", "Claude Code", "mcp"
+	e := run(ctx, req)
+	check("done", e, verdict{"done", "", 0, false, false})
+	if e.Via != "mcp" || e.Client != "Claude Code" || e.Purpose != "deploy the docs" || e.Provider != "probe" || e.Scope != "s" ||
+		!slices.Equal(e.Permissions, req.Permissions) || !slices.Equal(e.Command, req.Command) || e.LeaseID != "probe-lease" {
+		t.Errorf("done entry lost a request field: %+v", e)
+	}
+	check("exit 3", run(ctx, probe("s", "sh", "-c", "exit 3")), verdict{"failed", "", 3, false, false})
+	req = probe("s", "sleep", "5")
+	req.TimeoutSec = 1
+	if e := run(ctx, req); e.Outcome != "timed_out" || e.ExitCode == 0 {
+		t.Errorf("timeout: %+v", e)
+	}
+	check("cancelled run", run(cancelled, probe("s", "true")), verdict{"interrupted", "", 1, false, false})
+
+	req = probe("s", "printenv")
+	req.Permissions, req.Purpose = []string{"p:read"}, "list env"
+	e = run(ctx, req)
+	check("env dump", e, verdict{"blocked", "env_dump", 126, false, false})
+	if !slices.Equal(e.Permissions, req.Permissions) || e.Purpose != "list env" {
+		t.Errorf("blocked entry lost a request field: %+v", e)
+	}
+	check("empty request", run(ctx, core.ExecRequest{}), verdict{"blocked", "invalid_request", 126, false, false})
+	req = probe("s", "true")
+	req.Vault = "nope"
+	check("unknown vault", run(ctx, req), verdict{"failed", "", 1, false, false})
+	check("unknown provider", run(ctx, core.ExecRequest{MintRequest: core.MintRequest{Provider: "nope"}, Command: []string{"true"}}), verdict{"failed", "", 1, false, false})
+	leased := core.ExecRequest{MintRequest: core.MintRequest{Provider: "leased"}, Command: []string{"true"}}
+	check("missing master", run(ctx, leased), verdict{"failed", "", 1, false, false})
+
+	vault, err := rt.Registry.Vault("keychain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := vault.SetSecret(ctx, "leased", master); err != nil {
+		t.Fatal(err)
+	}
+	req = leased
+	req.Scope, req.Purpose, req.Client = "fail", "use "+master, master
+	e = run(ctx, req)
+	check("mint failure", e, verdict{"failed", "", 1, false, false})
+	if e.Purpose != "use "+core.RedactedPlaceholder || e.Client != core.RedactedPlaceholder || !strings.Contains(e.Error, "mint failed: mint refused for "+core.RedactedPlaceholder) {
+		t.Errorf("mint failure entry not scrubbed: %+v", e)
+	}
+	e = run(ctx, leased)
+	check("ephemeral lease", e, verdict{"done", "", 0, false, true})
+	exp, err := time.Parse(time.RFC3339, e.ExpiresAt)
+	if left := time.Until(exp); err != nil || left < 59*time.Minute || left > time.Hour || !e.Ephemeral || !e.Revoked || e.LeaseID != "leased-1" || revokes.Load() != 1 {
+		t.Errorf("ephemeral lease entry %+v (expires in %v, %d revokes)", e, left, revokes.Load())
+	}
+	req = probe("s", "true")
+	req.Purpose, req.Client = "use "+master, master
+	if e := run(ctx, req); e.Outcome != "done" || e.Purpose != "use "+core.RedactedPlaceholder || e.Client != core.RedactedPlaceholder {
+		t.Errorf("run entry not scrubbed: %+v", e)
+	}
+
+	for _, c := range []struct {
+		ctx   context.Context
+		scope string
+		want  verdict
+	}{
+		{ctx, "allow", verdict{"done", "", 0, true, false}},
+		{ctx, "deny", verdict{"denied", "", 126, true, false}},
+		{ctx, "broken", verdict{"failed", "", 126, false, false}},
+		{cancelled, "allow", verdict{"interrupted", "", 126, false, false}},
+	} {
+		req := probe(c.scope, "true")
+		req.Approve = true
+		e := run(c.ctx, req)
+		check("approval "+c.scope, e, c.want)
+		if approverTask != e.Task {
+			t.Errorf("approval %s: approver saw task %q, entry has %q", c.scope, approverTask, e.Task)
+		}
+	}
+
+	if raw, _ := os.ReadFile(filepath.Join(home, "audit.jsonl")); strings.Contains(string(raw), master) {
+		t.Fatalf("audit log holds the master secret:\n%s", raw)
 	}
 }
 
@@ -1380,6 +1757,207 @@ esac
 		if text := shown(); len(text) > 1100 || !strings.HasSuffix(text, "Deny unless you know the rest.") {
 			t.Errorf("long request (pad %q): dialog text = %q", pad, text)
 		}
+	}
+}
+
+// TestApprovalTimeout pins the approval deadline: nobody answering within ApprovalTimeout is
+// no_answer and closes a dialog still open, a caller whose context ends first is interrupted, and
+// 0 or more than 10 minutes means 10 minutes.
+func TestApprovalTimeout(t *testing.T) {
+	t.Setenv("MINTRUN_APPROVE", "")
+	rt, home := probeRuntime(t, "timeout_master_secret")
+	req := core.ExecRequest{MintRequest: core.MintRequest{Provider: "probe"}, Command: []string{"true"}, Approve: true}
+	expect := func(name string, ctx context.Context, outcome, reason string) {
+		t.Helper()
+		start := time.Now()
+		_, err := rt.ExecBlind(ctx, req)
+		e := lastAudit(t, home)
+		if err == nil || err.Error() != reason || e.Outcome != outcome || e.Error != reason || e.ExitCode != 126 || e.DecidedAt != "" {
+			t.Errorf("%s: err=%v entry=%+v", name, err, e)
+		}
+		if d := time.Since(start); d > 5*time.Second {
+			t.Errorf("%s took %v", name, d)
+		}
+	}
+	rt.ApprovalFunc = func(ctx context.Context, _ core.ExecRequest) (bool, error) {
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(5 * time.Second):
+			return false, errors.New("the approval context never ended")
+		}
+	}
+	rt.ApprovalTimeout = 50 * time.Millisecond
+	expect("deadline", context.Background(), "no_answer", "policy denied: no answer within 50ms")
+	// The caller's own deadline is not "nobody answered".
+	rt.ApprovalTimeout = time.Minute
+	caller, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	expect("caller", caller, "interrupted", "policy denied: human-in-the-loop approval rejected (context deadline exceeded)")
+
+	for _, c := range []struct{ set, want time.Duration }{
+		{0, 10 * time.Minute}, {-time.Second, 10 * time.Minute}, {time.Hour, 10 * time.Minute}, {90 * time.Second, 90 * time.Second},
+	} {
+		var left time.Duration
+		rt.ApprovalFunc = func(ctx context.Context, _ core.ExecRequest) (bool, error) {
+			dl, _ := ctx.Deadline()
+			left = time.Until(dl)
+			return true, nil
+		}
+		rt.ApprovalTimeout = c.set
+		if _, err := rt.ExecBlind(context.Background(), req); err != nil || left > c.want || left < c.want-5*time.Second {
+			t.Errorf("ApprovalTimeout %v: approver had %v left (want %v), err=%v", c.set, left, c.want, err)
+		}
+	}
+
+	if runtime.GOOS != "darwin" {
+		return
+	}
+	// exec makes sleep the process the deadline kills: a forked one would hold stderr open for 30 s.
+	stub := filepath.Join(t.TempDir(), "osascript")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\nexec sleep 30\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	orig := core.OsascriptPath
+	core.OsascriptPath = stub
+	t.Cleanup(func() { core.OsascriptPath = orig })
+	rt.ApprovalFunc, rt.ApprovalTimeout = core.OSApproval, 200*time.Millisecond
+	expect("dialog", context.Background(), "no_answer", "policy denied: no answer within 200ms")
+}
+
+// leasedRuntime is probeRuntime with leaseProbe registered and given master.
+func leasedRuntime(t *testing.T, master string) (*core.Runtime, string, *atomic.Int32) {
+	t.Helper()
+	rt, home := probeRuntime(t, master)
+	revokes := new(atomic.Int32)
+	if err := rt.Registry.Register(leaseProbe{revokes}); err != nil {
+		t.Fatal(err)
+	}
+	vault, err := rt.Registry.Vault("keychain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := vault.SetSecret(context.Background(), "leased", master); err != nil {
+		t.Fatal(err)
+	}
+	return rt, home, revokes
+}
+
+// TestExecBlindStop pins a stop through Track: closing the channel kills the run's whole process
+// group, revokes the lease, and records stopped; a stop already in when Track returns keeps the
+// command from starting; a timeout and a cancelled caller keep their own outcomes.
+func TestExecBlindStop(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process groups are Unix-only")
+	}
+	t.Setenv("MINTRUN_APPROVE", "")
+	rt, home, revokes := leasedRuntime(t, "stop_master_secret")
+	mark := filepath.Join(t.TempDir(), "started")
+	// once makes Track call act as soon as the command has created mark.
+	once := func(act func(stop chan struct{})) {
+		rt.Track = func(ctx context.Context, _ core.AuditEntry) <-chan struct{} {
+			stop := make(chan struct{})
+			go func() {
+				for ctx.Err() == nil {
+					if _, err := os.Stat(mark); err == nil {
+						act(stop)
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}()
+			return stop
+		}
+	}
+	// The background sleep holds stdout, so only killing the whole group frees it before
+	// PipeWaitDelay (5 s). mark comes after the last fork: on macOS a child forked while its
+	// group is killed can survive the kill (1 or 2 runs in 100 when touch came first).
+	sleeper := core.ExecRequest{MintRequest: core.MintRequest{Provider: "leased"}, Command: []string{"sh", "-c", `sleep 60 & touch "$0"; wait`, mark}}
+	run := func(name string, ctx context.Context, req core.ExecRequest, outcome string) core.AuditEntry {
+		t.Helper()
+		os.Remove(mark)
+		before, start := revokes.Load(), time.Now()
+		res, err := rt.ExecBlind(ctx, req)
+		e := lastAudit(t, home)
+		if err != nil || res.ExitCode == 0 || e.Outcome != outcome || !e.Revoked || revokes.Load() != before+1 {
+			t.Errorf("%s: res=%+v err=%v entry=%+v", name, res, err, e)
+		}
+		if d := time.Since(start); d > 4*time.Second {
+			t.Errorf("%s took %v", name, d)
+		}
+		return e
+	}
+
+	once(func(stop chan struct{}) { close(stop) })
+	run("stop", context.Background(), sleeper, "stopped")
+
+	rt.Track = func(context.Context, core.AuditEntry) <-chan struct{} {
+		stop := make(chan struct{})
+		close(stop)
+		return stop
+	}
+	// With one P the watcher goroutine ran after Start in 20 of 20 runs, so without the check
+	// made when Track returns, the command starts.
+	procs := runtime.GOMAXPROCS(1)
+	e := run("stop before start", context.Background(), sleeper, "stopped")
+	runtime.GOMAXPROCS(procs)
+	if e.ExitCode != 1 {
+		t.Errorf("stop before start: exit %d, want 1", e.ExitCode)
+	}
+	if _, err := os.Stat(mark); err == nil {
+		t.Error("a run stopped before it started ran its command")
+	}
+
+	rt.Track = func(context.Context, core.AuditEntry) <-chan struct{} { return nil }
+	timed := sleeper
+	timed.TimeoutSec = 1
+	run("timeout", context.Background(), timed, "timed_out")
+
+	caller, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	once(func(chan struct{}) { cancel() })
+	run("caller", caller, sleeper, "interrupted")
+}
+
+// TestExecBlindTrackEndsAfterAudit pins what Track gets: the entry so far, scrubbed and with the
+// lease, and a context that outlives a cancelled caller and ends only once the run's final entry
+// is in the audit log.
+func TestExecBlindTrackEndsAfterAudit(t *testing.T) {
+	t.Setenv("MINTRUN_APPROVE", "")
+	const master = "track_master_secret"
+	rt, home, _ := leasedRuntime(t, master)
+	caller, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var started core.AuditEntry
+	logged := make(chan []byte, 1)
+	rt.Track = func(ctx context.Context, s core.AuditEntry) <-chan struct{} {
+		started = s
+		cancel() // the caller goes away while the run is tracked
+		go func() {
+			<-ctx.Done()
+			raw, _ := os.ReadFile(filepath.Join(home, "audit.jsonl"))
+			logged <- raw
+		}()
+		return nil
+	}
+	req := core.ExecRequest{MintRequest: core.MintRequest{Provider: "leased"}, Command: []string{"echo", master}, Purpose: "use " + master}
+	if _, err := rt.ExecBlind(caller, req); err != nil {
+		t.Fatal(err)
+	}
+	e := lastAudit(t, home)
+	select {
+	case raw := <-logged:
+		if !strings.Contains(string(raw), `"task":"`+e.Task+`"`) {
+			t.Errorf("Track's context ended before the final entry was written:\n%s", raw)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Track's context never ended")
+	}
+	want, _ := json.Marshal(core.AuditEntry{Timestamp: e.Timestamp, Task: e.Task, Provider: "leased",
+		Command: []string{"echo", core.RedactedPlaceholder}, Purpose: "use " + core.RedactedPlaceholder,
+		LeaseID: "leased-1", Ephemeral: true, ExpiresAt: e.ExpiresAt})
+	if got, _ := json.Marshal(started); string(got) != string(want) || e.ExpiresAt == "" || e.Outcome != "interrupted" {
+		t.Errorf("Track got %s\nwant %s\nfinal entry %+v", got, want, e)
 	}
 }
 

@@ -566,7 +566,8 @@ func inferShimScopePerms(rt *core.Runtime, tool, provider string, entry shimEntr
 	if scope == "" && tool == "gh" {
 		scope = ghRepoFromArgsOrGit(args)
 	}
-	rule, hasRule := rt.Policies[provider]
+	rules, _ := rt.LoadPolicies() // a broken policy.json infers nothing here; ExecBlind denies it
+	rule, hasRule := rules[provider]
 	if scope == "" && hasRule && len(rule.AllowedScopes) == 1 && !strings.Contains(rule.AllowedScopes[0], "*") {
 		scope = rule.AllowedScopes[0]
 	}

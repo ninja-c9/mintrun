@@ -675,7 +675,8 @@ func (w *wizard) policy() {
 	p := filepath.Join(w.rt.HomeDir, "policy.json")
 	if _, err := os.Stat(p); !errors.Is(err, fs.ErrNotExist) {
 		entry, _ := json.MarshalIndent(rule, "", "  ")
-		if _, ok := w.rt.Policies["github"]; ok {
+		rules, _ := w.rt.LoadPolicies()
+		if _, ok := rules["github"]; ok {
 			fmt.Printf("%s already has a github rule; left unchanged. The suggested rule:\n\"github\": %s\n", p, entry)
 		} else {
 			fmt.Printf("%s exists, so it is left unchanged. Add this key to it:\n\"github\": %s\n", p, entry)

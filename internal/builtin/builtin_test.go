@@ -1,6 +1,7 @@
 package builtin
 
 import (
+	"bufio"
 	"bytes"
 	"cmp"
 	"context"
@@ -16,6 +17,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"io"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -580,6 +582,7 @@ esac
 
 func TestMCPBridgeComprehensive(t *testing.T) {
 	home := t.TempDir()
+	t.Setenv("MINTRUN_APPROVE", "")
 	reg := core.NewRegistry()
 	kv := &KeychainVault{HomeDir: home, ForceFile: true}
 	_ = kv.SetSecret(context.Background(), "cloudflare", "cf_sec_12345")
@@ -597,7 +600,7 @@ func TestMCPBridgeComprehensive(t *testing.T) {
 		"",                                    // empty line ignored
 		"{invalid-json",                       // malformed JSON ignored
 		`{"jsonrpc":"2.0","method":"notify"}`, // notification without ID ignored
-		`{"jsonrpc":"2.0","id":1,"method":"initialize"}`,
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"claude-code","version":"2.0.0"}}}`,
 		`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`,
 		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":"not-an-object"}`,
 		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"mintrun_plugins"}}`,
@@ -616,6 +619,23 @@ func TestMCPBridgeComprehensive(t *testing.T) {
 	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
 	if len(lines) != 9 {
 		t.Fatalf("expected 9 JSON-RPC responses, got %d:\n%s", len(lines), out.String())
+	}
+
+	// The two execs that reached the runner (an unknown provider, static mode without
+	// allow_static) are audited with the session's client and via mcp.
+	raw, err := os.ReadFile(filepath.Join(home, "audit.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 audit entries, got %d:\n%s", len(entries), raw)
+	}
+	for _, line := range entries {
+		var e core.AuditEntry
+		if err := json.Unmarshal([]byte(line), &e); err != nil || e.Client != "claude-code" || e.Via != "mcp" {
+			t.Fatalf("expected client claude-code via mcp, got %s (err=%v)", line, err)
+		}
 	}
 
 	// Verify canceled context exits cleanly
@@ -1358,7 +1378,8 @@ esac
 
 // TestMCPBridgeGovernanceTools drives mintrun_policy_check and mintrun_audit over JSON-RPC. No
 // vault is registered and no secret is stored: the dry run must not need either, and must never
-// ask a human. A secret typed into argv must never reach the agent through any response.
+// ask a human. A secret typed into argv, and the purpose of a blocked exec, must never reach the
+// agent through any response.
 func TestMCPBridgeGovernanceTools(t *testing.T) {
 	home, badHome := t.TempDir(), t.TempDir()
 	t.Setenv("MINTRUN_HOME", home)
@@ -1387,7 +1408,10 @@ func TestMCPBridgeGovernanceTools(t *testing.T) {
 		Result struct {
 			IsError bool                    `json:"isError"`
 			Content []struct{ Text string } `json:"content"`
-			Tools   []struct{ Name string } `json:"tools"`
+			Tools   []struct {
+				Name        string
+				InputSchema struct{ Properties map[string]any }
+			} `json:"tools"`
 		} `json:"result"`
 	}
 	call := func(name, args string) string {
@@ -1399,8 +1423,10 @@ func TestMCPBridgeGovernanceTools(t *testing.T) {
 		if err := NewMCPBridge().Serve(context.Background(), rt, strings.NewReader(strings.Join(reqs, "\n")+"\n"), &out); err != nil {
 			t.Fatal(err)
 		}
-		if strings.Contains(out.String(), "fake_argv_secret_123") {
-			t.Fatalf("argv secret reached the agent:\n%s", out.String())
+		for _, canary := range []string{"fake_argv_secret_123", "agent_purpose_canary_456"} {
+			if strings.Contains(out.String(), canary) {
+				t.Fatalf("%s reached the agent:\n%s", canary, out.String())
+			}
 		}
 		lines := strings.Split(strings.TrimSpace(out.String()), "\n")
 		resps := make([]toolResp, len(lines))
@@ -1436,7 +1462,8 @@ func TestMCPBridgeGovernanceTools(t *testing.T) {
 		return es
 	}
 
-	leaky := `{"provider":"cloudflare","scope":"evil.com","permissions":["dns:read"],"command":["sh","-c","curl -H 'Authorization: Bearer fake_argv_secret_123'"]}`
+	leaky := `{"provider":"cloudflare","scope":"evil.com","permissions":["dns:read"],"command":["sh","-c","curl -H 'Authorization: Bearer fake_argv_secret_123'"],"purpose":"agent_purpose_canary_456"}`
+	withPurpose := `{"provider":"cloudflare","scope":"ok.com","permissions":["dns:read"],"command":["true"],"purpose":`
 	r := serve(rt,
 		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`,
 		call("mintrun_policy_check", `{"provider":"cloudflare","scope":"ok.com","permissions":["dns:read"],"command":["wrangler","deploy"],"ttl_seconds":300}`),
@@ -1451,14 +1478,25 @@ func TestMCPBridgeGovernanceTools(t *testing.T) {
 		call("mintrun_audit", `{"provider":"CLOUDFLARE"}`),
 		call("mintrun_audit", `{"failed_only":true}`),
 		call("mintrun_audit", `{"limit":"x"}`),
+		call("mintrun_policy_check", withPurpose+`"`+strings.Repeat("a", 301)+`"}`),
+		call("mintrun_policy_check", withPurpose+`"line one\nline two"}`),
 	)
 
 	var names []string
 	for _, tool := range r[0].Result.Tools {
 		names = append(names, tool.Name)
+		if _, ok := tool.InputSchema.Properties["purpose"]; ok != (tool.Name == "mintrun_exec" || tool.Name == "mintrun_policy_check") {
+			t.Fatalf("%s: purpose in the input schema is %v", tool.Name, ok)
+		}
 	}
 	if got := strings.Join(names, ","); got != "mintrun_exec,mintrun_plugins,mintrun_policy_check,mintrun_audit" {
 		t.Fatalf("tools/list advertises %s", got)
+	}
+	// The purpose reaches the same gate: over 300 bytes or more than one line is denied.
+	for _, i := range []int{13, 14} {
+		if d := decision(r[i]); d.Allowed || d.BlockedBy != "purpose" {
+			t.Fatalf("policy_check %d: expected a purpose denial, got %+v", i, d)
+		}
 	}
 
 	// Allowed: max_ttl_seconds caps the TTL, clean_env comes from the request or the policy, and
@@ -1483,17 +1521,20 @@ func TestMCPBridgeGovernanceTools(t *testing.T) {
 		t.Fatal("expected invalid arguments and the denied exec to be tool errors")
 	}
 
-	// The denied exec logged its raw argv on disk (no secret was loaded to scrub against); the
-	// agent only ever sees argv[0]. Dry runs log nothing: cloudflare has a single entry.
-	if raw, _ := os.ReadFile(filepath.Join(home, "audit.jsonl")); !strings.Contains(string(raw), "fake_argv_secret_123") {
-		t.Fatal("expected the operator log to keep the raw argv of the denied exec")
+	// The denied exec logged its raw argv and purpose on disk (no secret was loaded to scrub
+	// against); the agent only ever sees argv[0] and no purpose. Dry runs log nothing: cloudflare
+	// has a single entry.
+	if raw, _ := os.ReadFile(filepath.Join(home, "audit.jsonl")); !strings.Contains(string(raw), "fake_argv_secret_123") ||
+		!strings.Contains(string(raw), `"purpose":"agent_purpose_canary_456"`) {
+		t.Fatal("expected the operator log to keep the raw argv and purpose of the denied exec")
 	}
 	es := audit(r[8])
 	if len(es) != 20 {
 		t.Fatalf("default limit must be 20, got %d", len(es))
 	}
 	if last := es[19]; es[0].Provider != "github" || strings.Join(es[0].Command, " ") != "gh "+core.RedactedPlaceholder ||
-		last.Provider != "cloudflare" || last.ExitCode != 126 || strings.Join(last.Command, " ") != "sh "+core.RedactedPlaceholder {
+		last.Provider != "cloudflare" || last.ExitCode != 126 || strings.Join(last.Command, " ") != "sh "+core.RedactedPlaceholder ||
+		last.Task == "" || last.Via != "mcp" || last.Outcome != "blocked" || last.BlockedBy != "scope" || last.Purpose != "" {
 		t.Fatalf("default audit view: first %+v, last %+v", es[0], last)
 	}
 	if n := len(audit(r[9])); n != 100 {
@@ -1573,6 +1614,138 @@ func TestMCPBridgeExecCleanEnv(t *testing.T) {
 	}
 }
 
+// TestMCPBridgeClientInfo checks the client name a Serve call takes from initialize's clientInfo:
+// only [A-Za-z0-9._ ()-] is kept, cut to 64 bytes; a name with nothing left records no client; a
+// "client" in the tool arguments is ignored; and two interleaved sessions on one bridge each keep
+// their own name. Every exec has an empty command, so it is blocked before any vault opens.
+func TestMCPBridgeClientInfo(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MINTRUN_HOME", home)
+	t.Setenv("MINTRUN_APPROVE", "")
+	reg := core.NewRegistry()
+	_ = reg.Register(NewCloudflareProvider())
+	rt := core.NewRuntime(home, "keychain", reg)
+	rt.ApprovalFunc = func(context.Context, core.ExecRequest) (bool, error) {
+		t.Error("a blocked exec must never ask a human")
+		return false, nil
+	}
+	bridge := NewMCPBridge()
+	const purpose = "client_purpose_canary_789"
+	hello := func(name string) string {
+		params, _ := json.Marshal(map[string]any{"protocolVersion": "2024-11-05", "clientInfo": map[string]string{"name": name, "version": "1.0"}})
+		return `{"jsonrpc":"2.0","id":1,"method":"initialize","params":` + string(params) + `}`
+	}
+	blocked := func(label string) string {
+		return `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"mintrun_exec","arguments":{"provider":"cloudflare","scope":"` + label +
+			`","command":[],"purpose":"` + purpose + `","client":"spoofed"}}}`
+	}
+
+	// One session per name, labeled by scope. Characters are dropped, not replaced, before the cut.
+	want := map[string]string{}
+	for _, c := range []struct{ label, name, client string }{
+		{"filtered", "Evil\n\"Claude\" \u202e\u00e9<b>/:;@1.2_3 (beta)-x", "EvilClaude b1.2_3 (beta)-x"},
+		{"cut", "\u00e9" + strings.Repeat("abcdefgh", 9), strings.Repeat("abcdefgh", 8)},
+		{"empty", "", ""},
+		{"stripped", "\u202e\n\u00e9", ""},
+	} {
+		if err := bridge.Serve(context.Background(), rt, strings.NewReader(hello(c.name)+"\n"+blocked(c.label)+"\n"), io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		want[c.label] = c.client
+	}
+
+	// Two sessions on one bridge, interleaved: each exec records its own session's name.
+	type session struct {
+		in   *io.PipeWriter
+		out  *bufio.Reader
+		done chan error
+	}
+	open := func() session {
+		inR, inW := io.Pipe()
+		outR, outW := io.Pipe()
+		s := session{inW, bufio.NewReader(outR), make(chan error, 1)}
+		go func() {
+			err := bridge.Serve(context.Background(), rt, inR, outW)
+			outW.Close()
+			s.done <- err
+		}()
+		return s
+	}
+	send := func(s session, line string) {
+		t.Helper()
+		if _, err := io.WriteString(s.in, line+"\n"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.out.ReadString('\n'); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, b := open(), open()
+	send(a, hello("Alpha"))
+	send(b, hello("Beta"))
+	send(a, blocked("session-a"))
+	send(b, blocked("session-b"))
+	for _, s := range []session{a, b} {
+		s.in.Close()
+		if err := <-s.done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	want["session-a"], want["session-b"] = "Alpha", "Beta"
+
+	check := func(where string, es []core.AuditEntry, wantPurpose string) {
+		t.Helper()
+		if len(es) != len(want) {
+			t.Fatalf("%s: %d entries, want %d", where, len(es), len(want))
+		}
+		for _, e := range es {
+			if c, ok := want[e.Scope]; !ok || e.Client != c || e.Via != "mcp" || e.Task == "" || e.Outcome != "blocked" ||
+				e.BlockedBy != "invalid_request" || e.Purpose != wantPurpose {
+				t.Errorf("%s: got %+v, want client %q via mcp, a task, blocked by invalid_request, purpose %q", where, e, c, wantPurpose)
+			}
+		}
+	}
+
+	// On disk the operator keeps the purpose; the client in the arguments is nowhere.
+	raw, err := os.ReadFile(filepath.Join(home, "audit.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "spoofed") {
+		t.Fatalf("a client in the tool arguments reached the audit log:\n%s", raw)
+	}
+	var onDisk []core.AuditEntry
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var e core.AuditEntry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatal(err)
+		}
+		onDisk = append(onDisk, e)
+	}
+	check("audit.jsonl", onDisk, purpose)
+
+	// mintrun_audit shows the new fields but never the purpose.
+	var out bytes.Buffer
+	if err := bridge.Serve(context.Background(), rt, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mintrun_audit","arguments":{}}}`+"\n"), &out); err != nil {
+		t.Fatal(err)
+	}
+	var resp struct {
+		Result struct{ Content []struct{ Text string } }
+	}
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil || len(resp.Result.Content) != 1 {
+		t.Fatalf("unexpected mintrun_audit response %s (err=%v)", out.String(), err)
+	}
+	text := resp.Result.Content[0].Text
+	if strings.Contains(text, `"purpose"`) {
+		t.Fatalf("mintrun_audit showed a purpose:\n%s", text)
+	}
+	var shown []core.AuditEntry
+	if err := json.Unmarshal([]byte(text), &shown); err != nil {
+		t.Fatal(err)
+	}
+	check("mintrun_audit", shown, "")
+}
+
 // TestMCPBridgeRefusesVault pins that the vault is the operator's choice. An agent naming one,
 // even the vault the server already uses, is denied with the same reason by mintrun_policy_check
 // and mintrun_exec, no argument clears the flag the bridge sets, and the exec is audited with
@@ -1641,7 +1814,7 @@ func mcpRefusal(t *testing.T, args, reason string) {
 	}
 
 	var d core.PolicyDecision
-	if err := json.Unmarshal([]byte(resps[0].Result.Content[0].Text), &d); err != nil || resps[0].Result.IsError || d != (core.PolicyDecision{Reason: reason}) {
+	if err := json.Unmarshal([]byte(resps[0].Result.Content[0].Text), &d); err != nil || resps[0].Result.IsError || d != (core.PolicyDecision{Reason: reason, BlockedBy: "invalid_request"}) {
 		t.Fatalf("policy_check with %s: got %+v (err=%v), want a denial with %q", args, resps[0].Result, err, reason)
 	}
 	if r := resps[1].Result; !r.IsError || r.Content[0].Text != "mintrun execution error: "+reason {
