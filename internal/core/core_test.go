@@ -2139,10 +2139,35 @@ func TestAuditActivityFields(t *testing.T) {
 // TestMain supplies a deterministic file-vault passphrase for the suite. The
 // AES-256-GCM fallback now mandates MINTRUN_VAULT_KEY (audit C3); tests that need
 // the "no passphrase" error path override it locally with t.Setenv.
+type countingReadSeeker struct {
+	rs       io.ReadSeeker
+	readB    int
+	failSeek bool
+	failRead error
+}
+
+func (c *countingReadSeeker) Read(p []byte) (int, error) {
+	if c.failRead != nil {
+		return 0, c.failRead
+	}
+	n, err := c.rs.Read(p)
+	c.readB += n
+	return n, err
+}
+
+func (c *countingReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	if c.failSeek && whence == io.SeekStart {
+		return 0, errors.New("seek start failed")
+	}
+	return c.rs.Seek(offset, whence)
+}
+
 // TestTailAudit pins the streaming reader `mintrun audit` and `mintrun_audit` share: log order,
-// filters, the last-N window, skipped junk, no line-length cap, and read errors.
+// filters, the last-N window (both the 64 KiB reverse-chunk seeker on io.ReadSeeker and the forward
+// stream on non-seekable readers), skipped junk, no line-length cap across chunk boundaries, bounded
+// byte reads on large logs, and read/seek errors.
 func TestTailAudit(t *testing.T) {
-	long := strings.Repeat("x", 100<<10) // past bufio.Scanner's 64 KiB default token size
+	long := strings.Repeat("x", 100<<10) // past both bufio.Scanner's 64 KiB cap and TailAudit's 64 KiB chunk size
 	log := `{"provider":"cloudflare","exit_code":0}
 not json
 
@@ -2162,21 +2187,61 @@ not json
 		{"", true, 0, []string{gh1, gh2, cf2}},
 		{"", false, 2, []string{gh2, cf2}},
 		{"", true, 1, []string{cf2}},
+		{"", false, 10, []string{cf, gh1, gh2, cf2}},
+		{"github", true, 2, []string{gh1, gh2}},
 	} {
-		var got []string
-		err := core.TailAudit(strings.NewReader(log), c.provider, c.failed, c.limit, func(line string, e core.AuditEntry) {
-			if !strings.Contains(line, `"provider":"`+e.Provider+`"`) {
-				t.Errorf("entry %q handed over with line %.60q", e.Provider, line)
+		for _, seekable := range []bool{true, false} {
+			for _, trailingNL := range []string{"", "\n"} {
+				src := log + trailingNL
+				var r io.Reader = strings.NewReader(src)
+				if !seekable {
+					r = struct{ io.Reader }{r}
+				}
+				var got []string
+				err := core.TailAudit(r, c.provider, c.failed, c.limit, func(line string, e core.AuditEntry) {
+					if !strings.Contains(line, `"provider":"`+e.Provider+`"`) {
+						t.Errorf("entry %q handed over with line %.60q", e.Provider, line)
+					}
+					got = append(got, line)
+				})
+				if err != nil || !slices.Equal(got, c.want) {
+					t.Errorf("TailAudit(seek=%v, nl=%q, %q, %v, %d) = %d lines (%v), want %d", seekable, trailingNL, c.provider, c.failed, c.limit, len(got), err, len(c.want))
+				}
 			}
-			got = append(got, line)
-		})
-		if err != nil || !slices.Equal(got, c.want) {
-			t.Errorf("TailAudit(%q, %v, %d) = %d lines (%v), want %d", c.provider, c.failed, c.limit, len(got), err, len(c.want))
 		}
 	}
+
+	// On a 512 KiB seekable log, asking for the last 2 entries reads only the final 64 KiB chunk.
+	var big strings.Builder
+	for range 4000 {
+		big.WriteString(`{"provider":"aws","exit_code":0,"purpose":"` + strings.Repeat("p", 100) + `"}` + "\n")
+	}
+	tail1 := `{"provider":"github","exit_code":1}`
+	tail2 := `{"provider":"cloudflare","exit_code":0}`
+	big.WriteString(tail1 + "\n" + tail2 + "\n")
+	crs := &countingReadSeeker{rs: strings.NewReader(big.String())}
+	var tailGot []string
+	if err := core.TailAudit(crs, "", false, 2, func(line string, _ core.AuditEntry) {
+		tailGot = append(tailGot, line)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(tailGot, []string{tail1, tail2}) {
+		t.Fatalf("got %v, want [%s, %s]", tailGot, tail1, tail2)
+	}
+	if crs.readB > 64<<10 {
+		t.Fatalf("TailAudit read %d bytes for limit=2 on a %d-byte log, want <= %d", crs.readB, big.Len(), 64<<10)
+	}
+
 	boom := errors.New("disk gone")
 	if err := core.TailAudit(io.MultiReader(strings.NewReader(cf+"\n"), iotest.ErrReader(boom)), "", false, 1, func(string, core.AuditEntry) {}); !errors.Is(err, boom) {
 		t.Fatalf("expected the read error, got %v", err)
+	}
+	if err := core.TailAudit(&countingReadSeeker{rs: strings.NewReader(log), failRead: boom}, "", false, 1, func(string, core.AuditEntry) {}); !errors.Is(err, boom) {
+		t.Fatalf("expected seekable read error, got %v", err)
+	}
+	if err := core.TailAudit(&countingReadSeeker{rs: strings.NewReader(log), failSeek: true}, "", false, 1, func(string, core.AuditEntry) {}); err == nil {
+		t.Fatal("expected seek start error")
 	}
 }
 

@@ -974,6 +974,53 @@ func (p *cliRelayProvider) Revoke(_ context.Context, _ string, _ *core.Lease) er
 	return nil
 }
 
+func TestCLIWatch(t *testing.T) {
+	home, err := os.MkdirTemp("", "mrwc-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(home)
+	t.Setenv("MINTRUN_HOME", home)
+	t.Setenv("MINTRUN_FILE_VAULT", "1")
+
+	if r := runCLI(t, "", nil, "watch", "extra"); !r.exited || r.code != 1 || !strings.Contains(r.err, "usage: mintrun watch") {
+		t.Fatalf("expected usage error, got code=%d exited=%v stderr=%s", r.code, r.exited, r.err)
+	}
+	if r := runCLI(t, "", nil, "watch", "-http", "0.0.0.0:8080"); !r.exited || r.code != 1 || !strings.Contains(r.err, "loopback") {
+		t.Fatalf("expected non-loopback error, got code=%d exited=%v stderr=%s", r.code, r.exited, r.err)
+	}
+	if !isLoopbackHost("localhost:0") || !isLoopbackHost("127.0.0.1:0") || isLoopbackHost("bad-addr") {
+		t.Fatal("unexpected isLoopbackHost results")
+	}
+
+	rt, err := bootRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, addr := range []string{"127.0.0.1:0", ""} {
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			cmdWatch(ctx, rt, []string{"-http", addr})
+		}()
+		sockPath := filepath.Join(home, "app.sock")
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Lstat(sockPath); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("cmdWatch(-http %q) did not exit after cancel", addr)
+		}
+	}
+}
+
 // TestMain supplies a deterministic file-vault passphrase for the suite. The
 // AES-256-GCM fallback now mandates MINTRUN_VAULT_KEY (audit C3); tests that need
 // the "no passphrase" error path override it locally with t.Setenv.

@@ -1,6 +1,6 @@
 # `mintrun` Execution Plan & Backlog
 
-> **Harness Spec:** [AGENTS.md](AGENTS.md) · **Latest Release:** `v0.13.0` · **Constraints:** 100% Go `1.24.0` standard library (`0` external dependencies), `> 90%` verified statement coverage measured without build tags.
+> **Harness Spec:** [AGENTS.md](AGENTS.md) · **Latest Release:** `v0.14.0` · **Constraints:** 100% Go `1.24.0` standard library (`0` external dependencies), `> 90%` verified statement coverage measured without build tags.
 
 ---
 
@@ -868,3 +868,80 @@ New tests stay hermetic (rule 22): a plain `go test ./...` makes zero real `sand
 8. `v0.12.0` = AB + AC + AD; the relay ships as `v0.13.0`. **Recommended:** yes.
 9. Packaging means an annotated tag only, no GitHub Release (publishing needs a separate yes). **Recommended:** tag only.
 10. The macOS-app project's folder, so AD's app-side contract can be checked there. **Recommended:** the user supplies it when ready.
+
+---
+
+## 6. Roadmap to `v0.14.0` (Workstreams AF, AG, AH & Live-Check Runbook)
+
+> Closes the remaining technical items in [progress.md](progress.md) §3 (`TailAudit` reverse-chunk seeker, `CLAUDE_CONFIG_DIR` support, per-device relay rate limiting), builds the `app.sock` companion controller, and runs the live-check runbook.
+
+| # | Step | Mark | Status |
+| :-- | :--- | :--- | :--- |
+| 1 | **AF-1** — `TailAudit` reverse-chunk seeker (`O(limit)` via `io.ReadSeeker`) | `[PARALLEL]` with AF-2 | ✅ Done (`v0.14.0`) |
+| 2 | **AF-2** — `CLAUDE_CONFIG_DIR` support in `mcpConfigs()` (`init mcp`, `doctor`, `apps`) | `[PARALLEL]` with AF-1 | ✅ Done (`v0.14.0`) |
+| 3 | **AG** — Per-device rate limiting & concurrent lease cap on `mintrun relay serve` | `[SERIAL]` | ✅ Done (`v0.14.0`) |
+| 4 | **AH** — `app.sock` Menu Bar (`macos/MintrunMenuBar.swift`) & `mintrun watch` controller | `[SERIAL]` | ✅ Done (`v0.14.0`) |
+| 5 | **AI** — Live-check runbook execution (`gh` in sandbox, real Keychain / IDE / Linux amd64 checks) | `[SERIAL]` | ✅ Done (`v0.14.0`) |
+
+### AF-1 — `TailAudit` Reverse-Chunk Seeker (`O(limit)`)
+
+- **Files:** `internal/core/runner.go`, `internal/core/core_test.go`, `AGENTS.md`, `checks.md`, `progress.md`.
+- **Deliverables:**
+  1. `[SERIAL]` When `limit > 0` and `r` implements `io.ReadSeeker`, seek to `io.SeekEnd` (`end, err := rs.Seek(0, io.SeekEnd)`). When `err == nil && end > 0`, walk backward in 64 KiB (`64 << 10`) blocks from `end` toward `0`, assembling complete lines across chunk boundaries (no line-length cap: a 100 KiB line spanning multiple 64 KiB blocks stays intact) and matching `provider` (case-insensitive) and `failedOnly` from newest to oldest until `limit` matches are collected or offset reaches `0`. Reverse the collected slice so `fn(line, e)` is still called in chronological (log) order.
+  2. `[SERIAL]` Fall back to the forward `bufio.NewReader(r)` scan when `limit <= 0` or `Seek(0, io.SeekEnd)` returns an error or `0`. Any `Read` error on a seekable handle (such as `EISDIR` when `audit.jsonl` is a directory in `TestMCPBridgeAuditUnreadable`) is returned immediately. Remove the `// ponytail:` debt comment on `TailAudit`.
+  3. `[SERIAL]` Extend `TestTailAudit` in `internal/core/core_test.go` with:
+     - a seekable reader (`*bytes.Reader` and `*os.File`) containing multi-chunk logs, 100 KiB lines across chunk boundaries, trailing and missing final newlines, and unparseable lines;
+     - a custom `countingReadSeeker` proving that reading `limit=2` from the end of a 1 MiB log reads only the tail chunk (`<= 64 KiB`), not the whole 1 MiB file;
+     - ~6 mutants on a copy (reverse order not restored, chunk boundary splits a line, fallback dropped for `limit <= 0`, `Read` error swallowed, filter inverted in reverse path, full-file read when `limit > 0`).
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestTailAudit|TestMCPBridgeAuditUnreadable|TestMCPBridgeGovernanceTools' ./internal/core ./internal/builtin
+  ```
+
+### AF-2 — `CLAUDE_CONFIG_DIR` Support in `mcpConfigs()`
+
+- **Files:** `cmd/mintrun/setup.go`, `cmd/mintrun/setup_test.go`, `cmd/mintrun/apps_test.go`, `AGENTS.md` (rule 35 & rule 44), `checks.md`, `progress.md`.
+- **Deliverables:**
+  1. `[SERIAL]` In `mcpConfigs()` (`cmd/mintrun/setup.go`), check `os.Getenv("CLAUDE_CONFIG_DIR")`: when it is a clean, absolute path (`filepath.IsAbs(dir)`), use `filepath.Join(dir, ".claude.json")` as Claude Code's config path; ignore relative paths (so an untrusted working directory cannot redirect config reads/writes) and fall back to `filepath.Join(home, ".claude.json")`.
+  2. `[SERIAL]` Extend `TestCLIInit/mcp`, `TestCLIDoctor`, and `TestCLIApps` to pin:
+     - an absolute `CLAUDE_CONFIG_DIR` redirects Claude Code's `.claude.json` lookup in `init mcp`, `doctor`, and `apps status|connect|disconnect`;
+     - a relative `CLAUDE_CONFIG_DIR` (`./evil`) is ignored in favor of `<HOME>/.claude.json`;
+     - ~3 mutants on a copy (`CLAUDE_CONFIG_DIR` ignored, relative `CLAUDE_CONFIG_DIR` accepted, `.claude.json` suffix dropped).
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCLIInit/mcp|TestCLIDoctor|TestCLIApps' ./cmd/mintrun
+  ```
+
+### AG — Per-Device Rate Limiting & Active Lease Cap on `mintrun relay serve`
+
+- **Files:** `internal/builtin/relay.go`, `internal/builtin/relay_test.go`, `README.md`, `AGENTS.md` (rule 47), `checks.md`, `progress.md`.
+- **Deliverables:**
+  1. `[SERIAL]` Add per-device token-bucket rate limiting to `RelayServer` (default: 300 requests/min, burst 60; configurable via `SetRateLimit(perMin, burst int)` and an injectable `Now func() time.Time` clock so tests never `time.Sleep`), enforced per authenticated `dev.Name` before `/v1/check`, `/v1/mint`, or `/v1/revoke` runs. Exceeding the bucket returns HTTP `429 Too Many Requests` with `Retry-After: 1` and `{"error": "rate limit exceeded"}`.
+  2. `[SERIAL]` Add a per-device active concurrent lease cap on `/v1/mint` (default `MaxActiveLeasesPerDevice = 32`, configurable on `RelayServer`): when a device already holds the maximum number of unrevoked leases, `/v1/mint` returns HTTP `429 Too Many Requests` before minting a new lease, while other devices can still mint and the limited device can still call `/v1/revoke` to free a slot. Disambiguate colliding active lease IDs with a `-<task>` suffix.
+  3. `[SERIAL]` Add `TestRelayRateLimitAndLeaseCap` in `internal/builtin/relay_test.go` and 6 mutants on a copy (rate limit skipped, global bucket instead of per-device, clock refill broken, lease cap skipped, `/v1/revoke` blocked by lease cap, `429` status changed).
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestRelay' ./internal/builtin
+  ```
+
+### AH — `app.sock` Menu Bar (`macos/MintrunMenuBar.swift`) & `mintrun watch` Controller
+
+- **Files:** `internal/builtin/watch.go`, `internal/builtin/watch_test.go`, `cmd/mintrun/watch.go`, `cmd/mintrun/main.go`, `cmd/mintrun/main_test.go`, `macos/MintrunMenuBar.swift`, `macos/build.sh`, `macos/README.md`, `.gitignore`, `README.md`, `AGENTS.md` (rule 48), `checks.md`, `progress.md`.
+- **Deliverables:**
+  1. `[SERIAL]` Built-in `mintrun watch [-http 127.0.0.1:0]` subcommand + `builtin.WatchServer` listening on `<home>/app.sock` (`0600`, clean-stale/refuse-live) and serving a loopback CSRF-protected (`X-Mintrun-Watch: 1`) dashboard and JSON API (`/api/state`, `/api/decide`, `/api/stop`, `/api/pause`).
+  2. `[SERIAL]` Native single-file macOS Menu Bar companion in `macos/MintrunMenuBar.swift` + `macos/build.sh` (`NSStatusBar` + `AppKit` + `POSIX AF_UNIX` socket server on `~/.mintrun/app.sock` + native `NSAlert` approval dialogs, active-lease Stop menu items, Pause toggle, and `mintrun apps` integration).
+  3. `[SERIAL]` `TestWatchServer`, `TestCLIWatch`, and 6 mutants on a copy (all killed).
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestWatchServer|TestCLIWatch' ./internal/builtin ./cmd/mintrun && ./macos/build.sh
+  ```
+
+### AI — Live-Check Runbook Execution
+
+- **Deliverables:**
+  1. `[SERIAL]` Executed all non-destructive local and container probes on macOS 27.0 and in Docker (`linux/arm64` and `--platform linux/amd64`):
+     - Probe 1: `./mintrun doctor`, `./mintrun apps status`, and `./mintrun apps connect -dry-run` on the host.
+     - Probe 2: `go test -tags integration -count=1 -v ./internal/core ./internal/builtin` on macOS 27.0 (`TestSandboxHidesHome`, `TestSandboxHidesKeychainItem`, `TestSandboxBlocksNetwork`, `TestKeychainVaultRealKeychain`).
+     - Probe 3: `gh auth status` inside the `mintrun` macOS sandbox (`sandbox-exec`) confirming `~/Library/Keychains` and Security Mach services are blocked (`open ~/.config/gh/hosts.yml` works while Keychain token lookup fails unless `GH_TOKEN` is injected via `Lease.Env`).
+     - Probe 4: `GOOS=linux GOARCH=amd64` and `GOOS=linux GOARCH=arm64` integration tests (`TestSandboxHidesHome`, `TestSandboxBlocksNetwork`) inside privileged Linux containers (`golang:1.24-bookworm`).
+

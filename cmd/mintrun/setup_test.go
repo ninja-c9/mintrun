@@ -60,7 +60,7 @@ func setupEnv(t *testing.T) (home, self string) {
 	t.Helper()
 	home = t.TempDir()
 	bin := filepath.Join(home, "bin")
-	for k, v := range map[string]string{"HOME": home, "XDG_CONFIG_HOME": "", "MINTRUN_HOME": filepath.Join(home, ".mintrun"),
+	for k, v := range map[string]string{"HOME": home, "XDG_CONFIG_HOME": "", "CLAUDE_CONFIG_DIR": "", "MINTRUN_HOME": filepath.Join(home, ".mintrun"),
 		"MINTRUN_FILE_VAULT": "1", "MINTRUN_VAULT": "keychain", "MINTRUN_VAULT_KEY": "vault-" + leak, // never printed either
 		"PATH": bin, "MOCK_GIT_URL": "", "MOCK_CLAUDE_EXIT": "0"} {
 		t.Setenv(k, v)
@@ -403,6 +403,11 @@ func TestCLIDoctor(t *testing.T) {
 		{"1Password vault", func(t *testing.T, home, self string) {
 			t.Setenv("MINTRUN_VAULT", "1password")
 		}, 0, []string{"-     vault 1password: not checked, since reading it can prompt"}},
+		{"CLAUDE_CONFIG_DIR absolute and relative", func(t *testing.T, home, self string) {
+			cdir := filepath.Join(home, "custom-claude")
+			t.Setenv("CLAUDE_CONFIG_DIR", cdir)
+			writeJSON(t, filepath.Join(cdir, ".claude.json"), obj{"mcpServers": obj{"mintrun": obj{"command": self, "args": []any{"mcp"}}}})
+		}, 0, []string{"ok    Claude Code: runs this binary\n"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			home, self := setupEnv(t)
@@ -977,6 +982,18 @@ func TestCLIInit(t *testing.T) {
 			t.Fatal(err)
 		}
 		runs(t, "", []string{"mcp"}, "Antigravity: open Manage MCP Servers → View raw config, and add the entry below.")
+
+		// CLAUDE_CONFIG_DIR: an absolute path redirects Claude Code's .claude.json; a relative one is ignored.
+		cdir := filepath.Join(home, "custom-claude")
+		customClaude := filepath.Join(cdir, ".claude.json")
+		writeJSON(t, customClaude, obj{"mcpServers": obj{"mintrun": entry}})
+		t.Setenv("CLAUDE_CONFIG_DIR", cdir)
+		runs(t, "", []string{"mcp"}, "Claude Code: "+customClaude+" already has a mintrun entry.")
+		t.Setenv("CLAUDE_CONFIG_DIR", "relative-claude")
+		if got := idePaths()[0]; got != ide[0] {
+			t.Errorf("relative CLAUDE_CONFIG_DIR used: got %s, want %s", got, ide[0])
+		}
+		t.Setenv("CLAUDE_CONFIG_DIR", "")
 
 		gob := filepath.Join(home, "go-build1", "b001", "exe", "mintrun")
 		writeFile(t, gob, "")

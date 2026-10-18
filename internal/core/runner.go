@@ -1306,32 +1306,87 @@ func (rt *Runtime) writeAudit(entry AuditEntry) {
 	_, _ = f.Write(append(line, '\n'))
 }
 
-// TailAudit streams an audit log line by line and calls fn, in log order, for each entry matching
-// provider (case-insensitive) and failedOnly; unparseable lines are skipped. With limit > 0 only
-// the last limit matches are kept and handed over at the end, so memory stays bounded however
-// long the log grows.
-// ponytail: reads the whole log each call (O(log) time); seek back from the end if it reaches GBs.
+// TailAudit streams an audit log and calls fn, in log order, for each entry matching provider
+// (case-insensitive) and failedOnly; unparseable lines are skipped. With limit > 0 only the last
+// limit matches are kept and handed over at the end, and when r is seekable it walks backward from
+// the end in 64 KiB chunks and stops as soon as limit matches are found.
 func TailAudit(r io.Reader, provider string, failedOnly bool, limit int, fn func(line string, e AuditEntry)) error {
 	type match struct {
 		line string
 		e    AuditEntry
 	}
-	var last []match
-	br := bufio.NewReader(r) // no line-length cap, unlike bufio.Scanner: an entry holds a full argv
-	for {
-		line, err := br.ReadString('\n')
+	parse := func(line string) (match, bool) {
+		line = strings.TrimRight(line, "\r\n")
 		var e AuditEntry
 		if json.Unmarshal([]byte(line), &e) == nil &&
 			(provider == "" || strings.EqualFold(e.Provider, provider)) &&
 			(!failedOnly || e.ExitCode != 0 || e.Error != "") {
-			line = strings.TrimRight(line, "\r\n")
+			return match{line, e}, true
+		}
+		return match{}, false
+	}
+
+	if limit > 0 {
+		if rs, ok := r.(io.ReadSeeker); ok {
+			if end, err := rs.Seek(0, io.SeekEnd); err == nil && end > 0 {
+				const chunkSize = 64 << 10
+				var last []match
+				var rem []byte
+				first := true
+				for pos := end; pos > 0 && len(last) < limit; {
+					step := min(int64(chunkSize), pos)
+					pos -= step
+					if _, err := rs.Seek(pos, io.SeekStart); err != nil {
+						return err
+					}
+					buf := make([]byte, step)
+					if _, err := io.ReadFull(rs, buf); err != nil {
+						return err
+					}
+					buf = append(buf, rem...)
+					if first {
+						first = false
+						buf = bytes.TrimSuffix(buf, []byte("\n"))
+					}
+					for len(last) < limit {
+						i := bytes.LastIndexByte(buf, '\n')
+						if i < 0 {
+							if pos == 0 {
+								if m, ok := parse(string(buf)); ok {
+									last = append(last, m)
+								}
+								rem = nil
+							} else {
+								rem = buf
+							}
+							break
+						}
+						if m, ok := parse(string(buf[i+1:])); ok {
+							last = append(last, m)
+						}
+						buf = buf[:i]
+					}
+				}
+				for i := len(last) - 1; i >= 0; i-- {
+					fn(last[i].line, last[i].e)
+				}
+				return nil
+			}
+		}
+	}
+
+	var last []match
+	br := bufio.NewReader(r) // no line-length cap, unlike bufio.Scanner: an entry holds a full argv
+	for {
+		line, err := br.ReadString('\n')
+		if m, ok := parse(line); ok {
 			if limit <= 0 {
-				fn(line, e)
+				fn(m.line, m.e)
 			} else {
 				if len(last) == limit {
 					last = last[1:]
 				}
-				last = append(last, match{line, e})
+				last = append(last, m)
 			}
 		}
 		if err == io.EOF {

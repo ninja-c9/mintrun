@@ -36,7 +36,9 @@ type mcpEntry struct {
 type mcpConfig struct{ name, path string }
 
 // mcpConfigs lists the MCP config files of the IDEs mintrun knows. Claude Code's is only ever
-// read: `claude mcp add` changes it.
+// read: `claude mcp add` changes it. When CLAUDE_CONFIG_DIR is set to an absolute path, Claude
+// Code keeps its .claude.json there instead of HOME; a relative path is ignored so a working
+// directory cannot redirect config reads.
 func mcpConfigs() []mcpConfig {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -46,8 +48,12 @@ func mcpConfigs() []mcpConfig {
 	if err != nil {
 		conf = filepath.Join(home, ".config")
 	}
+	claudeDir := home
+	if dir := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); filepath.IsAbs(dir) {
+		claudeDir = dir
+	}
 	return []mcpConfig{
-		{"Claude Code", filepath.Join(home, ".claude.json")},
+		{"Claude Code", filepath.Join(claudeDir, ".claude.json")},
 		{"Cursor", filepath.Join(home, ".cursor", "mcp.json")},
 		{"Claude Desktop", filepath.Join(conf, "Claude", "claude_desktop_config.json")},
 		{"Antigravity", filepath.Join(home, ".gemini", "antigravity", "mcp_config.json")},

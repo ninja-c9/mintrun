@@ -556,3 +556,124 @@ func TestRelayEndToEnd(t *testing.T) {
 		t.Fatalf("expected Close() to record unreported/revoked entry, got: %+v", lastClose)
 	}
 }
+
+func TestRelayRateLimitAndLeaseCap(t *testing.T) {
+	t.Setenv("MINTRUN_VAULT_KEY", "relay-rate-vault-passphrase")
+	serverHome := t.TempDir()
+	reg := core.NewRegistry()
+	fv := NewKeychainVault(serverHome)
+	fv.ForceFile, fv.SecretTool = true, ""
+	if err := reg.Register(fv); err != nil {
+		t.Fatal(err)
+	}
+	prov := &relayTestProvider{ephemeral: true}
+	if err := reg.Register(prov); err != nil {
+		t.Fatal(err)
+	}
+	if err := fv.SetSecret(context.Background(), "cf-relay", "MASTER-SECRET-CANARY-999"); err != nil {
+		t.Fatal(err)
+	}
+	policyJSON := `{"cf-relay":{"allowed_scopes":["example.com"],"allowed_permissions":["dns:write"],"max_ttl_seconds":300}}`
+	if err := os.WriteFile(filepath.Join(serverHome, "policy.json"), []byte(policyJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	aliceToken, _, err := AddRelayDevice(serverHome, "laptop-alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobToken, _, err := AddRelayDevice(serverHome, "laptop-bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	serverRT := core.NewRuntime(serverHome, "keychain", reg)
+	relaySrv := NewRelayServer(serverRT)
+	defer relaySrv.Close()
+
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	relaySrv.Now = func() time.Time { return now }
+	relaySrv.RatePerMin = 60
+	relaySrv.Burst = 2
+
+	ts := httptest.NewUnstartedServer(relaySrv)
+	ts.Config.ErrorLog = log.New(io.Discard, "", 0)
+	ts.TLS = &tls.Config{MinVersion: tls.VersionTLS13}
+	ts.StartTLS()
+	defer ts.Close()
+
+	pin, err := RelaySPKIPin(ts.Certificate().Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinnedURL := ts.URL + "#sha256=" + pin
+	aliceClient, err := NewRelayClient(pinnedURL, func(context.Context) (string, error) { return aliceToken, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobClient, err := NewRelayClient(pinnedURL, func(context.Context) (string, error) { return bobToken, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	req := core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "cf-relay", Scope: "example.com", Permissions: []string{"dns:write"}},
+		Command:     []string{"true"},
+	}
+
+	// 1. Burst of 2 succeeds for laptop-alice; 3rd request at the same instant gets 429, while laptop-bob succeeds.
+	for i := range 2 {
+		if d := aliceClient.CheckPolicy(ctx, req); !d.Allowed {
+			t.Fatalf("alice request %d denied: %+v", i, d)
+		}
+	}
+	if d := aliceClient.CheckPolicy(ctx, req); d.Allowed || d.BlockedBy != "relay" || !strings.Contains(d.Reason, "rate limit exceeded") {
+		t.Fatalf("expected 429 rate limit exceeded on 3rd request, got: %+v", d)
+	}
+	if d := bobClient.CheckPolicy(ctx, req); !d.Allowed {
+		t.Fatalf("bob should not be rate-limited by alice: %+v", d)
+	}
+
+	// 2. Advancing clock by 1s refills 1 token (60/min = 1/sec), allowing 1 more request for alice.
+	now = now.Add(time.Second)
+	if d := aliceClient.CheckPolicy(ctx, req); !d.Allowed {
+		t.Fatalf("alice should succeed after 1s refill: %+v", d)
+	}
+	if d := aliceClient.CheckPolicy(ctx, req); d.Allowed || !strings.Contains(d.Reason, "rate limit exceeded") {
+		t.Fatalf("alice should be limited again when bucket empties: %+v", d)
+	}
+
+	// 3. Per-device active concurrent lease cap on /v1/mint.
+	relaySrv.RatePerMin = 0 // disable request rate limit to isolate lease cap
+	relaySrv.MaxLeases = 2
+
+	l1, _, _, err := aliceClient.Mint(ctx, req)
+	if err != nil {
+		t.Fatalf("alice mint 1: %v", err)
+	}
+	l2, _, _, err := aliceClient.Mint(ctx, req)
+	if err != nil {
+		t.Fatalf("alice mint 2: %v", err)
+	}
+	if _, _, _, err := aliceClient.Mint(ctx, req); err == nil || !strings.Contains(err.Error(), "too many active leases for device") {
+		t.Fatalf("expected active lease cap error on 3rd mint, got: %v", err)
+	}
+	// Bob can still mint while Alice is at her cap.
+	lb, _, _, err := bobClient.Mint(ctx, req)
+	if err != nil {
+		t.Fatalf("bob mint while alice capped: %v", err)
+	}
+	_, _ = bobClient.Revoke(ctx, lb.ID, "done", 0, false)
+
+	// Alice can still revoke l1 while at her cap, freeing a slot to mint again.
+	if ok, err := aliceClient.Revoke(ctx, l1.ID, "done", 0, false); err != nil || !ok {
+		t.Fatalf("expected alice Revoke(l1) to succeed while at lease cap: ok=%v err=%v", ok, err)
+	}
+	l3, _, _, err := aliceClient.Mint(ctx, req)
+	if err != nil {
+		t.Fatalf("alice mint 3 after revoking l1: %v", err)
+	}
+	_, _ = aliceClient.Revoke(ctx, l2.ID, "done", 0, false)
+	_, _ = aliceClient.Revoke(ctx, l3.ID, "done", 0, false)
+}

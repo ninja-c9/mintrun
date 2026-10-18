@@ -1,4 +1,5 @@
 /mintrun
+/macos/MintrunMenuBar
 *.exe
 *.test
 *.out

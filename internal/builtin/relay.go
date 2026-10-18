@@ -229,19 +229,35 @@ func RelayTLSConfig(spkiPin [32]byte) *tls.Config {
 	}
 }
 
+const (
+	DefaultRelayRatePerMinute       = 300
+	DefaultRelayBurst               = 60
+	DefaultMaxActiveLeasesPerDevice = 32
+)
+
 type activeRelayLease struct {
 	device string
 	timer  *time.Timer
 	finish func(outcome string, exitCode int, truncated bool) core.AuditEntry
 }
 
+type relayBucket struct {
+	tokens float64
+	last   time.Time
+}
+
 // RelayServer serves /v1/check, /v1/mint, and /v1/revoke over HTTPS. Master secrets and
 // Lease.RevokeSecret stay on the server; laptops authenticate with per-device bearer tokens and
 // receive only ephemeral leases.
 type RelayServer struct {
-	rt     *core.Runtime
-	mu     sync.Mutex
-	leases map[string]*activeRelayLease
+	rt         *core.Runtime
+	mu         sync.Mutex
+	leases     map[string]*activeRelayLease
+	buckets    map[string]*relayBucket
+	RatePerMin int
+	Burst      int
+	MaxLeases  int
+	Now        func() time.Time
 }
 
 // NewRelayServer configures rt as a headless relay server (Telegram and Slack approval only, never
@@ -251,9 +267,54 @@ func NewRelayServer(rt *core.Runtime) *RelayServer {
 	rt.RelayServer = true
 	rt.ApprovalFunc = core.FirstApproval(TelegramApproval(rt), SlackApproval(rt))
 	return &RelayServer{
-		rt:     rt,
-		leases: make(map[string]*activeRelayLease),
+		rt:         rt,
+		leases:     make(map[string]*activeRelayLease),
+		buckets:    make(map[string]*relayBucket),
+		RatePerMin: DefaultRelayRatePerMinute,
+		Burst:      DefaultRelayBurst,
+		MaxLeases:  DefaultMaxActiveLeasesPerDevice,
+		Now:        time.Now,
 	}
+}
+
+func (s *RelayServer) allowDevice(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.RatePerMin <= 0 || s.Burst <= 0 {
+		return true
+	}
+	now := s.Now()
+	b := s.buckets[name]
+	if b == nil {
+		b = &relayBucket{tokens: float64(s.Burst), last: now}
+		s.buckets[name] = b
+	} else if dt := now.Sub(b.last).Seconds(); dt > 0 {
+		b.tokens = min(float64(s.Burst), b.tokens+dt*(float64(s.RatePerMin)/60.0))
+		b.last = now
+	}
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens -= 1
+	return true
+}
+
+func (s *RelayServer) atLeaseCap(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.MaxLeases <= 0 {
+		return false
+	}
+	n := 0
+	for _, al := range s.leases {
+		if al.device == name {
+			n++
+			if n >= s.MaxLeases {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Close stops all expiry timers and revokes and audits any still-open leases as "unreported".
@@ -358,6 +419,11 @@ func (s *RelayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
 	}
+	if !s.allowDevice(dev.Name) {
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limit exceeded"})
+		return
+	}
 
 	switch r.URL.Path {
 	case "/v1/check":
@@ -370,6 +436,11 @@ func (s *RelayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.rt.CheckPolicy(req))
 
 	case "/v1/mint":
+		if s.atLeaseCap(dev.Name) {
+			w.Header().Set("Retry-After", "1")
+			writeJSON(w, http.StatusTooManyRequests, relayMintResponse{Error: "too many active leases for device"})
+			return
+		}
 		var req core.ExecRequest
 		if err := decodeStrictJSON(w, r, &req); err != nil {
 			writeJSON(w, http.StatusBadRequest, relayMintResponse{Error: "invalid request body"})
@@ -394,16 +465,20 @@ func (s *RelayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ttl = 10 * time.Minute
 		}
 		s.mu.Lock()
+		clientLease := *lease
+		if s.leases[clientLease.ID] != nil {
+			clientLease.ID = lease.ID + "-" + entry.Task
+		}
 		al := &activeRelayLease{
 			device: dev.Name,
 			finish: finish,
 		}
-		al.timer = time.AfterFunc(ttl, func() { s.expireLease(lease.ID) })
-		s.leases[lease.ID] = al
+		al.timer = time.AfterFunc(ttl, func() { s.expireLease(clientLease.ID) })
+		s.leases[clientLease.ID] = al
 		s.mu.Unlock()
 
 		writeJSON(w, http.StatusOK, relayMintResponse{
-			Lease:     lease,
+			Lease:     &clientLease,
 			Decision:  d,
 			DecidedAt: entry.DecidedAt,
 		})
@@ -500,6 +575,16 @@ func (c *RelayClient) postJSON(ctx context.Context, path string, in, out any) (i
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
 		return resp.StatusCode, errors.New("relay rejected device token (401 unauthorized)")
+	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		var errBody struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(raw, &errBody)
+		if errBody.Error != "" {
+			return resp.StatusCode, fmt.Errorf("relay rate limited (429: %s)", core.Scrub(errBody.Error, []string{token}))
+		}
+		return resp.StatusCode, errors.New("relay rate limited (429)")
 	}
 	return resp.StatusCode, nil
 }

@@ -401,6 +401,13 @@ func TestCLIApps(t *testing.T) {
 		if r.code != 0 || len(rows) != 1 || !strings.Contains(r.err, "CLAUDE-SAYS") {
 			t.Fatalf("exit %d, rows %+v, stderr %q", r.code, rows, r.err)
 		}
+
+		// CLAUDE_CONFIG_DIR redirects Claude Code's config in apps status/connect/disconnect.
+		cdir := filepath.Join(home, "alt-claude")
+		altCC := filepath.Join(cdir, ".claude.json")
+		t.Setenv("CLAUDE_CONFIG_DIR", cdir)
+		writeFile(t, altCC, `{"mcpServers": {"mintrun": {"command": `+jsonString(self)+`, "args": ["mcp"]}}}`)
+		wantApps(t, 0, []appRow{{App: "claude-code", Found: true, Config: altCC, Installed: true, Matches: true}}, "status", "-app", "claude-code", "-command", self)
 	})
 
 	t.Run("default command", func(t *testing.T) {
