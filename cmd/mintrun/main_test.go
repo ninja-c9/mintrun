@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,7 +15,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -449,8 +452,10 @@ type appLine struct {
 }
 
 // fakeApp listens on <home>/app.sock as the macOS app does and passes on the first line of each
-// connection. It answers an approve line with decision, or not at all when decision is empty, and
-// drops a connection after 10 s, so a deadline that is not wired fails instead of hanging.
+// connection. It answers an approve line with decision (or not at all when decision is empty),
+// answers a started line with {"type":"stop"} when decision is "stop" (once <home>/pid holds a
+// line, when the test runs a child that writes one), and drops a connection after 10 s, so a
+// deadline that is not wired fails instead of hanging.
 func fakeApp(t *testing.T, home, decision string) <-chan appLine {
 	t.Helper()
 	l, err := net.Listen("unix", filepath.Join(home, "app.sock"))
@@ -477,6 +482,16 @@ func fakeApp(t *testing.T, home, decision string) <-chan appLine {
 				lines <- line
 				if line.Type == "approve" && decision != "" {
 					fmt.Fprintf(conn, "{\"task\":%q,\"decision\":%q}\n", line.Task, decision)
+				}
+				if line.Type == "started" && decision == "stop" {
+					pidFile := filepath.Join(home, "pid")
+					for range 300 {
+						if b, err := os.ReadFile(pidFile); err == nil && bytes.Contains(b, []byte("\n")) {
+							break
+						}
+						time.Sleep(10 * time.Millisecond)
+					}
+					fmt.Fprintln(conn, `{"type":"stop"}`)
 				}
 				_, _ = io.Copy(io.Discard, r) // until mintrun closes the connection
 			}()
@@ -687,6 +702,65 @@ func TestBootRuntimeSettings(t *testing.T) {
 			}
 		})
 	})
+}
+
+// TestCLIExecAppStop: a {"type":"stop"} reply from the app on the started connection kills the
+// running CLI child's process group and audits the run as outcome: stopped with via: cli.
+func TestCLIExecAppStop(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process groups are Unix-only")
+	}
+	home, err := os.MkdirTemp("", "mr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(home) })
+	t.Setenv("MINTRUN_HOME", home)
+	t.Setenv("MINTRUN_FILE_VAULT", "1")
+	t.Setenv("MINTRUN_VAULT", "keychain")
+	writeFile(t, filepath.Join(home, "policy.json"), `{"cloudflare":{"allow_static":true}}`)
+	setSecret(t, "cloudflare", "cf_stop_secret")
+	lines := fakeApp(t, home, "stop")
+	pidFile := filepath.Join(home, "pid")
+
+	start := time.Now()
+	r := runCLI(t, "", nil, "exec", "-provider", "cloudflare", "-perms", "static", "--", "sh", "-c", `echo $$ > "$0"; exec sleep 60`, pidFile)
+	if elapsed := time.Since(start); elapsed >= 5*time.Second {
+		t.Fatalf("exec took %s, want < 5s", elapsed)
+	}
+	if !r.exited || r.code != -1 {
+		t.Fatalf("exec: code %d, exited %v (want -1, true)\n%s%s", r.code, r.exited, r.out, r.err)
+	}
+	started := nextLine(t, lines)
+	if started.Type != "started" || started.Entry.Task == "" || started.Entry.Via != "cli" {
+		t.Errorf("started line = %+v", started)
+	}
+	rawAudit, err := os.ReadFile(filepath.Join(home, "audit.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditLines := strings.Split(strings.TrimSpace(string(rawAudit)), "\n")
+	if len(auditLines) != 1 {
+		t.Fatalf("audit lines = %d, want 1:\n%s", len(auditLines), rawAudit)
+	}
+	if e := lastAudit(t, home); e.Outcome != "stopped" || e.Via != "cli" || e.ExitCode != -1 || e.Task != started.Entry.Task {
+		t.Errorf("audit entry = %+v", e)
+	}
+	rawPID, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("read pid file: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(rawPID)))
+	if err != nil || pid <= 0 {
+		t.Fatalf("pid = %q (%v)", rawPID, err)
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := proc.Signal(os.Signal(syscall.Signal(0))); !errors.Is(err, os.ErrProcessDone) {
+		t.Errorf("child pid %d still alive: Signal(0) = %v", pid, err)
+	}
 }
 
 // TestCLIExecPaused: the pause file the app writes stops `mintrun exec`, and both the denial and

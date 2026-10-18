@@ -652,7 +652,8 @@ func (w *wizard) testApproval(channel string, ask func(context.Context, core.Exe
 }
 
 // policy suggests a fail-closed rule for GitHub: one repository (one owner's, only if asked), a
-// clean environment, and never allow_static. It never changes an existing policy.json.
+// clean environment, the child sandbox when this host can run it, and never allow_static. It never
+// changes an existing policy.json.
 func (w *wizard) policy() {
 	def := ""
 	if out, err := exec.Command("git", "remote", "get-url", "origin").Output(); err == nil {
@@ -672,6 +673,12 @@ func (w *wizard) policy() {
 		fatal("expected owner/repo or owner/*")
 	}
 	rule := core.PolicyRule{AllowedScopes: []string{scope}, CleanEnv: true}
+	if err := w.rt.SandboxReady(); err == nil {
+		rule.Sandbox = true
+		fmt.Println("Note: sandbox hides mintrun's home, the macOS Keychain, and Linux libsecret/D-Bus from the child, so tools that read their own stored logins there fail inside, and the network stays open.")
+	} else {
+		fmt.Printf("Sandbox: not suggested: %v\n", err)
+	}
 	p := filepath.Join(w.rt.HomeDir, "policy.json")
 	if _, err := os.Stat(p); !errors.Is(err, fs.ErrNotExist) {
 		entry, _ := json.MarshalIndent(rule, "", "  ")

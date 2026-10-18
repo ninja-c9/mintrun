@@ -777,10 +777,24 @@ func TestCLIInit(t *testing.T) {
 		home, _ := setupEnv(t)
 		p := filepath.Join(home, ".mintrun", "policy.json")
 		read := func() string { b, _ := os.ReadFile(p); return string(b) }
+		sandboxStub := filepath.Join(home, "bin", "sandbox-exec")
+		writeFile(t, sandboxStub, stubLog+"exit 0\n")
+		if err := os.MkdirAll(filepath.Join(home, "Library", "Keychains"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		origSandbox, origLinux := core.SandboxExecPath, core.LinuxSandboxPath
+		t.Cleanup(func() { core.SandboxExecPath, core.LinuxSandboxPath = origSandbox, origLinux })
+		core.SandboxExecPath, core.LinuxSandboxPath = sandboxStub, ""
+
 		// The remote URL carries a token, so it is never printed.
 		t.Setenv("MOCK_GIT_URL", "https://x-access-token:"+leak+"@github.com/acme/widgets.git")
-		want := "{\n  \"github\": {\n    \"allowed_scopes\": [\n      \"acme/widgets\"\n    ],\n    \"clean_env\": true\n  }\n}\n"
-		runs(t, "\ny\n", []string{"policy"}, "(owner/repo, or owner/* for all of owner's) [acme/widgets]: ", "Wrote "+p+".")
+		note := "Note: sandbox hides mintrun's home, the macOS Keychain, and Linux libsecret/D-Bus from the child, so tools that read their own stored logins there fail inside, and the network stays open.\n"
+		wantRule := "{\n  \"allowed_scopes\": [\n    \"acme/widgets\"\n  ],\n  \"clean_env\": true,\n  \"sandbox\": true\n}"
+		want := "{\n  \"github\": {\n    \"allowed_scopes\": [\n      \"acme/widgets\"\n    ],\n    \"clean_env\": true,\n    \"sandbox\": true\n  }\n}\n"
+		r := runs(t, "\ny\n", []string{"policy"}, "(owner/repo, or owner/* for all of owner's) [acme/widgets]: ", note, "Wrote "+p+".")
+		if strings.Contains(r.out, "Sandbox: not suggested:") {
+			t.Errorf("unexpected not-suggested line:\n%s", r.out)
+		}
 		if got := read(); got != want {
 			t.Errorf("policy.json:\n%s\nwant:\n%s", got, want)
 		}
@@ -791,13 +805,13 @@ func TestCLIInit(t *testing.T) {
 			t.Errorf("calls %q", c)
 		}
 
-		// Never changes an existing policy.json, only shows the rule.
-		runs(t, "\n", []string{"policy"}, "already has a github rule; left unchanged. The suggested rule:\n\"github\": {")
+		// Never changes an existing policy.json, only shows the rule (with sandbox when ready).
+		runs(t, "\n", []string{"policy"}, note, "already has a github rule; left unchanged. The suggested rule:\n\"github\": "+wantRule)
 		if got := read(); got != want {
 			t.Errorf("policy.json changed:\n%s", got)
 		}
 		writeFile(t, p, `{"aws":{}}`)
-		runs(t, "\n", []string{"policy"}, "exists, so it is left unchanged. Add this key to it:\n\"github\": {")
+		runs(t, "\n", []string{"policy"}, note, "exists, so it is left unchanged. Add this key to it:\n\"github\": "+wantRule)
 		if got := read(); got != `{"aws":{}}` {
 			t.Errorf("policy.json changed:\n%s", got)
 		}
@@ -806,14 +820,26 @@ func TestCLIInit(t *testing.T) {
 			t.Fatal(err)
 		}
 		fails(t, "acme\n", "expected owner/repo or owner/*", "policy")
-		runs(t, "acme/widgets\nn\n", []string{"policy"})
+		runs(t, "acme/widgets\nn\n", []string{"policy"}, note)
 		if _, err := os.Stat(p); !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("wrote policy.json after a no: %v", err)
 		}
-		runs(t, "acme/*\ny\n", []string{"policy"})
-		if got := read(); !strings.Contains(got, `"acme/*"`) {
-			t.Errorf("policy.json:\n%s", got)
+
+		// When the sandbox is not ready, the reason has no path (leak is in the path) and the rule omits sandbox.
+		core.SandboxExecPath = filepath.Join(home, "missing", leak, "sandbox-exec")
+		notSuggested := "Sandbox: not suggested: sandbox-exec cannot be used (no such file or directory)\n"
+		wantNoSandboxRule := "{\n  \"allowed_scopes\": [\n    \"acme/*\"\n  ],\n  \"clean_env\": true\n}"
+		wantNoSandbox := "{\n  \"github\": {\n    \"allowed_scopes\": [\n      \"acme/*\"\n    ],\n    \"clean_env\": true\n  }\n}\n"
+		r = runs(t, "acme/*\ny\n", []string{"policy"}, notSuggested, "Wrote "+p+".")
+		if strings.Contains(r.out, "Note: sandbox hides") {
+			t.Errorf("printed sandbox note when not ready:\n%s", r.out)
 		}
+		if got := read(); got != wantNoSandbox {
+			t.Errorf("policy.json:\n%s\nwant:\n%s", got, wantNoSandbox)
+		}
+		runs(t, "acme/*\n", []string{"policy"}, notSuggested, "already has a github rule; left unchanged. The suggested rule:\n\"github\": "+wantNoSandboxRule)
+		writeFile(t, p, `{"aws":{}}`)
+		runs(t, "acme/*\n", []string{"policy"}, notSuggested, "exists, so it is left unchanged. Add this key to it:\n\"github\": "+wantNoSandboxRule)
 		if err := os.Remove(p); err != nil {
 			t.Fatal(err)
 		}

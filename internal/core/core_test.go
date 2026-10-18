@@ -1118,11 +1118,17 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 			core.SandboxExecPath = c.sandboxExec
 			t.Setenv("HOME", c.userHome)
 			srt := core.NewRuntime(c.home, "keychain", reg)
+			readyErr := srt.SandboxReady()
 			d := srt.CheckPolicy(req)
 			_, err := srt.ExecBlind(ctx, req)
-			if want := "policy denied: sandbox is on, but " + c.cause; d.Allowed || d.Reason != want || d.BlockedBy != "sandbox" || err == nil || err.Error() != want {
-				t.Errorf("%s: decision %+v, exec error %v, want both to deny with %q", c.cause, d, err, want)
+			if want := "policy denied: sandbox is on, but " + c.cause; d.Allowed || d.Reason != want || d.BlockedBy != "sandbox" || err == nil || err.Error() != want || readyErr == nil || readyErr.Error() != c.cause {
+				t.Errorf("%s: decision %+v, exec error %v, readyErr %v, want both to deny with %q", c.cause, d, err, readyErr, want)
 			}
+		}
+		core.SandboxExecPath = stub
+		t.Setenv("HOME", userHome)
+		if err := core.NewRuntime(home, "keychain", reg).SandboxReady(); err != nil {
+			t.Errorf("SandboxReady on a ready runtime = %v", err)
 		}
 
 		// Linux namespace sandbox failure modes (probed when SandboxExecPath is empty).

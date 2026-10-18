@@ -391,6 +391,13 @@ const sandboxProfile = `(version 1)
   (global-name "com.apple.security.escrow-update"))
 `
 
+// SandboxReady reports whether this host can build the sandbox prefix for rt.HomeDir, using the
+// same resolver decide runs, so a failure names only the cause and never a path (rule 36).
+func (rt *Runtime) SandboxReady() error {
+	_, err := sandboxArgv(rt.HomeDir)
+	return err
+}
+
 // sandboxArgv returns the sandbox runner argv the command goes behind. The profile or mount table
 // matches real paths, so folders and sockets are made absolute and their symlinks resolved. A
 // reason keeps only the error's cause, never a path (rule 36): it reaches agents and audit.jsonl.
