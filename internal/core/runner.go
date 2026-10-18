@@ -761,8 +761,8 @@ func OSApproval(ctx context.Context, req ExecRequest) (bool, error) {
 
 // ApprovalText is the request an approver shows a human. Every field an agent sets is quoted, so
 // a newline or quote in an argument cannot fake a line or push the command out of view, and text
-// longer than limit bytes is cut with a warning. The sandbox and network lines come before every
-// such field, so none can push them out of view either.
+// longer than limit bytes is cut with a warning. The sandbox, network, and hints lines come before
+// every such field, so none can push them out of view either.
 func ApprovalText(header string, req ExecRequest, limit int) string {
 	quote := func(list []string) string {
 		q := make([]string, len(list))
@@ -794,8 +794,12 @@ func ApprovalText(header string, req ExecRequest, limit int) string {
 	if req.Device != "" {
 		device = "\nDevice: " + strconv.Quote(req.Device)
 	}
-	text := fmt.Sprintf("%s\n\nSandbox: %s\nNetwork: %s%s\nProvider: %q\nVault: %s\nScope: %q\nPermissions: %s\nParams: %s\nCommand: %s\nWorking directory: %s",
-		header, sandbox, network, device, req.Provider, orUnset(req.Vault, "(not set: the default vault)"), req.Scope, quote(req.Permissions),
+	hints := "none"
+	if h := approvalHints(req); len(h) > 0 {
+		hints = strings.Join(h, ", ")
+	}
+	text := fmt.Sprintf("%s\n\nSandbox: %s\nNetwork: %s%s\nHints: %s\nProvider: %q\nVault: %s\nScope: %q\nPermissions: %s\nParams: %s\nCommand: %s\nWorking directory: %s",
+		header, sandbox, network, device, hints, req.Provider, orUnset(req.Vault, "(not set: the default vault)"), req.Scope, quote(req.Permissions),
 		strings.Join(params, " "), quote(req.Command), orUnset(req.WorkingDir, "(not set: mintrun's own)"))
 	if req.Purpose != "" {
 		text += "\nPurpose: " + strconv.Quote(req.Purpose)
@@ -807,6 +811,79 @@ func ApprovalText(header string, req ExecRequest, limit int) string {
 		text = strings.ToValidUTF8(text[:limit], "") + "\n\n⚠️ TRUNCATED: the request is longer than this message. Deny unless you know the rest."
 	}
 	return text
+}
+
+// approvalHintRules is approvalHints' closed vocabulary, in the order the labels show. An argument
+// gets a label when it equals one of its words, starts with one of its prefixes, or holds one of
+// its parts; a -X DELETE or --method delete pair gets it from its delete word. A bare -f is not a
+// force word, since gh api's -f sets a field.
+var approvalHintRules = []struct {
+	label                  string
+	words, prefixes, parts []string
+}{
+	{"delete", []string{"delete", "rm", "remove", "destroy", "purge", "truncate"}, []string{"drop ", "delete ", "truncate "}, nil},
+	{"force", []string{"--force", "--force-with-lease", "--hard", "--no-verify", "--yes", "-rf", "-fr"}, nil, nil},
+	{"network-tool", []string{"curl", "wget", "nc", "ncat", "ssh", "scp", "rsync"}, nil, nil},
+	{"encode", []string{"base64", "xxd", "od", "hexdump"}, nil, nil},
+	{"shell", []string{"sh", "bash", "zsh", "tee", "eval"}, nil, []string{"|", ">", "$(", "`"}},
+	{"external-url", nil, nil, nil}, // externalURL
+}
+
+// approvalOwnHosts are the domains, subdomains included, whose URLs a provider calls its own.
+var approvalOwnHosts = map[string][]string{
+	"github":     {"github.com", "githubusercontent.com"},
+	"aws":        {"amazonaws.com"},
+	"gcp":        {"googleapis.com", "google.com"},
+	"cloudflare": {"cloudflare.com"},
+	"vercel":     {"vercel.com"},
+}
+
+// approvalHints labels what the command asks for. Only argv is read, ASCII-lowercased (so no other
+// letter can fold into a word or a host), and the provider only names its own hosts. The labels
+// are advice for the human: they decide nothing.
+func approvalHints(req ExecRequest) []string {
+	args := make([]string, len(req.Command))
+	for i, arg := range req.Command {
+		b := []byte(arg)
+		for j, c := range b {
+			if 'A' <= c && c <= 'Z' {
+				b[j] = c + 'a' - 'A'
+			}
+		}
+		args[i] = string(b)
+	}
+	var hints []string
+	for _, rule := range approvalHintRules {
+		if slices.ContainsFunc(args, func(a string) bool {
+			return slices.Contains(rule.words, a) ||
+				slices.ContainsFunc(rule.prefixes, func(p string) bool { return strings.HasPrefix(a, p) }) ||
+				slices.ContainsFunc(rule.parts, func(p string) bool { return strings.Contains(a, p) }) ||
+				rule.label == "external-url" && externalURL(req.Provider, a)
+		}) {
+			hints = append(hints, rule.label)
+		}
+	}
+	return hints
+}
+
+// externalURL reports whether arg holds an http:// or https:// URL, up to the next space, whose
+// host is not one of the provider's own. A URL net/url cannot parse is external.
+func externalURL(provider, arg string) bool {
+	for _, field := range strings.Fields(arg) {
+		for i := range len(field) {
+			rest := field[i:]
+			if !strings.HasPrefix(rest, "http://") && !strings.HasPrefix(rest, "https://") {
+				continue
+			}
+			u, err := url.Parse(rest)
+			if err != nil || !slices.ContainsFunc(approvalOwnHosts[provider], func(d string) bool {
+				return u.Hostname() == d || strings.HasSuffix(u.Hostname(), "."+d)
+			}) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // FirstApproval asks every approver at once. The first answer, allow or deny, wins and cancels

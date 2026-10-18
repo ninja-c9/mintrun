@@ -225,7 +225,7 @@ func TestSlackApproval(t *testing.T) {
 			mu.Lock()
 			defer mu.Unlock()
 			// Every <, > and & is escaped, so no argument can mention @channel, a user, or a link.
-			want := "🔐 mintrun approval request\n\nSandbox: off\nNetwork: open\nProvider: \"github\"\nVault: \"agent-chosen\"\nScope: \"owner/repo\"\n" +
+			want := "🔐 mintrun approval request\n\nSandbox: off\nNetwork: open\nHints: shell, external-url\nProvider: \"github\"\nVault: \"agent-chosen\"\nScope: \"owner/repo\"\n" +
 				"Permissions: \"contents:read\"\nParams: \"installation_id\"=\"7\"\n" +
 				"Command: \"gh\" \"pr\" \"list\" \"x\\n✅ Allowed &lt;!channel&gt; &lt;@U0EVIL&gt; &lt;https://example.com|details&gt; &amp;amp;\"\n" +
 				"Working directory: (not set: mintrun's own)"

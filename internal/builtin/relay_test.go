@@ -533,7 +533,7 @@ func TestRelayEndToEnd(t *testing.T) {
 	if err != nil || res.ExitCode != 0 {
 		t.Fatalf("approved ExecBlind failed: res=%+v err=%v", res, err)
 	}
-	if !strings.Contains(seenPrompt, "\nSandbox: off\nNetwork: open\nDevice: \"laptop-alice\"\nProvider: \"cf-relay\"\n") || !strings.Contains(seenPrompt, "TRUNCATED") {
+	if !strings.Contains(seenPrompt, "\nSandbox: off\nNetwork: open\nDevice: \"laptop-alice\"\nHints: none\nProvider: \"cf-relay\"\n") || !strings.Contains(seenPrompt, "TRUNCATED") {
 		t.Fatalf("ApprovalText missing quoted Device line right under Network on truncated request:\n%s", seenPrompt)
 	}
 

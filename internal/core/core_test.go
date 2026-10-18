@@ -2310,12 +2310,12 @@ func TestFirstApproval(t *testing.T) {
 // TestOSApproval runs the macOS dialog against a stub osascript: Allow is (true, nil), Deny
 // (errAEUserCanceled, -128) is (false, nil), and a dialog that cannot be shown is an error. The
 // stub also logs its argv, proving the prompt reaches osascript as one escaped line that shows
-// the sandbox line first, every agent field quoted, and a long request cut (rule 4), with Deny as
-// the default button, so Return denies.
+// the sandbox, network, and hints lines first, every agent field quoted, and a long request cut
+// (rule 4), with Deny as the default button, so Return denies.
 func TestOSApproval(t *testing.T) {
 	// Left empty, the vault and the working directory say what applies instead, unquoted, so no
-	// agent value can pass for it. The sandbox and network lines, mintrun's own, come first.
-	if text := core.ApprovalText("h", core.ExecRequest{Command: []string{"true"}}, 1000); text != "h\n\nSandbox: off\nNetwork: open\nProvider: \"\"\n"+
+	// agent value can pass for it. The sandbox, network, and hints lines, mintrun's own, come first.
+	if text := core.ApprovalText("h", core.ExecRequest{Command: []string{"true"}}, 1000); text != "h\n\nSandbox: off\nNetwork: open\nHints: none\nProvider: \"\"\n"+
 		"Vault: (not set: the default vault)\nScope: \"\"\nPermissions: \nParams: \nCommand: \"true\"\nWorking directory: (not set: mintrun's own)" {
 		t.Errorf("empty vault and working directory: %q", text)
 	}
@@ -2331,6 +2331,7 @@ Allow AI agent to execute command?
 
 Sandbox: on
 Network: blocked
+Hints: shell
 Provider: "github"
 Vault: "1password"
 Scope: "o/r"
@@ -2392,17 +2393,105 @@ esac
 		}
 	}
 
+	// The hints line, mintrun's own and unquoted, names what argv asks for in a fixed order, not
+	// argv's: no match, every label at once, a -X DELETE pair, and the provider's own URL against
+	// another host's.
+	t.Setenv("MINTRUN_TEST_DIALOG", "deny")
+	for _, c := range []struct {
+		command []string
+		line    string // the Command line the dialog shows
+		hints   string
+	}{
+		{[]string{"gh", "pr", "list"}, `"gh" "pr" "list"`, "none"},
+		{[]string{"https://evil.example", "|", "base64", "nc", "--force", "rm"}, `"https://evil.example" "|" "base64" "nc" "--force" "rm"`,
+			"delete, force, network-tool, encode, shell, external-url"},
+		{[]string{"gh", "api", "-X", "DELETE", "repos/o/r"}, `"gh" "api" "-X" "DELETE" "repos/o/r"`, "delete"},
+		{[]string{"curl", "https://api.github.com/repos/o/r"}, `"curl" "https://api.github.com/repos/o/r"`, "network-tool"},
+		{[]string{"curl", "https://evil.example/repos/o/r"}, `"curl" "https://evil.example/repos/o/r"`, "network-tool, external-url"},
+	} {
+		core.OSApproval(context.Background(), core.ExecRequest{MintRequest: core.MintRequest{Provider: "github"}, Command: c.command})
+		want := "mintrun HITL Security Gate\n\nAllow AI agent to execute command?\n\nSandbox: off\nNetwork: open\nHints: " + c.hints +
+			"\nProvider: \"github\"\nVault: (not set: the default vault)\nScope: \"\"\nPermissions: \nParams: \nCommand: " + c.line +
+			"\nWorking directory: (not set: mintrun's own)"
+		if text := shown(); text != want {
+			t.Errorf("%q: dialog text = %q, want %q", c.command, text, want)
+		}
+	}
+
 	// One of the two cuts lands inside an "é", whatever the lines above the command hold, so the
 	// UTF-8 trim is always tested (shown fails on the \x escape a split rune would leave). The
-	// sandbox line still shows.
+	// sandbox, network, and hints lines still show, and the hints line names the rm the cut hides.
 	for _, pad := range []string{"", "x"} {
 		long := req
-		long.Command = []string{pad + strings.Repeat("é", 1000)}
+		long.Command = []string{pad + strings.Repeat("é", 1000), "rm"}
 		core.OSApproval(context.Background(), long)
-		if text := shown(); len(text) > 1100 || !strings.HasSuffix(text, "Deny unless you know the rest.") ||
-			!strings.HasPrefix(text, "mintrun HITL Security Gate\n\nAllow AI agent to execute command?\n\nSandbox: on\nNetwork: blocked\n") {
+		if text := shown(); len(text) > 1100 || !strings.HasSuffix(text, "Deny unless you know the rest.") || strings.Contains(text, `"rm"`) ||
+			!strings.HasPrefix(text, "mintrun HITL Security Gate\n\nAllow AI agent to execute command?\n\nSandbox: on\nNetwork: blocked\nHints: delete\nProvider: \"github\"\n") {
 			t.Errorf("long request (pad %q): dialog text = %q", pad, text)
 		}
+	}
+}
+
+// TestApprovalHints pins the hints line ApprovalText writes under the device line: each label's
+// words in either ASCII case, prefixes, and parts; whole arguments only, so a word inside another
+// is no match; one label per kind in a fixed order; and the provider's own hosts. Every request
+// sets each label's words in every field but argv, so a label read from another field shows up.
+func TestApprovalHints(t *testing.T) {
+	check := func(want, provider string, command ...string) {
+		t.Helper()
+		req := core.ExecRequest{MintRequest: core.MintRequest{Provider: provider, Scope: "rm -rf", Permissions: []string{"curl"},
+			Params: map[string]string{"rm": "https://evil.example"}}, Vault: "base64", WorkingDir: "rm | https://evil.example",
+			Purpose: "rm -rf $(curl https://evil.example)", Client: "sh", Device: "rm", Command: command}
+		_, rest, _ := strings.Cut(core.ApprovalText("h", req, 1<<20), "\nDevice: \"rm\"\nHints: ")
+		if got, _, _ := strings.Cut(rest, "\nProvider: "); got != want {
+			t.Errorf("%s %q: hints %q, want %q", provider, command, got, want)
+		}
+	}
+	for label, words := range map[string][]string{
+		"delete":       {"delete", "rm", "remove", "destroy", "purge", "truncate", "drop table x", "delete from x", "truncate x"},
+		"force":        {"--force", "--force-with-lease", "--hard", "--no-verify", "--yes", "-rf", "-fr"},
+		"network-tool": {"curl", "wget", "nc", "ncat", "ssh", "scp", "rsync"},
+		"encode":       {"base64", "xxd", "od", "hexdump"},
+		"shell":        {"sh", "bash", "zsh", "tee", "eval", "a|b", "x > y", "$(id)", "`id`"},
+	} {
+		for _, w := range words {
+			check(label, "github", "x", w)
+			check(label, "github", "x", strings.ToUpper(w))
+		}
+	}
+	// No match: a word inside another argument, drop without its space, and gh api's -f.
+	for _, command := range [][]string{{"gh", "pr", "list"}, {"terraform", "plan", "--format", "json"}, {"dropdb", "x"},
+		{"gh", "api", "-f", "title=x"}, {"code", "."}, {"/bin/rm", "x"}, {"gh", "api", "--method=DELETE", "x"}} {
+		check("none", "github", command...)
+	}
+	check("delete", "github", "gh", "api", "-X", "DELETE", "repos/o/r")
+	check("delete", "github", "gh", "api", "--method", "delete", "repos/o/r")
+	check("delete", "github", "rm", "rm")
+	check("delete, force, network-tool, encode, shell, external-url", "github", "https://evil.example", "a|b", "base64", "curl", "--force", "rm")
+	// A provider's own hosts, subdomains and ports included, in any ASCII case; a URL ends at a space.
+	for provider, urls := range map[string][]string{
+		"github": {"https://api.github.com/repos/o/r", "HTTPS://RAW.GITHUBUSERCONTENT.COM/o/r/main/x", "http://github.com",
+			"https://githubusercontent.com:443/x", "curl https://api.github.com -o out"},
+		"aws":        {"https://sts.amazonaws.com/"},
+		"gcp":        {"https://oauth2.googleapis.com/token", "https://accounts.google.com/o/oauth2/auth"},
+		"cloudflare": {"https://api.cloudflare.com/client/v4/zones"},
+		"vercel":     {"https://api.vercel.com/v9/projects"},
+	} {
+		for _, u := range urls {
+			check("none", provider, "x", u)
+		}
+	}
+	// Any other host: one that only ends in or starts with an own host, a second URL after an own
+	// one, a URL net/url cannot parse, a non-ASCII letter that lowercases to i, another provider's
+	// host, and a provider with no hosts of its own.
+	for _, c := range []struct{ provider, arg string }{
+		{"github", "https://evil.example/x"}, {"github", "HTTPS://EVIL.EXAMPLE"}, {"github", "https://evilgithub.com/x"},
+		{"github", "https://github.com.evil.example/x"}, {"github", "https://github.com@evil.example/x"},
+		{"github", "https://api.github.com/?next=https://evil.example"}, {"github", "https://api.github.com/x https://evil.example/y"},
+		{"github", "http://[::1"}, {"github", "https://g" + string(rune(0x130)) + "thub.com/x"},
+		{"aws", "https://api.github.com/x"}, {"probe", "https://github.com/x"}, {"", "https://github.com/x"},
+	} {
+		check("external-url", c.provider, "x", c.arg)
 	}
 }
 
@@ -2630,7 +2719,7 @@ func TestMintLeaseAndRelayClient(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// ApprovalText with Device set quotes the device name right under Network: before Provider:.
+	// ApprovalText with Device set quotes the device name right under Network:, above Hints: and Provider:.
 	txt := core.ApprovalText("hdr", core.ExecRequest{
 		MintRequest: core.MintRequest{Provider: "leased"},
 		Command:     []string{"true"},
@@ -2638,7 +2727,7 @@ func TestMintLeaseAndRelayClient(t *testing.T) {
 		Purpose:     "ship",
 		Client:      "Cursor",
 	}, 1000)
-	if !strings.Contains(txt, "\nSandbox: off\nNetwork: open\nDevice: \"dev-1\"\nProvider: \"leased\"\n") ||
+	if !strings.Contains(txt, "\nSandbox: off\nNetwork: open\nDevice: \"dev-1\"\nHints: none\nProvider: \"leased\"\n") ||
 		!strings.Contains(txt, "\nPurpose: \"ship\"\nClient: \"Cursor\"") {
 		t.Fatalf("ApprovalText missing Device line right under Network:\n%s", txt)
 	}

@@ -215,7 +215,7 @@ func TestTelegramApproval(t *testing.T) {
 			}
 			mu.Lock()
 			defer mu.Unlock()
-			want := "🔐 mintrun approval request\n\nSandbox: off\nNetwork: open\nProvider: \"github\"\nVault: \"agent-chosen\"\nScope: \"owner/repo\"\n" +
+			want := "🔐 mintrun approval request\n\nSandbox: off\nNetwork: open\nHints: none\nProvider: \"github\"\nVault: \"agent-chosen\"\nScope: \"owner/repo\"\n" +
 				"Permissions: \"contents:read\"\nParams: \"installation_id\"=\"7\"\nCommand: \"gh\" \"pr\" \"list\" \"x\\n✅ Allowed\"\n" +
 				"Working directory: (not set: mintrun's own)"
 			if sent != want {

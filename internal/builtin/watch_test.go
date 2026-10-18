@@ -308,8 +308,8 @@ func TestWatchServer(t *testing.T) {
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
-		if pending.Task != taskID || !strings.Contains(pending.Text, "Sandbox: on\nNetwork: blocked\n") {
-			t.Fatalf("pending approval not found or missing Sandbox/Network header: %+v", pending)
+		if pending.Task != taskID || !strings.Contains(pending.Text, "Sandbox: on\nNetwork: blocked\nHints: none\nProvider: \"github\"\n") {
+			t.Fatalf("pending approval not found or missing Sandbox/Network/Hints header: %+v", pending)
 		}
 
 		r := postWatch("/api/decide", `{"task":"`+taskID+`","decision":"`+decision+`"}`, true)
