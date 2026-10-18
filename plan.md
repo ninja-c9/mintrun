@@ -1,6 +1,6 @@
 # `mintrun` Execution Plan & Backlog
 
-> **Harness Spec:** [AGENTS.md](AGENTS.md) · **Latest Release:** `v0.11.0` · **Constraints:** 100% Go `1.24.0` standard library (`0` external dependencies), `> 90%` verified statement coverage measured without build tags.
+> **Harness Spec:** [AGENTS.md](AGENTS.md) · **Latest Release:** `v0.12.0` · **Constraints:** 100% Go `1.24.0` standard library (`0` external dependencies), `> 90%` verified statement coverage measured without build tags.
 
 ---
 
@@ -504,13 +504,13 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
 
 ## 3. Deferred Backlog (Next Actionable Items)
 
-1. **`no_network` Child Sandbox Option (open):** planned as **Workstream AC** in [§5](#5-roadmap-to-v0120-planned-2026-10-18-awaiting-approval). The macOS and Linux child sandboxes are built (Workstreams Y, Z, AA; rule 43) but leave the network open; AC adds a `no_network` option that blocks the command's own egress, gated behind per-OS integration tests.
+1. **`no_network` Child Sandbox Option (completed in `v0.12.0`, Workstream AC, rule 46):** `"no_network": true` in `policy.json`, CLI `-no-network`, and MCP `no_network: true` imply `sandbox: true` and block network egress inside the child (`(deny network*)` on macOS; `CLONE_NEWNET` + 9-instruction `seccomp-bpf` filter on `linux/amd64` and `linux/arm64`). Verified via `TestSandboxBlocksNetwork` on macOS 27.0 and Ubuntu 24.04 (`linux/arm64`, kernel 6.17); `linux/amd64` live integration run awaits an x86-64 Linux host.
 2. **Linux Host Verification:** moved to the §5 live-check runbook, item 4 (`-approve` with Telegram and Slack as the only channels; `secret-tool` is already verified).
 3. **Live Runs: Telegram, 1Password, Bitwarden & Vercel:** moved to the §5 live-check runbook, items 2–3 (each run with the user's own throwaway bot or account; `checks.md` §3 turns `pass` only on that run's output).
 4. **Live Slack Approval Run:** moved to the §5 live-check runbook, item 2 (the user's own throwaway workspace and app).
 5. **GCP `token_uri` From the Service-Account Key:**
    - Deferred: only keys outside the default Google universe carry a different `token_uri`, and honoring it also means sending revocation to that universe. Add it when such a key is in use.
-6. **Team Relay (`mintrun relay`), design only, awaiting approval:** planned as **Workstream AE** in [§5](#5-roadmap-to-v0120-planned-2026-10-18-awaiting-approval), gated behind the R0 approval; it ships as `v0.13.0`. The design (goal, server, client, the limits the docs must state, open questions, first slice) is preserved in the AE and R0 sections there.
+6. **Team Relay (`mintrun relay`), approved with R0 defaults:** planned as **Workstream AE** in [§5](#5-roadmap-to-v0120--v0130-approved-2026-10-18); ships as `v0.13.0`.
 
 ---
 
@@ -710,19 +710,19 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
 
 ---
 
-## 5. Roadmap to `v0.12.0` (planned 2026-10-18, awaiting approval)
+## 5. Roadmap to `v0.12.0` & `v0.13.0` (approved 2026-10-18)
 
-> Four shipped features from §3 become workstreams here, plus the §3 relay design gated behind an approval. `v0.12.0` = **AB + AC + AD**; the relay (**AE**) ships later as `v0.13.0` and only after its R0 gate is approved. One writer per docs file at a time (rule 17). Each workstream defines its checks before its code (layer 1). No code, commit, push, or tag before the user approves this section.
+> Four shipped features from §3 become workstreams here, plus the §3 relay design. `v0.12.0` = **AB + AC + AD** (completed); the relay (**AE**) ships as `v0.13.0`. One writer per docs file at a time (rule 17). Each workstream defines its checks before its code (layer 1).
 
-| # | Step | Mark | Waits for |
+| # | Step | Mark | Status |
 | :-- | :--- | :--- | :--- |
-| 1 | Release `v0.11.0` | `[SERIAL]` | — |
-| 2 | AB — `init policy` suggests the sandbox | `[SERIAL]` | 1 |
-| 3 | AD — app Stop end to end, and the app contract | `[PARALLEL]` with AB's code | 1 |
-| 4 | AC — `no_network` child option | `[SERIAL]` | AB and AD (shares `runner.go` with AB, `main_test.go` with AD) |
-| 5 | Release `v0.12.0` | `[SERIAL]` | AB, AC, AD; tag only after a yes |
-| 6 | AE — team relay (`mintrun relay`) | `[SERIAL]` | R0 approval and AC; ships as `v0.13.0` |
-| 7 | Live-check runbook | user-run | — |
+| 1 | Release `v0.11.0` | `[SERIAL]` | ✅ Done (`v0.11.0`) |
+| 2 | AB — `init policy` suggests the sandbox | `[SERIAL]` | ✅ Done (`422610f`, `e67042e`) |
+| 3 | AD — app Stop end to end, and the app contract | `[PARALLEL]` with AB's code | ✅ Done (`422610f`, `e67042e`) |
+| 4 | AC — `no_network` child option | `[SERIAL]` | ✅ Done (`fa117b5`, `bcf53d5`) |
+| 5 | Release `v0.12.0` | `[SERIAL]` | ✅ Done (`v0.12.0`) |
+| 6 | AE — team relay (`mintrun relay`) | `[SERIAL]` | In progress (`v0.13.0`) |
+| 7 | Live-check runbook | user-run | `unresolved` (user-run) |
 
 ### Release `v0.11.0`
 
