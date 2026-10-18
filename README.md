@@ -158,6 +158,8 @@ mintrun/
 │   ├── build.sh                          # Compiles macos/MintrunMenuBar with swiftc
 │   └── README.md                         # Build and usage instructions for the macOS Menu Bar companion
 ├── examples/plugins/                     # Plugins built into the binary (`plugin install <name>`): bitwarden (vault), vercel & postgres-jit (providers)
+├── scripts/
+│   └── verify.sh                         # Every acceptance check: gofmt, go vet, tests with a coverage gate above 90%, build & smoke test
 └── docs/
     ├── assets/                           # SVG architectural diagrams
     └── video/                            # Self-contained HTML/MP4 motion overview & storyboard
@@ -673,6 +675,9 @@ A reply that does not decode, such as text that is not JSON or an `expires_at` t
 `mintrun` ships with a deterministic, offline unit and integration test suite (**94.7%** total statement coverage, measured without build tags) that mocks Cloudflare, GitHub App RS256, AWS STS SigV4 (plus a fixed AWS signing vector), Google OAuth2 JWT-bearer, Telegram Bot, and Slack Web APIs plus the macOS `security`, `osascript`, and `sandbox-exec`, Linux `secret-tool` and the user+mount namespace sandbox helper, 1Password `op`, and `stty` CLIs, exercises the TLS 1.3 SPKI-pinned team relay (`mintrun relay`) and `mintrun watch` companion controller end to end, checks child environment isolation, the sandbox gate, the output cap, and the process-group kill, verifies AES-256-GCM encryption at rest, tests multi-encoding leak scrubbing, enforces policy guardrails, validates external plugin execution and the governance tools over MCP, installs and runs the [example plugins](examples/plugins/README.md) against a stub `bw`, a stub `psql`, and a local Vercel API (skipped without `python3`), runs `mintrun init`, `mintrun doctor`, `mintrun shim`, and `mintrun apps` in a throwaway home directory against stub `git`, `claude`, and `open`, and asks the mintrun app over a local test socket. It never touches the real Keychain, Telegram, Slack, Bitwarden, Vercel, a database, the mintrun app, or your IDE configs:
 
 ```bash
+# Every acceptance check at once (gofmt, go vet, tests with a coverage gate above 90%, build, smoke test), then a check | verdict table
+scripts/verify.sh
+
 go test -v -cover ./...
 
 # macOS only: round-trip throwaway single-item and multi-part secrets through the real Keychain
