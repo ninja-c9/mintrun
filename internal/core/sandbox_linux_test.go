@@ -17,12 +17,12 @@ import (
 )
 
 func init() {
-	if len(os.Args) == 4 && os.Args[1] == "-mintrun-linux-sandbox-check" {
-		os.Exit(checkInsideLinuxSandbox(os.Args[2], os.Args[3]))
+	if len(os.Args) == 6 && os.Args[1] == "-mintrun-linux-sandbox-check" {
+		os.Exit(checkInsideLinuxSandbox(os.Args[2], os.Args[3], os.Args[4], os.Args[5] == "1"))
 	}
 }
 
-func checkInsideLinuxSandbox(dir, file string) int {
+func checkInsideLinuxSandbox(dir, file, parentNetNS string, noNet bool) int {
 	const prGetSecurebits = 27
 	secbits, _, errno := syscall.Syscall6(syscall.SYS_PRCTL, prGetSecurebits, 0, 0, 0, 0, 0)
 	if errno != 0 || secbits != secbitsLockedNoRoot {
@@ -57,6 +57,41 @@ func checkInsideLinuxSandbox(dir, file string) int {
 		fmt.Fprintf(os.Stderr, "expected empty /dev/null read on hidden file, got %q err=%v\n", got, err)
 		return 8
 	}
+	netNS, err := os.Readlink("/proc/self/ns/net")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 9
+	}
+	if !noNet {
+		if netNS != parentNetNS || !strings.Contains(string(status), "Seccomp:\t0") {
+			fmt.Fprintf(os.Stderr, "expected shared netns and Seccomp 0, got netNS=%q status:\n%s", netNS, status)
+			return 10
+		}
+		fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "expected AF_UNIX socket without -no-network, got %v\n", err)
+			return 11
+		}
+		_ = syscall.Close(fd)
+		return 0
+	}
+	if netNS == parentNetNS || !strings.Contains(string(status), "NoNewPrivs:\t1") || !strings.Contains(string(status), "Seccomp:\t2") {
+		fmt.Fprintf(os.Stderr, "expected isolated netns, NoNewPrivs 1, and Seccomp 2, got netNS=%q status:\n%s", netNS, status)
+		return 12
+	}
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "expected socketpair to succeed, got %v\n", err)
+		return 13
+	}
+	_ = syscall.Close(fds[0])
+	_ = syscall.Close(fds[1])
+	for _, domain := range []int{syscall.AF_UNIX, syscall.AF_INET} {
+		if _, err := syscall.Socket(domain, syscall.SOCK_STREAM, 0); !errors.Is(err, syscall.EPERM) {
+			fmt.Fprintf(os.Stderr, "expected EPERM from socket(%d), got %v\n", domain, err)
+			return 14
+		}
+	}
 	return 0
 }
 
@@ -68,6 +103,15 @@ func TestLinuxSandboxSysProcAttrAndHelper(t *testing.T) {
 		!slices.Equal(cmd.SysProcAttr.AmbientCaps, []uintptr{capSysAdmin, capSetpcap}) ||
 		cmd.SysProcAttr.GidMappingsEnableSetgroups {
 		t.Fatalf("unexpected SysProcAttr: %+v", cmd.SysProcAttr)
+	}
+	if a, s, c, b, err := seccompArch("amd64"); err != nil || a != 0xc000003e || s != 41 || c != 42 || b != 49 {
+		t.Fatalf("seccompArch(amd64) = (%#x, %d, %d, %d, %v)", a, s, c, b, err)
+	}
+	if a, s, c, b, err := seccompArch("arm64"); err != nil || a != 0xc00000b7 || s != 198 || c != 203 || b != 200 {
+		t.Fatalf("seccompArch(arm64) = (%#x, %d, %d, %d, %v)", a, s, c, b, err)
+	}
+	if _, _, _, _, err := seccompArch("386"); err == nil {
+		t.Fatal("expected seccompArch(386) to fail")
 	}
 
 	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
@@ -91,10 +135,20 @@ func TestLinuxSandboxSysProcAttrAndHelper(t *testing.T) {
 			t.Errorf("runLinuxSandbox(%q) = %d, want 126", args, got)
 		}
 	}
+	origArch := linuxSandboxArch
+	linuxSandboxArch = "386"
+	if got := runLinuxSandbox([]string{"-hide-dir", "/tmp", "-no-network", "--"}); got != 126 {
+		t.Errorf("runLinuxSandbox(-no-network on 386) = %d, want 126", got)
+	}
+	linuxSandboxArch = origArch
 	os.Stderr = origStderr
 	_ = devNull.Close()
 
 	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentNetNS, err := os.Readlink("/proc/self/ns/net")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,9 +178,9 @@ func TestLinuxSandboxSysProcAttrAndHelper(t *testing.T) {
 		return code, out.String(), errBuf.String()
 	}
 
-	// Dry-run probe with an existing directory and a not-yet-created directory.
-	if code, _, stderr := runHelper("", "-hide-dir", dir, "-hide-file", file, "--"); code != 0 {
-		t.Skipf("unprivileged user+mount namespaces unavailable on this host (exit %d: %s)", code, strings.TrimSpace(stderr))
+	// Dry-run probe with an existing directory and a not-yet-created directory, with and without -no-network.
+	if code, _, stderr := runHelper("", "-hide-dir", dir, "-hide-file", file, "-no-network", "--"); code != 0 {
+		t.Skipf("unprivileged user+mount+net namespaces unavailable on this host (exit %d: %s)", code, strings.TrimSpace(stderr))
 	}
 	missingHome := filepath.Join(t.TempDir(), "not-created-yet")
 	if code, _, stderr := runHelper("", "-hide-dir", missingHome, "--"); code != 0 {
@@ -138,13 +192,24 @@ func TestLinuxSandboxSysProcAttrAndHelper(t *testing.T) {
 
 	// Inside the sandbox: securebits locked, all capability masks zeroed, mounts private,
 	// hidden directory unreadable and read-only (EROFS), and hidden file bound to /dev/null.
-	if code, stdout, stderr := runHelper("", "-hide-dir", dir, "-hide-file", file, "--",
-		exe, "-mintrun-linux-sandbox-check", dir, file); code != 0 {
-		t.Fatalf("sandbox check exited %d: stdout=%q stderr=%q", code, stdout, stderr)
+	// With -no-network, the net namespace is isolated, NoNewPrivs=1 and Seccomp=2 are active,
+	// socketpair(AF_UNIX) works, and socket(AF_UNIX|AF_INET) returns EPERM.
+	for _, tc := range []struct {
+		flag  string
+		extra []string
+	}{
+		{"0", nil},
+		{"1", []string{"-no-network"}},
+	} {
+		args := append([]string{"-hide-dir", dir, "-hide-file", file}, tc.extra...)
+		args = append(args, "--", exe, "-mintrun-linux-sandbox-check", dir, file, parentNetNS, tc.flag)
+		if code, stdout, stderr := runHelper("", args...); code != 0 {
+			t.Fatalf("sandbox check (noNet=%s) exited %d: stdout=%q stderr=%q", tc.flag, code, stdout, stderr)
+		}
 	}
 
 	// A working directory inside a hidden directory fails closed after Chdir("/") + mount + Chdir(cwd).
-	if code, _, stderr := runHelper(dir, "-hide-dir", dir, "--", exe, "-mintrun-linux-sandbox-check", dir, file); code != 126 || !strings.Contains(stderr, "permission denied") {
+	if code, _, stderr := runHelper(dir, "-hide-dir", dir, "--", exe, "-mintrun-linux-sandbox-check", dir, file, parentNetNS, "0"); code != 126 || !strings.Contains(stderr, "permission denied") {
 		t.Errorf("cwd inside hidden dir: exit %d, stderr %q, want 126 with permission denied", code, stderr)
 	}
 

@@ -3,11 +3,14 @@
 package core_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,7 +19,9 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/ninja-c9/mintrun/internal/builtin"
 	"github.com/ninja-c9/mintrun/internal/core"
@@ -289,5 +294,271 @@ func TestSandboxHidesSecretTool(t *testing.T) {
 
 	if got, err := kv.GetSecret(ctx, key); err != nil || got != canary {
 		t.Errorf("host secret-tool lookup after sandboxed runs: got %q, err %v", got, err)
+	}
+}
+
+func runNetProbe(kind, target string) {
+	fail := func(err error) {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	switch kind {
+	case "tcp":
+		cl := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{}}
+		resp, err := cl.Get(target)
+		if err != nil {
+			fail(err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			fail(err)
+		}
+		_, _ = os.Stdout.Write(body)
+	case "udp":
+		conn, err := net.DialTimeout("udp", target, 2*time.Second)
+		if err != nil {
+			fail(err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, err := io.WriteString(conn, "ping"); err != nil {
+			fail(err)
+		}
+		buf := make([]byte, 128)
+		n, err := conn.Read(buf)
+		if err != nil {
+			fail(err)
+		}
+		_, _ = os.Stdout.Write(buf[:n])
+	case "unix":
+		conn, err := net.DialTimeout("unix", target, 2*time.Second)
+		if err != nil {
+			fail(err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		out, err := io.ReadAll(conn)
+		if err != nil {
+			fail(err)
+		}
+		_, _ = os.Stdout.Write(out)
+	case "dns":
+		r := &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "udp", target)
+			},
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		ips, err := r.LookupIP(ctx, "ip4", "probe.example")
+		if err != nil || len(ips) == 0 {
+			fail(fmt.Errorf("LookupIP: %v (%v)", err, ips))
+		}
+		_, _ = io.WriteString(os.Stdout, ips[0].String())
+	case "local":
+		fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+		if err != nil {
+			fail(err)
+		}
+		if _, err := syscall.Write(fds[0], []byte("pair-ok")); err != nil {
+			fail(err)
+		}
+		_ = syscall.Close(fds[0])
+		buf := make([]byte, 7)
+		n, err := syscall.Read(fds[1], buf)
+		_ = syscall.Close(fds[1])
+		if err != nil || string(buf[:n]) != "pair-ok" {
+			fail(fmt.Errorf("socketpair read %q (%v)", buf[:n], err))
+		}
+		if err := os.WriteFile(target, buf[:n], 0o600); err != nil {
+			fail(err)
+		}
+		if runtime.GOOS == "linux" {
+			ns, err := os.Readlink("/proc/self/ns/net")
+			if err != nil {
+				fail(err)
+			}
+			status, err := os.ReadFile("/proc/self/status")
+			if err != nil {
+				fail(err)
+			}
+			fmt.Printf("%s\n%s", ns, status)
+		} else {
+			_, _ = io.WriteString(os.Stdout, "pair-ok")
+		}
+	default:
+		fail(fmt.Errorf("unknown probe %q", kind))
+	}
+	os.Exit(0)
+}
+
+func init() {
+	if len(os.Args) == 4 && os.Args[1] == "-mintrun-net-probe" {
+		runNetProbe(os.Args[2], os.Args[3])
+	}
+}
+
+// TestSandboxBlocksNetwork verifies that NoNetwork blocks TCP, UDP, pathname Unix domain sockets,
+// and DNS (plus mDNSResponder via dns-sd on macOS) while still allowing local file writes and
+// anonymous socketpair(AF_UNIX), and that on Linux /proc/self/ns/net is isolated and Seccomp:\t2
+// is active. Every blocked check has a positive control with NoNetwork: false (rule 23).
+func TestSandboxBlocksNetwork(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("sandbox is macOS and Linux only")
+	}
+	t.Setenv("MINTRUN_APPROVE", "")
+	rt, _ := probeRuntime(t, "sandbox_integration_master")
+	userHome, outside := t.TempDir(), t.TempDir()
+	if err := os.MkdirAll(filepath.Join(userHome, "Library", "Keychains"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", userHome)
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	canary := "net-canary-" + rand.Text()
+	tcpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, canary)
+	}))
+	defer tcpSrv.Close()
+
+	udpConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udpConn.Close()
+	go func() {
+		buf := make([]byte, 32)
+		for {
+			n, addr, err := udpConn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if string(buf[:n]) == "ping" {
+				_, _ = udpConn.WriteTo([]byte(canary), addr)
+			}
+		}
+	}()
+
+	sockDir, err := os.MkdirTemp("/tmp", "mr-net-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(sockDir)
+	sockPath := filepath.Join(sockDir, "s")
+	unixLn, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unixLn.Close()
+	go func() {
+		for {
+			c, err := unixLn.Accept()
+			if err != nil {
+				return
+			}
+			_, _ = io.WriteString(c, canary)
+			_ = c.Close()
+		}
+	}()
+
+	dnsConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dnsConn.Close()
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, addr, err := dnsConn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n < 17 {
+				continue
+			}
+			end := bytes.IndexByte(buf[12:n], 0)
+			if end < 0 || 12+end+5 > n {
+				continue
+			}
+			qEnd := 12 + end + 5
+			resp := []byte{buf[0], buf[1], 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00}
+			resp = append(resp, buf[12:qEnd]...)
+			resp = append(resp, 0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 127, 0, 0, 42)
+			_, _ = dnsConn.WriteTo(resp, addr)
+		}
+	}()
+
+	run := func(sandbox, noNet bool, cmd ...string) *core.ExecResult {
+		t.Helper()
+		res, err := rt.ExecBlind(context.Background(), core.ExecRequest{
+			MintRequest: core.MintRequest{Provider: "probe"},
+			Command:     cmd,
+			Sandbox:     sandbox,
+			NoNetwork:   noNet,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	probe := func(sandbox, noNet bool, kind, target string) *core.ExecResult {
+		t.Helper()
+		return run(sandbox, noNet, exe, "-mintrun-net-probe", kind, target)
+	}
+
+	for _, c := range []struct {
+		kind, target, want string
+	}{
+		{"tcp", tcpSrv.URL, canary},
+		{"udp", udpConn.LocalAddr().String(), canary},
+		{"unix", sockPath, canary},
+		{"dns", dnsConn.LocalAddr().String(), "127.0.0.42"},
+	} {
+		if res := probe(true, false, c.kind, c.target); res.ExitCode != 0 || res.Stdout != c.want {
+			t.Errorf("%s with Sandbox=true NoNetwork=false (positive control): %+v", c.kind, res)
+		}
+		if res := probe(false, true, c.kind, c.target); res.ExitCode == 0 || strings.Contains(res.Stdout, c.want) {
+			t.Errorf("%s with NoNetwork=true: %+v", c.kind, res)
+		}
+	}
+
+	if runtime.GOOS == "darwin" {
+		dnsSD := []string{"/usr/bin/dns-sd", "-t", "1", "-G", "v4", "localhost"}
+		if res := run(true, false, dnsSD...); res.ExitCode != 0 || !strings.Contains(res.Stdout, "127.0.0.1") {
+			t.Errorf("dns-sd with Sandbox=true NoNetwork=false (positive control): %+v", res)
+		}
+		if res := run(false, true, dnsSD...); res.ExitCode == 0 || strings.Contains(res.Stdout, "127.0.0.1") {
+			t.Errorf("dns-sd with NoNetwork=true: %+v", res)
+		}
+	}
+
+	localFile := filepath.Join(outside, "local-ok")
+	res := probe(false, true, "local", localFile)
+	if res.ExitCode != 0 {
+		t.Fatalf("local write + socketpair with NoNetwork=true: %+v", res)
+	}
+	if got, err := os.ReadFile(localFile); err != nil || string(got) != "pair-ok" {
+		t.Errorf("local file after NoNetwork=true: got %q (%v)", got, err)
+	}
+	if runtime.GOOS == "linux" {
+		parentNS, err := os.Readlink("/proc/self/ns/net")
+		if err != nil {
+			t.Fatal(err)
+		}
+		netNS, status, _ := strings.Cut(res.Stdout, "\n")
+		if netNS == parentNS || !strings.Contains(status, "Seccomp:\t2") || !strings.Contains(status, "NoNewPrivs:\t1") {
+			t.Errorf("Linux NoNetwork=true netns=%q (parent %q), status:\n%s", netNS, parentNS, status)
+		}
+		openRes := probe(true, false, "local", filepath.Join(outside, "local-open"))
+		openNS, openStatus, _ := strings.Cut(openRes.Stdout, "\n")
+		if openRes.ExitCode != 0 || openNS != parentNS || !strings.Contains(openStatus, "Seccomp:\t0") {
+			t.Errorf("Linux Sandbox=true NoNetwork=false (positive control) netns=%q (parent %q), status:\n%s", openNS, parentNS, openStatus)
+		}
 	}
 }

@@ -57,9 +57,9 @@ func TestAppApproval(t *testing.T) {
 		Vault: "agent-chosen", Command: []string{"gh", "pr", "list", "x\n✅ Allowed", long}, WorkingDir: "src/app",
 		Purpose: "triage", Client: "claude-code", Via: "mcp", Task: "TASK1", Approve: true, CleanEnv: true, FromAgent: true,
 	}
-	// The exact line pins what the app decodes: the sandbox, sent when off too, every request field,
-	// and the command whole.
-	wantSent := `{"v":1,"type":"approve","task":"TASK1","request":{"sandbox":false,"provider":"github","scope":"owner/repo",` +
+	// The exact line pins what the app decodes: the sandbox and network flags, sent when off too,
+	// every request field, and the command whole.
+	wantSent := `{"v":1,"type":"approve","task":"TASK1","request":{"sandbox":false,"no_network":false,"provider":"github","scope":"owner/repo",` +
 		`"permissions":["contents:read"],"params":{"installation_id":"7"},"command":["gh","pr","list","x\n✅ Allowed","` + long + `"],` +
 		`"cwd":"src/app","purpose":"triage","client":"claude-code","via":"mcp","ttl_seconds":300}}` + "\n"
 	var fallbacks atomic.Int32
@@ -128,24 +128,35 @@ func TestAppApproval(t *testing.T) {
 			}
 		})
 	}
-	// The sandbox comes from req.Sandbox, which checkPolicy sets from its verdict. The other flags
-	// differ from it in both requests, so a line that took one of them fails.
-	t.Run("sandbox on", func(t *testing.T) {
-		rt, ln := appListen(t)
-		on := req
-		on.Sandbox, on.Approve, on.CleanEnv, on.FromAgent = true, false, false, false
-		done := ask(context.Background(), rt, on)
-		conn, r := appAccept(t, ln)
-		want := strings.Replace(wantSent, `"sandbox":false`, `"sandbox":true`, 1)
-		if sent, err := r.ReadString('\n'); sent != want {
-			t.Fatalf("request line %q (%v), want %q", sent, err, want)
-		}
-		_, _ = io.WriteString(conn, allow+"\n")
-		conn.Close()
-		if got := answer(t, done); !got.ok || got.err != nil {
-			t.Fatalf("got (%v, %v), want (true, nil)", got.ok, got.err)
-		}
-	})
+	// The sandbox and no_network flags come from req.Sandbox and req.NoNetwork, which checkPolicy sets
+	// from its verdict. The other flags differ from them in both requests, so a line that took one of
+	// them fails.
+	for _, tc := range []struct {
+		name               string
+		sandbox, noNet     bool
+		wantBox, wantNoNet string
+	}{
+		{"sandbox on", true, false, `"sandbox":true`, `"no_network":false`},
+		{"no_network on", true, true, `"sandbox":true`, `"no_network":true`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt, ln := appListen(t)
+			on := req
+			on.Sandbox, on.NoNetwork, on.Approve, on.CleanEnv, on.FromAgent = tc.sandbox, tc.noNet, false, false, false
+			done := ask(context.Background(), rt, on)
+			conn, r := appAccept(t, ln)
+			want := strings.Replace(wantSent, `"sandbox":false`, tc.wantBox, 1)
+			want = strings.Replace(want, `"no_network":false`, tc.wantNoNet, 1)
+			if sent, err := r.ReadString('\n'); sent != want {
+				t.Fatalf("request line %q (%v), want %q", sent, err, want)
+			}
+			_, _ = io.WriteString(conn, allow+"\n")
+			conn.Close()
+			if got := answer(t, done); !got.ok || got.err != nil {
+				t.Fatalf("got (%v, %v), want (true, nil)", got.ok, got.err)
+			}
+		})
+	}
 
 	// When ctx ends (another channel answered, or ApprovalTimeout passed), the connection closes,
 	// which tells the app to drop the card.

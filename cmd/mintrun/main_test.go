@@ -363,20 +363,22 @@ func TestCLIExecSandbox(t *testing.T) {
 		core.SandboxExecPath, core.LinuxSandboxPath, core.LinuxSandboxSysProcAttr = p, lp, fn
 	}(core.SandboxExecPath, core.LinuxSandboxPath, core.LinuxSandboxSysProcAttr)
 	core.SandboxExecPath = stub
-	for _, flags := range [][]string{{"-sandbox"}, nil} {
+	for _, flags := range [][]string{{"-sandbox"}, {"-no-network"}, nil} {
 		r := runCLI(t, "", nil, append(append([]string{"exec"}, flags...), "-provider", "cloudflare", "-perms", "static", "--", "/bin/sh", "-c", "exit 7")...)
 		calls := takeCalls(t, home)
 		sandboxed := strings.HasPrefix(calls, "sandbox-exec -p (version 1)\n") && strings.HasSuffix(calls, " -- /bin/sh -c exit 7\n")
-		if r.code != 7 || !r.exited || sandboxed != (flags != nil) || flags == nil && calls != "" {
+		noNet := strings.Contains(calls, "(deny network*)")
+		if r.code != 7 || !r.exited || sandboxed != (flags != nil) || noNet != (len(flags) == 1 && flags[0] == "-no-network") || flags == nil && calls != "" {
 			t.Errorf("%v: exit %d (exited %v), stderr %q, stub calls %q", flags, r.code, r.exited, r.err, calls)
 		}
 	}
 	core.SandboxExecPath, core.LinuxSandboxPath, core.LinuxSandboxSysProcAttr = "", linuxStub, func(*exec.Cmd) {}
-	for _, flags := range [][]string{{"-sandbox"}, nil} {
+	for _, flags := range [][]string{{"-sandbox"}, {"-no-network"}, nil} {
 		r := runCLI(t, "", nil, append(append([]string{"exec"}, flags...), "-provider", "cloudflare", "-perms", "static", "--", "/bin/sh", "-c", "exit 7")...)
 		calls := takeCalls(t, home)
 		sandboxed := strings.HasPrefix(calls, "mintrun-linux-sandbox -mintrun-linux-sandbox -hide-dir ") && strings.HasSuffix(calls, " -- /bin/sh -c exit 7\n")
-		if r.code != 7 || !r.exited || sandboxed != (flags != nil) || flags == nil && calls != "" {
+		noNet := strings.Contains(calls, " -no-network -- ")
+		if r.code != 7 || !r.exited || sandboxed != (flags != nil) || noNet != (len(flags) == 1 && flags[0] == "-no-network") || flags == nil && calls != "" {
 			t.Errorf("linux %v: exit %d (exited %v), stderr %q, stub calls %q", flags, r.code, r.exited, r.err, calls)
 		}
 	}

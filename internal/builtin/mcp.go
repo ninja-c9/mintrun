@@ -166,7 +166,11 @@ func (m *MCPBridge) handleRequest(ctx context.Context, rt *core.Runtime, req jso
 				},
 				"sandbox": map[string]any{
 					"type":        "boolean",
-					"description": "Run the command in a macOS sandbox that cannot read mintrun's home or the Keychain (denied on other hosts). It only adds the sandbox: policy sandbox applies whatever this says",
+					"description": "Run the command in the OS sandbox (macOS and Linux; denied on other hosts), away from mintrun's home and the keystore. It only adds the sandbox: policy sandbox or no_network applies whatever this says",
+				},
+				"no_network": map[string]any{
+					"type":        "boolean",
+					"description": "Block the command's network egress inside the OS sandbox (macOS and Linux; implies sandbox). It only adds the block: policy no_network applies whatever this says",
 				},
 				"approve": map[string]any{
 					"type":        "boolean",
@@ -204,7 +208,7 @@ func (m *MCPBridge) handleRequest(ctx context.Context, rt *core.Runtime, req jso
 					},
 					{
 						"name":        "mintrun_policy_check",
-						"description": "Dry-run a mintrun_exec request (same arguments) against policy.json and the anti-exfiltration guard, using the exact gate mintrun_exec enforces. Never opens the vault, mints, runs the command, or asks a human. Returns allowed, the denial reason, approval_required, ttl_seconds (the lease TTL requested from the provider; gcp tokens always live up to 1h), clean_env, and sandbox. Policy verdict only: an allowed exec can still fail on an unknown provider, a missing vault secret, or a mint error.",
+						"description": "Dry-run a mintrun_exec request (same arguments) against policy.json and the anti-exfiltration guard, using the exact gate mintrun_exec enforces. Never opens the vault, mints, runs the command, or asks a human. Returns allowed, the denial reason, approval_required, ttl_seconds (the lease TTL requested from the provider; gcp tokens always live up to 1h), clean_env, sandbox, and no_network. Policy verdict only: an allowed exec can still fail on an unknown provider, a missing vault secret, or a mint error.",
 						"inputSchema": execSchema,
 					},
 					{

@@ -1611,7 +1611,8 @@ func TestMCPBridgeGovernanceTools(t *testing.T) {
   "approval_required": false,
   "ttl_seconds": 120,
   "clean_env": false,
-  "sandbox": false
+  "sandbox": false,
+  "no_network": false
 }` {
 		t.Fatalf("policy_check reply drifted:\n%s", got)
 	}

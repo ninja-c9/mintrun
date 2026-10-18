@@ -34,10 +34,11 @@ type ExecRequest struct {
 	Command    []string `json:"command"`         // e.g. ["wrangler", "deploy"]
 	WorkingDir string   `json:"cwd,omitempty"`   // Optional working directory
 	TimeoutSec int      `json:"timeout_seconds,omitempty"`
-	Approve    bool     `json:"approve,omitempty"`   // Require interactive human-in-the-loop approval
-	CleanEnv   bool     `json:"clean_env,omitempty"` // Child gets only the base env + policy allowed_env + Lease.Env (can only tighten policy)
-	Sandbox    bool     `json:"sandbox,omitempty"`   // Run under sandbox-exec (macOS), away from mintrun's home and the Keychain (can only tighten policy)
-	Purpose    string   `json:"purpose,omitempty"`   // The agent's reason in plain words: shown to the approver, never trusted
+	Approve    bool     `json:"approve,omitempty"`    // Require interactive human-in-the-loop approval
+	CleanEnv   bool     `json:"clean_env,omitempty"`  // Child gets only the base env + policy allowed_env + Lease.Env (can only tighten policy)
+	Sandbox    bool     `json:"sandbox,omitempty"`    // Run inside the OS sandbox (macOS and Linux), away from mintrun's home and the keystore (can only tighten policy)
+	NoNetwork  bool     `json:"no_network,omitempty"` // Block the command's network egress inside the OS sandbox (implies sandbox; can only tighten policy)
+	Purpose    string   `json:"purpose,omitempty"`    // The agent's reason in plain words: shown to the approver, never trusted
 	// Set by mintrun, never by an agent: MCP arguments unmarshal straight into ExecRequest.
 	Client    string `json:"-"` // MCP clientInfo name, self-reported by the AI app
 	Via       string `json:"-"` // "cli" or "mcp"
@@ -86,11 +87,13 @@ type AuditEntry struct {
 	ExitCode   int    `json:"exit_code"`
 	DurationMs int64  `json:"duration_ms"`
 	Truncated  bool   `json:"truncated,omitempty"`
-	// Sandbox is whether the command runs under sandbox-exec, from the verdict that asked a human
-	// or allowed the request. A request the gate blocked first has none, and one it blocked after
-	// an approval keeps what the human was shown.
-	Sandbox bool   `json:"sandbox,omitempty"`
-	Error   string `json:"error,omitempty"`
+	// Sandbox and NoNetwork record whether the command runs inside the OS sandbox and with network
+	// egress blocked, from the verdict that asked a human or allowed the request. A request the
+	// gate blocked first has neither, and one it blocked after an approval keeps what the human
+	// was shown.
+	Sandbox   bool   `json:"sandbox,omitempty"`
+	NoNetwork bool   `json:"no_network,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
 // PolicyRule controls which scopes, permissions, and commands are permitted for a provider.
@@ -104,7 +107,8 @@ type PolicyRule struct {
 	CleanEnv             bool     `json:"clean_env,omitempty"`             // Force clean-env for every exec of this provider (audit M1)
 	AllowedEnv           []string `json:"allowed_env,omitempty"`           // Host env names (globs) a clean-env child keeps; non-empty implies clean_env
 	AllowedInstallations []string `json:"allowed_installations,omitempty"` // Exact params.installation_id values; non-empty requires a listed one
-	Sandbox              bool     `json:"sandbox,omitempty"`               // Run every exec of this provider under sandbox-exec (macOS only; denied elsewhere)
+	Sandbox              bool     `json:"sandbox,omitempty"`               // Run every exec of this provider inside the OS sandbox (macOS and Linux; denied elsewhere)
+	NoNetwork            bool     `json:"no_network,omitempty"`            // Block network egress for every exec of this provider (implies sandbox)
 }
 
 func matchPattern(pattern, value string) bool {
@@ -205,7 +209,8 @@ type PolicyDecision struct {
 	ApprovalRequired bool   `json:"approval_required"`    // ExecBlind would ask a human (approve, require_approval, MINTRUN_APPROVE=1)
 	TTLSeconds       int    `json:"ttl_seconds"`          // Lease TTL requested from the provider after max_ttl_seconds and the 600s default
 	CleanEnv         bool   `json:"clean_env"`            // Child gets the clean env (request, policy clean_env, or allowed_env)
-	Sandbox          bool   `json:"sandbox"`              // Child runs under sandbox-exec (request or policy sandbox)
+	Sandbox          bool   `json:"sandbox"`              // Child runs inside the OS sandbox (request, policy sandbox, or no_network)
+	NoNetwork        bool   `json:"no_network"`           // Child runs with network egress blocked (request or policy no_network)
 }
 
 // CheckPolicy runs every static rule of the exec gate: request validation, the fail-closed
@@ -331,18 +336,20 @@ func (rt *Runtime) decide(req ExecRequest) (PolicyDecision, []string, []string) 
 		req.TTLSeconds = 600
 	}
 
+	noNet := req.NoNetwork || rule.NoNetwork
 	d := PolicyDecision{
 		Allowed:          true,
 		ApprovalRequired: req.Approve || (hasRule && rule.RequireApproval) || os.Getenv("MINTRUN_APPROVE") == "1",
 		TTLSeconds:       req.TTLSeconds,
 		CleanEnv:         req.CleanEnv || rule.CleanEnv || len(rule.AllowedEnv) > 0,
-		Sandbox:          req.Sandbox || rule.Sandbox,
+		Sandbox:          req.Sandbox || rule.Sandbox || noNet,
+		NoNetwork:        noNet,
 	}
 	if !d.Sandbox {
 		return d, rule.AllowedEnv, nil
 	}
 	// Fail closed: a sandbox that is on but cannot be set up denies the request.
-	sandbox, err := sandboxArgv(rt.HomeDir)
+	sandbox, err := sandboxArgv(rt.HomeDir, d.NoNetwork)
 	if err != nil {
 		return deny("sandbox", "policy denied: sandbox is on, but %v", err)
 	}
@@ -394,19 +401,19 @@ const sandboxProfile = `(version 1)
 // SandboxReady reports whether this host can build the sandbox prefix for rt.HomeDir, using the
 // same resolver decide runs, so a failure names only the cause and never a path (rule 36).
 func (rt *Runtime) SandboxReady() error {
-	_, err := sandboxArgv(rt.HomeDir)
+	_, err := sandboxArgv(rt.HomeDir, false)
 	return err
 }
 
 // sandboxArgv returns the sandbox runner argv the command goes behind. The profile or mount table
 // matches real paths, so folders and sockets are made absolute and their symlinks resolved. A
 // reason keeps only the error's cause, never a path (rule 36): it reaches agents and audit.jsonl.
-func sandboxArgv(homeDir string) ([]string, error) {
+func sandboxArgv(homeDir string, noNetwork bool) ([]string, error) {
 	if SandboxExecPath == "" {
 		if LinuxSandboxPath != "" {
-			return linuxSandboxArgv(homeDir)
+			return linuxSandboxArgv(homeDir, noNetwork)
 		}
-		return nil, errors.New("this host has no sandbox-exec (macOS only)")
+		return nil, errors.New("this host has no sandbox (macOS and Linux only)")
 	}
 	if _, err := os.Stat(SandboxExecPath); err != nil {
 		return nil, fmt.Errorf("sandbox-exec cannot be used (%v)", pathCause(err))
@@ -423,7 +430,11 @@ func sandboxArgv(homeDir string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("the Keychain folder cannot be resolved (%v)", pathCause(err))
 	}
-	return []string{SandboxExecPath, "-p", sandboxProfile, "-D", "MINTRUN_DIR=" + dir, "-D", "KEYCHAINS=" + keychains, "--"}, nil
+	profile := sandboxProfile
+	if noNetwork {
+		profile += "(deny network*)\n"
+	}
+	return []string{SandboxExecPath, "-p", profile, "-D", "MINTRUN_DIR=" + dir, "-D", "KEYCHAINS=" + keychains, "--"}, nil
 }
 
 // linuxSandboxArgv builds and probes the Linux user+mount namespace sandbox prefix: a read-only
@@ -432,7 +443,7 @@ func sandboxArgv(homeDir string) ([]string, error) {
 // bind-mounted over the D-Bus session bus sockets (/run/user/<uid>/bus, $XDG_RUNTIME_DIR/bus, and
 // $DBUS_SESSION_BUS_ADDRESS). Any non-filesystem D-Bus address or blocked user/mount namespace
 // fails closed before any vault opens.
-func linuxSandboxArgv(homeDir string) ([]string, error) {
+func linuxSandboxArgv(homeDir string, noNetwork bool) ([]string, error) {
 	dir, err := realDir(homeDir)
 	if err != nil {
 		return nil, fmt.Errorf("mintrun's home cannot be resolved (%v)", pathCause(err))
@@ -529,6 +540,9 @@ func linuxSandboxArgv(homeDir string) ([]string, error) {
 	for _, f := range files {
 		argv = append(argv, "-hide-file", f)
 	}
+	if noNetwork {
+		argv = append(argv, "-no-network")
+	}
 	argv = append(argv, "--")
 	probe := exec.Command(argv[0], argv[1:]...)
 	LinuxSandboxSysProcAttr(probe)
@@ -614,28 +628,28 @@ func realDir(dir string) (string, error) {
 	return filepath.EvalSymlinks(abs)
 }
 
-// checkPolicy enforces CheckPolicy's verdict on req (effective TTL, clean mode, sandbox) and asks
-// a human through ApprovalFunc when the verdict requires approval. It returns the allowed_env of
-// the rule it enforced and the sandbox-exec prefix (nil when the sandbox is off); e records
-// whether the sandbox is on and why it denied.
+// checkPolicy enforces CheckPolicy's verdict on req (effective TTL, clean mode, sandbox, no_network)
+// and asks a human through ApprovalFunc when the verdict requires approval. It returns the
+// allowed_env of the rule it enforced and the sandbox prefix (nil when the sandbox is off); e
+// records whether the sandbox and no_network are on and why it denied.
 func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest, e *AuditEntry) ([]string, []string, error) {
 	d, env, sandbox := rt.decide(*req)
 	if d.Allowed && d.ApprovalRequired {
-		req.TTLSeconds, req.CleanEnv, req.Sandbox = d.TTLSeconds, d.CleanEnv, d.Sandbox
-		e.Sandbox = d.Sandbox
+		req.TTLSeconds, req.CleanEnv, req.Sandbox, req.NoNetwork = d.TTLSeconds, d.CleanEnv, d.Sandbox, d.NoNetwork
+		e.Sandbox, e.NoNetwork = d.Sandbox, d.NoNetwork
 		if err := rt.approve(ctx, *req, e); err != nil {
 			return nil, nil, err
 		}
 		// A pause or rule change made while the request waited for a human still applies. Fed
-		// the first verdict's TTL, clean mode, and sandbox, the second one can only tighten them.
+		// the first verdict's TTL, clean mode, sandbox, and no_network, the second one can only tighten them.
 		d, env, sandbox = rt.decide(*req)
 	}
 	if !d.Allowed {
 		e.Outcome, e.BlockedBy = "blocked", d.BlockedBy
 		return nil, nil, errors.New(d.Reason)
 	}
-	req.TTLSeconds, req.CleanEnv, req.Sandbox = d.TTLSeconds, d.CleanEnv, d.Sandbox
-	e.Sandbox = d.Sandbox
+	req.TTLSeconds, req.CleanEnv, req.Sandbox, req.NoNetwork = d.TTLSeconds, d.CleanEnv, d.Sandbox, d.NoNetwork
+	e.Sandbox, e.NoNetwork = d.Sandbox, d.NoNetwork
 	return env, sandbox, nil
 }
 
@@ -705,8 +719,8 @@ func OSApproval(ctx context.Context, req ExecRequest) (bool, error) {
 
 // ApprovalText is the request an approver shows a human. Every field an agent sets is quoted, so
 // a newline or quote in an argument cannot fake a line or push the command out of view, and text
-// longer than limit bytes is cut with a warning. The sandbox line comes before every such field,
-// so none can push it out of view either.
+// longer than limit bytes is cut with a warning. The sandbox and network lines come before every
+// such field, so none can push them out of view either.
 func ApprovalText(header string, req ExecRequest, limit int) string {
 	quote := func(list []string) string {
 		q := make([]string, len(list))
@@ -727,12 +741,15 @@ func ApprovalText(header string, req ExecRequest, limit int) string {
 		}
 		return strconv.Quote(s)
 	}
-	sandbox := "off"
+	sandbox, network := "off", "open"
 	if req.Sandbox {
 		sandbox = "on"
 	}
-	text := fmt.Sprintf("%s\n\nSandbox: %s\nProvider: %q\nVault: %s\nScope: %q\nPermissions: %s\nParams: %s\nCommand: %s\nWorking directory: %s",
-		header, sandbox, req.Provider, orUnset(req.Vault, "(not set: the default vault)"), req.Scope, quote(req.Permissions),
+	if req.NoNetwork {
+		network = "blocked"
+	}
+	text := fmt.Sprintf("%s\n\nSandbox: %s\nNetwork: %s\nProvider: %q\nVault: %s\nScope: %q\nPermissions: %s\nParams: %s\nCommand: %s\nWorking directory: %s",
+		header, sandbox, network, req.Provider, orUnset(req.Vault, "(not set: the default vault)"), req.Scope, quote(req.Permissions),
 		strings.Join(params, " "), quote(req.Command), orUnset(req.WorkingDir, "(not set: mintrun's own)"))
 	if req.Purpose != "" {
 		text += "\nPurpose: " + strconv.Quote(req.Purpose)
