@@ -163,6 +163,7 @@ mintrun/
 │   └── verify.sh                         # Every acceptance check: gofmt, go vet, tests with a coverage gate above 90%, build & smoke test
 └── docs/
     ├── assets/                           # SVG architectural diagrams
+    ├── threat-model.md                   # What mintrun promises, the tests behind each promise, and its limits
     └── video/                            # Self-contained HTML/MP4 motion overview & storyboard
 ```
 
@@ -441,6 +442,8 @@ The bot sends you a direct message with ✅ and ❌ already on it: tap one. `min
 ---
 
 ## Defense-in-Depth Security Model
+
+The [threat model](docs/threat-model.md) lists what `mintrun` promises, the tests behind each promise, and where each one stops. To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ### 1. Declarative Policy Guardrails (`~/.mintrun/policy.json`)
 
