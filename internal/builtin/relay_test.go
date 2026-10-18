@@ -30,6 +30,7 @@ type relayTestProvider struct {
 	leakMaster  bool
 	ttlOverride time.Duration
 	mintErr     error
+	mintHook    func() // runs at the start of Mint, outside mu
 	revokedIDs  []string
 }
 
@@ -38,6 +39,12 @@ func (p *relayTestProvider) Manifest() core.Manifest {
 }
 
 func (p *relayTestProvider) Mint(_ context.Context, master string, req core.MintRequest) (*core.Lease, error) {
+	p.mu.Lock()
+	hook := p.mintHook
+	p.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	if p.mintErr != nil {
 		return nil, p.mintErr
 	}
@@ -337,7 +344,8 @@ func TestRelayEndToEnd(t *testing.T) {
 	if d := wrongPinClient.CheckPolicy(context.Background(), core.ExecRequest{
 		MintRequest: core.MintRequest{Provider: "cf-relay", Scope: "example.com", Permissions: []string{"dns:write"}},
 		Command:     []string{"true"},
-	}); d.Allowed || d.BlockedBy != "relay" || strings.Contains(d.Reason, aliceToken) {
+	}); d.Allowed || d.BlockedBy != "relay" || strings.Contains(d.Reason, aliceToken) ||
+		!strings.HasPrefix(d.Reason, "policy denied: relay cannot be reached (") || !strings.Contains(d.Reason, "does not match pinned") {
 		t.Fatalf("expected SPKI mismatch to fail closed without token leak, got: %+v", d)
 	}
 
@@ -347,7 +355,7 @@ func TestRelayEndToEnd(t *testing.T) {
 	if d := badTokClient.CheckPolicy(context.Background(), core.ExecRequest{
 		MintRequest: core.MintRequest{Provider: "cf-relay", Scope: "example.com", Permissions: []string{"dns:write"}},
 		Command:     []string{"true"},
-	}); d.Allowed || d.BlockedBy != "relay" || strings.Contains(d.Reason, badTok) {
+	}); d.Allowed || d.BlockedBy != "relay" || d.Reason != "policy denied: relay rejected device token (401 unauthorized)" {
 		t.Fatalf("expected bad token to fail closed, got: %+v", d)
 	}
 
@@ -464,8 +472,8 @@ func TestRelayEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("alice Mint: %v", err)
 	}
-	if _, err := bobClient.Revoke(context.Background(), lease.ID, "done", 0, false); err == nil {
-		t.Fatal("expected bob to be refused when revoking alice's lease")
+	if _, err := bobClient.Revoke(context.Background(), lease.ID, "done", 0, false); err == nil || err.Error() != "unknown lease" {
+		t.Fatalf("expected bob to be refused with unknown lease when revoking alice's lease, got: %v", err)
 	}
 	if _, err := aliceClient.Revoke(context.Background(), lease.ID, "invalid_outcome", 0, false); err == nil {
 		t.Fatal("expected invalid revoke outcome to be refused")
@@ -628,7 +636,8 @@ func TestRelayRateLimitAndLeaseCap(t *testing.T) {
 			t.Fatalf("alice request %d denied: %+v", i, d)
 		}
 	}
-	if d := aliceClient.CheckPolicy(ctx, req); d.Allowed || d.BlockedBy != "relay" || !strings.Contains(d.Reason, "rate limit exceeded") {
+	const limited = "policy denied: relay rate limited (429: rate limit exceeded)"
+	if d := aliceClient.CheckPolicy(ctx, req); d.Allowed || d.BlockedBy != "relay" || d.Reason != limited {
 		t.Fatalf("expected 429 rate limit exceeded on 3rd request, got: %+v", d)
 	}
 	// The raw reply alice gets: its status, Retry-After, and the error in its body.
@@ -662,13 +671,97 @@ func TestRelayRateLimitAndLeaseCap(t *testing.T) {
 	if d := aliceClient.CheckPolicy(ctx, req); !d.Allowed {
 		t.Fatalf("alice should succeed after 1s refill: %+v", d)
 	}
-	if d := aliceClient.CheckPolicy(ctx, req); d.Allowed || !strings.Contains(d.Reason, "rate limit exceeded") {
+	if d := aliceClient.CheckPolicy(ctx, req); d.Allowed || d.BlockedBy != "relay" || d.Reason != limited {
 		t.Fatalf("alice should be limited again when bucket empties: %+v", d)
 	}
 
-	// 3. Per-device active concurrent lease cap on /v1/mint.
+	// 3. A revoke spends no token: alice, out of tokens, still ends her lease, and the server
+	// audits it as done, not unreported.
+	now = now.Add(time.Second)
+	la, _, _, err := aliceClient.Mint(ctx, req)
+	if err != nil {
+		t.Fatalf("alice mint after refill: %v", err)
+	}
+	if d := aliceClient.CheckPolicy(ctx, req); d.Allowed || d.Reason != limited {
+		t.Fatalf("alice should be out of tokens after her mint: %+v", d)
+	}
+	if ok, err := aliceClient.Revoke(ctx, la.ID, "done", 0, false); err != nil || !ok {
+		t.Fatalf("rate-limited alice Revoke = %v, %v; want true, nil", ok, err)
+	}
+	entries := readAuditLines(t, serverHome)
+	if minted, final := entries[len(entries)-2], entries[len(entries)-1]; minted.Outcome != "minted" ||
+		final.Outcome != "done" || !final.Revoked || final.Task != minted.Task || final.Device != "laptop-alice" {
+		t.Fatalf("server audit after a rate-limited revoke = %+v, %+v; want minted, then done and revoked", minted, final)
+	}
+	now = now.Add(time.Second) // one token back; a revoke must leave it for the check below
+	if _, err := aliceClient.Revoke(ctx, "no-such-lease", "done", 0, false); err == nil || err.Error() != "unknown lease" {
+		t.Fatalf("Revoke of an unknown lease = %v, want unknown lease", err)
+	}
+	if d := aliceClient.CheckPolicy(ctx, req); !d.Allowed {
+		t.Fatalf("a revoke spent alice's token: %+v", d)
+	}
+
+	// 4. Per-device active concurrent lease cap on /v1/mint.
 	relaySrv.RatePerMin = 0 // disable request rate limit to isolate lease cap
 	relaySrv.MaxLeases = 2
+
+	// Parallel mints that all reach the server before any lease is stored still mint only
+	// MaxLeases: the provider holds every mint it gets until each request has either reached
+	// it or been refused.
+	const parallel = 8
+	const capped = "relay lease cap reached (429: too many active leases for device)"
+	arrived, release := make(chan struct{}, parallel), make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	defer releaseOnce()
+	prov.mu.Lock()
+	prov.mintHook = func() { arrived <- struct{}{}; <-release }
+	prov.mu.Unlock()
+	var wg sync.WaitGroup
+	leases, errs := make(chan *core.Lease, parallel), make(chan error, parallel)
+	for range parallel {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			l, _, _, err := aliceClient.Mint(ctx, req)
+			if err != nil {
+				errs <- err
+				arrived <- struct{}{}
+				return
+			}
+			leases <- l
+		}()
+	}
+	for range parallel {
+		select {
+		case <-arrived:
+		case <-time.After(time.Minute):
+			t.Fatal("parallel mints neither reached the provider nor failed within a minute")
+		}
+	}
+	releaseOnce()
+	wg.Wait()
+	close(leases)
+	close(errs)
+	prov.mu.Lock()
+	prov.mintHook = nil
+	prov.mu.Unlock()
+	for err := range errs {
+		if err.Error() != capped {
+			t.Fatalf("parallel mint error = %q, want %q", err, capped)
+		}
+	}
+	var minted []*core.Lease
+	for l := range leases {
+		minted = append(minted, l)
+	}
+	if len(minted) != relaySrv.MaxLeases {
+		t.Fatalf("%d parallel mints gave %d leases, want MaxLeases = %d", parallel, len(minted), relaySrv.MaxLeases)
+	}
+	for _, l := range minted {
+		if ok, err := aliceClient.Revoke(ctx, l.ID, "done", 0, false); err != nil || !ok {
+			t.Fatalf("Revoke(%s) = %v, %v", l.ID, ok, err)
+		}
+	}
 
 	l1, _, _, err := aliceClient.Mint(ctx, req)
 	if err != nil {
@@ -678,8 +771,14 @@ func TestRelayRateLimitAndLeaseCap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("alice mint 2: %v", err)
 	}
-	if _, _, _, err := aliceClient.Mint(ctx, req); err == nil || !strings.Contains(err.Error(), "too many active leases for device") {
+	if _, _, _, err := aliceClient.Mint(ctx, req); err == nil || err.Error() != capped {
 		t.Fatalf("expected active lease cap error on 3rd mint, got: %v", err)
+	}
+	// What a capped exec shows: the relay was reached, and refused the mint.
+	clientRT := core.NewRuntime(t.TempDir(), "keychain", core.NewRegistry())
+	clientRT.Relay = aliceClient
+	if _, err := clientRT.ExecBlind(ctx, req); err == nil || err.Error() != "relay mint failed: "+capped {
+		t.Fatalf("capped ExecBlind error = %v, want %q", err, "relay mint failed: "+capped)
 	}
 	if code, ra, msg := rawPost("/v1/mint"); code != http.StatusTooManyRequests || ra != "1" || msg != "too many active leases for device" {
 		t.Fatalf("capped /v1/mint = %d, Retry-After %q, error %q; want 429, \"1\", \"too many active leases for device\"", code, ra, msg)
@@ -701,4 +800,52 @@ func TestRelayRateLimitAndLeaseCap(t *testing.T) {
 	}
 	_, _ = aliceClient.Revoke(ctx, l2.ID, "done", 0, false)
 	_, _ = aliceClient.Revoke(ctx, l3.ID, "done", 0, false)
+
+	// 5. A mint that fails gives its slot back: a denied one and one the provider fails.
+	relaySrv.MaxLeases = 1
+	denied := req
+	denied.Scope = "other.com"
+	if _, _, _, err := aliceClient.Mint(ctx, denied); !errors.As(err, new(*core.RelayDenyError)) {
+		t.Fatalf("Mint for an unlisted scope = %v, want a relay deny", err)
+	}
+	prov.mintErr = errors.New("provider down")
+	if _, _, _, err := aliceClient.Mint(ctx, req); err == nil || !strings.Contains(err.Error(), "provider down") {
+		t.Fatalf("Mint with a failing provider = %v, want provider down", err)
+	}
+	prov.mintErr = nil
+	l4, _, _, err := aliceClient.Mint(ctx, req)
+	if err != nil {
+		t.Fatalf("Mint after two failed mints: %v", err)
+	}
+	if _, _, _, err := aliceClient.Mint(ctx, req); err == nil || err.Error() != capped {
+		t.Fatalf("Mint over a cap of 1 = %v, want %q", err, capped)
+	}
+	if ok, err := aliceClient.Revoke(ctx, l4.ID, "done", 0, false); err != nil || !ok {
+		t.Fatalf("Revoke(l4) = %v, %v", ok, err)
+	}
+}
+
+// A reply cut off mid-body is a transport failure, so it reads as "cannot be reached", which a
+// 429 or a 401 never does (TestRelayRateLimitAndLeaseCap, TestRelayEndToEnd).
+func TestRelayClientCutOffReply(t *testing.T) {
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		_, _ = w.Write([]byte(`{"allowed":`))
+	}))
+	ts.Config.ErrorLog = log.New(io.Discard, "", 0)
+	ts.TLS = &tls.Config{MinVersion: tls.VersionTLS13}
+	ts.StartTLS()
+	defer ts.Close()
+	pin, err := RelaySPKIPin(ts.Certificate().Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := NewRelayClient(ts.URL+"#sha256="+pin, func(context.Context) (string, error) { return "mr_dev_cut_off_token", nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := c.CheckPolicy(context.Background(), core.ExecRequest{MintRequest: core.MintRequest{Provider: "cf-relay"}, Command: []string{"true"}})
+	if want := "policy denied: relay cannot be reached (unexpected EOF)"; d.Allowed || d.BlockedBy != "relay" || d.Reason != want {
+		t.Fatalf("cut-off reply = %+v, want reason %q", d, want)
+	}
 }

@@ -235,6 +235,12 @@ const (
 	DefaultMaxActiveLeasesPerDevice = 32
 )
 
+// The errors of the two 429 replies, which RelayClient tells apart.
+const (
+	relayRateLimitError = "rate limit exceeded"
+	relayLeaseCapError  = "too many active leases for device"
+)
+
 type activeRelayLease struct {
 	device string
 	timer  *time.Timer
@@ -254,6 +260,7 @@ type RelayServer struct {
 	mu         sync.Mutex
 	leases     map[string]*activeRelayLease
 	buckets    map[string]*relayBucket
+	minting    map[string]int // mints in flight per device, counted against MaxLeases
 	RatePerMin int
 	Burst      int
 	MaxLeases  int
@@ -270,6 +277,7 @@ func NewRelayServer(rt *core.Runtime) *RelayServer {
 		rt:         rt,
 		leases:     make(map[string]*activeRelayLease),
 		buckets:    make(map[string]*relayBucket),
+		minting:    make(map[string]int),
 		RatePerMin: DefaultRelayRatePerMinute,
 		Burst:      DefaultRelayBurst,
 		MaxLeases:  DefaultMaxActiveLeasesPerDevice,
@@ -299,22 +307,25 @@ func (s *RelayServer) allowDevice(name string) bool {
 	return true
 }
 
-func (s *RelayServer) atLeaseCap(name string) bool {
+// reserveLease takes one of name's MaxLeases slots under the same lock that counts them, so
+// concurrent mints cannot all pass the cap before any of them stores its lease. The /v1/mint
+// handler gives the slot back under s.mu when MintLease returns, storing the lease in its place.
+func (s *RelayServer) reserveLease(name string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.MaxLeases <= 0 {
-		return false
-	}
-	n := 0
-	for _, al := range s.leases {
-		if al.device == name {
-			n++
-			if n >= s.MaxLeases {
-				return true
+	if s.MaxLeases > 0 {
+		n := s.minting[name]
+		for _, al := range s.leases {
+			if al.device == name {
+				n++
 			}
 		}
+		if n >= s.MaxLeases {
+			return false
+		}
 	}
-	return false
+	s.minting[name]++
+	return true
 }
 
 // Close stops all expiry timers and revokes and audits any still-open leases as "unreported".
@@ -419,9 +430,11 @@ func (s *RelayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
 	}
-	if !s.allowDevice(dev.Name) {
+	// A revoke spends no token: it ends a lease a rate-limited mint handed out, and refusing it
+	// would leave the lease live until its timer revokes it as "unreported".
+	if r.URL.Path != "/v1/revoke" && !s.allowDevice(dev.Name) {
 		w.Header().Set("Retry-After", "1")
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limit exceeded"})
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": relayRateLimitError})
 		return
 	}
 
@@ -436,19 +449,22 @@ func (s *RelayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.rt.CheckPolicy(req))
 
 	case "/v1/mint":
-		if s.atLeaseCap(dev.Name) {
-			w.Header().Set("Retry-After", "1")
-			writeJSON(w, http.StatusTooManyRequests, relayMintResponse{Error: "too many active leases for device"})
-			return
-		}
 		var req core.ExecRequest
 		if err := decodeStrictJSON(w, r, &req); err != nil {
 			writeJSON(w, http.StatusBadRequest, relayMintResponse{Error: "invalid request body"})
 			return
 		}
+		if !s.reserveLease(dev.Name) {
+			w.Header().Set("Retry-After", "1")
+			writeJSON(w, http.StatusTooManyRequests, relayMintResponse{Error: relayLeaseCapError})
+			return
+		}
 		req.FromAgent, req.Device, req.Via = true, dev.Name, "relay"
 		lease, d, entry, finish, err := s.rt.MintLease(r.Context(), req)
+		s.mu.Lock()
+		s.minting[dev.Name]-- // the reserved slot is freed, or taken by the lease stored below
 		if err != nil {
+			s.mu.Unlock()
 			var rdeny *core.RelayDenyError
 			if errors.As(err, &rdeny) {
 				writeJSON(w, http.StatusForbidden, relayMintResponse{Deny: rdeny, Error: rdeny.Reason})
@@ -464,7 +480,6 @@ func (s *RelayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if ttl <= 0 {
 			ttl = 10 * time.Minute
 		}
-		s.mu.Lock()
 		clientLease := *lease
 		if s.leases[clientLease.ID] != nil {
 			clientLease.ID = lease.ID + "-" + entry.Task
@@ -561,12 +576,12 @@ func (c *RelayClient) postJSON(ctx context.Context, path string, in, out any) (i
 	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return 0, errors.New(core.Scrub(err.Error(), []string{token}))
+		return 0, fmt.Errorf("relay cannot be reached (%s)", core.Scrub(err.Error(), []string{token}))
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return resp.StatusCode, errors.New(core.Scrub(err.Error(), []string{token}))
+		return resp.StatusCode, fmt.Errorf("relay cannot be reached (%s)", core.Scrub(err.Error(), []string{token}))
 	}
 	if out != nil && len(raw) > 0 {
 		if err := json.Unmarshal(raw, out); err != nil {
@@ -581,6 +596,9 @@ func (c *RelayClient) postJSON(ctx context.Context, path string, in, out any) (i
 			Error string `json:"error"`
 		}
 		_ = json.Unmarshal(raw, &errBody)
+		if errBody.Error == relayLeaseCapError {
+			return resp.StatusCode, errors.New("relay lease cap reached (429: " + relayLeaseCapError + ")")
+		}
 		if errBody.Error != "" {
 			return resp.StatusCode, fmt.Errorf("relay rate limited (429: %s)", core.Scrub(errBody.Error, []string{token}))
 		}
@@ -589,8 +607,8 @@ func (c *RelayClient) postJSON(ctx context.Context, path string, in, out any) (i
 	return resp.StatusCode, nil
 }
 
-// CheckPolicy queries POST /v1/check on the relay server. Any transport, auth, or decode failure
-// fails closed with BlockedBy: "relay".
+// CheckPolicy queries POST /v1/check on the relay server. Any transport, auth, rate-limit, or
+// decode failure fails closed with BlockedBy: "relay".
 func (c *RelayClient) CheckPolicy(ctx context.Context, req core.ExecRequest) core.PolicyDecision {
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -600,7 +618,7 @@ func (c *RelayClient) CheckPolicy(ctx context.Context, req core.ExecRequest) cor
 		return core.PolicyDecision{
 			Allowed:   false,
 			BlockedBy: "relay",
-			Reason:    fmt.Sprintf("policy denied: relay cannot be reached (%s)", err.Error()),
+			Reason:    "policy denied: " + err.Error(),
 		}
 	}
 	if code != http.StatusOK {
