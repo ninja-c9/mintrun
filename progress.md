@@ -542,3 +542,25 @@
   - Chạy `mintrun watch` trên máy dùng chung vẫn không an toàn; `-http ''` tắt hẳn bảng điều khiển.
   - "Open dashboard" trên thanh menu mở trang không có fragment nên trang hiện thông báo từ chối, đúng như thiết kế nhưng dễ gây hiểu lầm.
 - **Next step:** Commit nhánh `claude/watch-token-guard`, rồi hợp nhất vào `main` (sau khi hoàn tất nhánh JEV và các nhánh còn lại), chạy lại toàn bộ acceptance trên `main`.
+
+## Checkpoint — Dòng `Hints:` trong văn bản phê duyệt (2026-10-19)
+
+- **Hoàn thành:** `core.ApprovalText` có thêm dòng `Hints:` ngay dưới `Network:`, hoặc dưới `Device:` khi có. Dòng này do mintrun viết, không đặt trong ngoặc kép và đứng trước `Provider:`, nên mọi người duyệt (hộp thoại macOS, Telegram, Slack, `mintrun watch` và qua nó ứng dụng thanh menu) đều thấy nó trước mọi trường do agent viết, kể cả khi văn bản bị cắt (TRUNCATED). Dòng ghi `Hints: none` hoặc các nhãn theo thứ tự cố định `delete`, `force`, `network-tool`, `encode`, `shell`, `external-url`, do `approvalHints` tính từ argv và provider (bộ từ vựng đóng nằm trong một slice có thứ tự, `approvalHintRules`; host riêng của từng provider nằm trong `approvalOwnHosts`). Chỉ dùng `strings`, `slices` và `net/url`: không regexp, không gọi mạng, không thêm dependency. Nhãn chỉ là gợi ý: không đổi quyết định, trường audit, `PolicyDecision` hay khoá nào trong `app.sock`.
+- **Outputs:** `internal/core/runner.go`, `internal/core/core_test.go`, `internal/builtin/telegram_test.go`, `internal/builtin/slack_test.go`, `internal/builtin/relay_test.go`, `internal/builtin/watch_test.go` (commit `76f9ce0`); `AGENTS.md` (luật 4), `README.md`, `macos/README.md`, `plan.md` (§7), `checks.md`, `progress.md` (commit docs).
+- **Quyết định:**
+  - Chỉ chữ thường hoá ASCII: `strings.ToLower` biến U+0130 thành `i`, nên một host viết bằng ký tự đó sẽ lọt qua như `github.com`.
+  - Mỗi đối số được tách theo khoảng trắng (`strings.Fields`) trước khi tìm URL, và mọi URL trong một đối số đều được xét, không chỉ URL đầu tiên.
+  - Cặp `-X DELETE` hay `--method delete` được nhận là `delete` nhờ chính từ `delete` của nó, không cần quy tắc riêng cho cặp.
+  - `-f` đứng một mình không phải `force`, vì `gh api -f` dùng nó để đặt một trường.
+  - URL không phân tích được (ví dụ một host chứa `|`) bị coi là `external-url`.
+- **Kiểm chứng:** Mục `Approval Hints` trong [checks.md](checks.md).
+  - Mutant trên bản sao của cây cuối cùng, mỗi mutant build trước bằng `go test -run '^$'`: **24/24** bị test bắt; bản sao không đổi thì pass.
+  - `gofmt -s -l .` rỗng, `go vet ./...` sạch; độ phủ tổng **94.7%** (`cmd/mintrun` 94.5%, `internal/builtin` 93.7%, `internal/core` 96.4%); `ApprovalText`, `approvalHints` và `externalURL` đều 100%.
+  - `go build -trimpath -o mintrun ./cmd/mintrun && ./mintrun plugin list` chạy được.
+  - Quét bidi và ký tự điều khiển (có mẫu cài sẵn `chr(0x202E)` và ESC), quét đường dẫn tuyệt đối và tên máy theo nguyên từ (có mẫu cài sẵn): 0 kết quả.
+- **Chưa kiểm chứng:** Chưa nhìn dòng mới trên hộp thoại macOS thật, Telegram, Slack hay ứng dụng thanh menu; các test chỉ so văn bản.
+- **Vấn đề mở:**
+  - `/bin/rm`, `-XDELETE`, `--method=DELETE` và `--request=DELETE` không có nhãn, vì mỗi đối số được so nguyên vẹn.
+  - `git push -f` không có nhãn `force` (theo yêu cầu, vì `-f` của `gh api`).
+  - Nhãn không có trong dòng `app.sock`, audit hay `PolicyDecision`.
+- **Next step:** Phiên cha xem 2 commit trên nhánh `claude/elated-dijkstra-77d761` và quyết định có merge vào `main` hay không.

@@ -958,3 +958,26 @@ New tests stay hermetic (rule 22): a plain `go test ./...` makes zero real `sand
   go test -count=1 -v -run 'TestWatchServer|TestWatchDashboardBanner|TestCLIWatch' ./internal/builtin ./cmd/mintrun
   ```
 
+## 7. Approval Hints (`Hints:` Line, 2026-10-19)
+
+> A deterministic first step before any semantic screen of a command: every approver (the dialog, Telegram, Slack, `mintrun watch`, and through it the menu bar app) reads a closed-vocabulary risk hint computed from argv and the provider, ahead of every agent field. No model, no network call, no new dependency, and the hints decide nothing.
+
+| # | Step | Mark | Status |
+| :-- | :--- | :--- | :--- |
+| 1 | `approvalHints` and the `Hints:` line in `core.ApprovalText` | `[SERIAL]` | ✅ Done (`76f9ce0`) |
+| 2 | Exact-text tests: `TestApprovalHints`, `TestOSApproval`, and the Telegram, Slack, relay, and watch texts | `[SERIAL]` | ✅ Done (`76f9ce0`) |
+| 3 | Mutants on a copy | `[SERIAL]` | ✅ Done (24/24 killed) |
+| 4 | Docs: `AGENTS.md` rule 4, `README.md`, `macos/README.md`, `checks.md`, `progress.md` | `[SERIAL]` | ✅ Done |
+
+### Hints Line
+
+- **Files:** `internal/core/runner.go`, `internal/core/core_test.go`, `internal/builtin/telegram_test.go`, `internal/builtin/slack_test.go`, `internal/builtin/relay_test.go`, `internal/builtin/watch_test.go`, `AGENTS.md` (rule 4), `README.md`, `macos/README.md`, `checks.md`, `progress.md`.
+- **Deliverables:**
+  1. `[SERIAL]` `approvalHints(req ExecRequest) []string` next to `ApprovalText`, with the vocabulary in one ordered slice (`approvalHintRules`) and each provider's own hosts in `approvalOwnHosts`; `strings`, `slices`, and `net/url` only, no `regexp`. `ApprovalText` writes `Hints: none` or the labels joined by `, ` under `Network:`, or under `Device:` when it is set, unquoted and ahead of `Provider:`.
+  2. `[SERIAL]` `TestApprovalHints` (the table test), and five whole dialog texts plus a long, cut request in `TestOSApproval`; the Telegram, Slack, relay, and watch tests expect the new line.
+  3. `[SERIAL]` Mutants on a copy, each compiled first: the line after `Command:`, quoted, or dropped when empty; the labels sorted; `rm` matched as a substring; the provider's own URL called external; a bare `-f` flagged; and 17 more (see [checks.md](checks.md)).
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run '^(TestOSApproval|TestApprovalHints|TestMintLeaseAndRelayClient|TestTelegramApproval|TestSlackApproval|TestRelayEndToEnd|TestWatchServer)$' ./internal/core ./internal/builtin
+  ```
+
