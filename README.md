@@ -177,6 +177,9 @@ go install github.com/ninja-c9/mintrun/cmd/mintrun@latest
 git clone https://github.com/ninja-c9/mintrun.git
 cd mintrun
 go build -trimpath -o mintrun ./cmd/mintrun
+
+# Print the version, Go version, and platform:
+./mintrun -version
 ```
 
 ### 2. Set Up With `mintrun init`

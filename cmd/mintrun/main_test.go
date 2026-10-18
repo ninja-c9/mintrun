@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -78,6 +79,53 @@ func runMainWithArgs(t *testing.T, stdin string, args ...string) (code int, exit
 	return withMockExit(t, func() {
 		main()
 	})
+}
+
+func TestVersion(t *testing.T) {
+	origVersion, origRead := version, readBuildInfo
+	t.Cleanup(func() { version, readBuildInfo = origVersion, origRead })
+	tail := fmt.Sprintf(" (%s, %s/%s)", runtime.Version(), runtime.GOOS, runtime.GOARCH)
+	// A test binary carries no vcs.* settings, so each case hands versionString its own.
+	info := func(settings ...debug.BuildSetting) func() (*debug.BuildInfo, bool) {
+		return func() (*debug.BuildInfo, bool) { return &debug.BuildInfo{Settings: settings}, true }
+	}
+	rev := debug.BuildSetting{Key: "vcs.revision", Value: "6fcd7f0a1b2c3d4e5f60718293a4b5c6d7e8f901"}
+	dirty := debug.BuildSetting{Key: "vcs.modified", Value: "true"}
+	clean := debug.BuildSetting{Key: "vcs.modified", Value: "false"}
+	for _, c := range []struct {
+		name, version string
+		read          func() (*debug.BuildInfo, bool)
+		want          string
+	}{
+		{"ldflags", "v1.2.3", info(rev, dirty), "v1.2.3"},
+		{"revision", "", info(rev, clean), "6fcd7f0a1b2c"},
+		{"revision dirty", "", info(dirty, rev), "6fcd7f0a1b2c+dirty"},
+		{"short revision", "", info(debug.BuildSetting{Key: "vcs.revision", Value: "1234"}), "1234"},
+		{"no revision", "", info(dirty), "dev"},
+		{"no build info", "", func() (*debug.BuildInfo, bool) { return nil, false }, "dev"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			version, readBuildInfo = c.version, c.read
+			if got, want := versionString(), "mintrun "+c.want+tail; got != want {
+				t.Fatalf("got %q, want %q", got, want)
+			}
+		})
+	}
+
+	// Every spelling prints that one line through main, even with a settings.json that stops
+	// every other command (rule 45), as it stops help here.
+	home := t.TempDir()
+	t.Setenv("MINTRUN_HOME", home)
+	writeFile(t, filepath.Join(home, "settings.json"), "{")
+	version, readBuildInfo = "v9.9.9", origRead
+	for _, arg := range []string{"version", "-version", "--version"} {
+		if r := runCLI(t, "", nil, arg); r.exited || r.out != "mintrun v9.9.9"+tail+"\n" || r.err != "" {
+			t.Fatalf("%s: %+v", arg, r)
+		}
+	}
+	if r := runCLI(t, "", nil, "help"); !r.exited || r.code != 1 || !strings.Contains(r.err, "settings.json is malformed") {
+		t.Fatalf("help with a malformed settings.json: %+v", r)
+	}
 }
 
 func TestCLISubcommandsEndToEnd(t *testing.T) {

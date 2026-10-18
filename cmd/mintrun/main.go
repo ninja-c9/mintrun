@@ -13,6 +13,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"syscall"
@@ -23,13 +25,43 @@ import (
 	"github.com/ninja-c9/mintrun/internal/core"
 )
 
+// version is stamped at build time with -ldflags "-X main.version=<tag>" (scripts/release.sh).
+var version string
+
 // Swapped by tests.
 var (
-	exitFunc     = os.Exit
-	sttyPath     = "/bin/stty"
-	osExecutable = os.Executable
-	openPath     = "/usr/bin/open"
+	exitFunc      = os.Exit
+	sttyPath      = "/bin/stty"
+	osExecutable  = os.Executable
+	openPath      = "/usr/bin/open"
+	readBuildInfo = debug.ReadBuildInfo
 )
+
+// versionString is the -X stamp, else the VCS revision go build embeds from a checkout (12
+// characters, +dirty when the tree had changes), else dev (rule 49).
+func versionString() string {
+	v := version
+	if v == "" {
+		v = "dev"
+		if info, ok := readBuildInfo(); ok {
+			var rev, dirty string
+			for _, s := range info.Settings {
+				switch s.Key {
+				case "vcs.revision":
+					rev = s.Value[:min(12, len(s.Value))]
+				case "vcs.modified":
+					if s.Value == "true" {
+						dirty = "+dirty"
+					}
+				}
+			}
+			if rev != "" {
+				v = rev + dirty
+			}
+		}
+	}
+	return fmt.Sprintf("mintrun %s (%s, %s/%s)", v, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+}
 
 func defaultHomeDir() string {
 	if env := os.Getenv("MINTRUN_HOME"); env != "" {
@@ -147,6 +179,12 @@ func main() {
 	if len(os.Args) < 2 {
 		printUsage()
 		exitFunc(1)
+		return
+	}
+
+	// Before bootRuntime, so nothing that stops every other command hides the version (rule 49).
+	if slices.Contains([]string{"version", "-version", "--version"}, os.Args[1]) {
+		fmt.Println(versionString())
 		return
 	}
 
@@ -446,7 +484,8 @@ Usage:
   mintrun plugin install <name|path|url>                      Install a bundled plugin by name, or one from a directory or URL
   mintrun plugin remove <name>                                Remove an installed external plugin
   mintrun mcp                                                 Start MCP JSON-RPC 2.0 server over stdio
-  mintrun audit                                               View zero-secret execution audit trail`)
+  mintrun audit                                               View zero-secret execution audit trail
+  mintrun version                                             Print the version, Go version and platform`)
 }
 
 func withoutShimsOnPath(homeDir string) func() {
