@@ -1096,10 +1096,13 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 	// and the entry records no sandbox, since no verdict allowed one.
 	t.Run("sandbox", func(t *testing.T) {
 		userHome, stub, dangling := t.TempDir(), filepath.Join(t.TempDir(), "sandbox-exec"), filepath.Join(t.TempDir(), "home")
-		if err := errors.Join(os.MkdirAll(filepath.Join(userHome, "Library", "Keychains"), 0o700), os.WriteFile(stub, nil, 0o700), os.Symlink(dangling+".missing", dangling)); err != nil {
+		if err := errors.Join(os.MkdirAll(filepath.Join(userHome, "Library", "Keychains"), 0o700), os.WriteFile(stub, []byte("#!/bin/sh\nexit 0\n"), 0o700), os.Symlink(dangling+".missing", dangling)); err != nil {
 			t.Fatal(err)
 		}
-		defer func(p string) { core.SandboxExecPath = p }(core.SandboxExecPath)
+		defer func(p, lp, rd string, fn func(*exec.Cmd)) {
+			core.SandboxExecPath, core.LinuxSandboxPath, core.LinuxRunDir, core.LinuxSandboxSysProcAttr = p, lp, rd, fn
+		}(core.SandboxExecPath, core.LinuxSandboxPath, core.LinuxRunDir, core.LinuxSandboxSysProcAttr)
+		core.LinuxSandboxPath = ""
 		t.Chdir(t.TempDir()) // an unset home reads policy.json and the pause file from here
 		req := probe("ok.com", []string{"dns:read"}, "true")
 		req.Sandbox = true
@@ -1114,6 +1117,83 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 		} {
 			core.SandboxExecPath = c.sandboxExec
 			t.Setenv("HOME", c.userHome)
+			srt := core.NewRuntime(c.home, "keychain", reg)
+			d := srt.CheckPolicy(req)
+			_, err := srt.ExecBlind(ctx, req)
+			if want := "policy denied: sandbox is on, but " + c.cause; d.Allowed || d.Reason != want || d.BlockedBy != "sandbox" || err == nil || err.Error() != want {
+				t.Errorf("%s: decision %+v, exec error %v, want both to deny with %q", c.cause, d, err, want)
+			}
+		}
+
+		// Linux namespace sandbox failure modes (probed when SandboxExecPath is empty).
+		core.SandboxExecPath = ""
+		core.LinuxSandboxSysProcAttr(&exec.Cmd{})
+		core.LinuxSandboxSysProcAttr = func(*exec.Cmd) {}
+		failMsg, failSilent := filepath.Join(t.TempDir(), "fail-msg"), filepath.Join(t.TempDir(), "fail-silent")
+		if err := errors.Join(
+			os.WriteFile(failMsg, []byte("#!/bin/sh\necho 'operation not permitted' >&2\nexit 126\n"), 0o700),
+			os.WriteFile(failSilent, []byte("#!/bin/sh\nexit 126\n"), 0o700),
+		); err != nil {
+			t.Fatal(err)
+		}
+		badKeyringLink, badKeyringFile := t.TempDir(), t.TempDir()
+		badXDGData, badXDGRunKeyring, badXDGRunBus := t.TempDir(), t.TempDir(), t.TempDir()
+		runLink, runBusDir, runKeyringFile := t.TempDir(), t.TempDir(), t.TempDir()
+		uid := strconv.Itoa(os.Getuid())
+		if err := errors.Join(
+			os.MkdirAll(filepath.Join(badKeyringLink, ".local", "share"), 0o700),
+			os.Symlink(dangling+".missing", filepath.Join(badKeyringLink, ".local", "share", "keyrings")),
+			os.MkdirAll(filepath.Join(badKeyringFile, ".local", "share"), 0o700),
+			os.WriteFile(filepath.Join(badKeyringFile, ".local", "share", "keyrings"), nil, 0o600),
+			os.WriteFile(filepath.Join(badXDGData, "keyrings"), nil, 0o600),
+			os.WriteFile(filepath.Join(badXDGRunKeyring, "keyring"), nil, 0o600),
+			os.MkdirAll(filepath.Join(badXDGRunBus, "bus"), 0o700),
+			os.MkdirAll(filepath.Join(runLink, uid), 0o700),
+			os.Symlink(dangling+".missing", filepath.Join(runLink, uid, "bus")),
+			os.MkdirAll(filepath.Join(runBusDir, uid, "bus"), 0o700),
+			os.MkdirAll(filepath.Join(runKeyringFile, uid), 0o700),
+			os.WriteFile(filepath.Join(runKeyringFile, uid, "keyring"), nil, 0o600),
+		); err != nil {
+			t.Fatal(err)
+		}
+		cleanRun := t.TempDir()
+		for _, c := range []struct {
+			linuxSandbox, home, userHome, xdgData, xdgRun, runDir, dbus, cause string
+		}{
+			{stub + ".missing", home, userHome, "", "", cleanRun, "", "the Linux sandbox cannot be used (no such file or directory)"},
+			{stub, "", userHome, "", "", cleanRun, "", "mintrun's home cannot be resolved (not set)"},
+			{stub, filepath.Join(t.TempDir(), "missing", "home"), userHome, "", "", cleanRun, "", "mintrun's home cannot be resolved (no such file or directory)"},
+			{stub, dangling, userHome, "", "", cleanRun, "", "mintrun's home cannot be resolved (no such file or directory)"},
+			{stub, home, "", "", "", cleanRun, "", "the keyring folder cannot be resolved ($HOME is not defined)"},
+			{stub, home, dangling, "", "", cleanRun, "", "the keyring folder cannot be resolved (no such file or directory)"},
+			{stub, home, badKeyringLink, "", "", cleanRun, "", "the keyring folder cannot be resolved (no such file or directory)"},
+			{stub, home, badKeyringFile, "", "", cleanRun, "", "the keyring folder cannot be resolved (not a directory)"},
+			{stub, home, userHome, "rel/data", "", cleanRun, "", "the keyring folder cannot be resolved (XDG_DATA_HOME must be an absolute path)"},
+			{stub, home, userHome, badXDGData, "", cleanRun, "", "the keyring folder cannot be resolved (not a directory)"},
+			{stub, home, userHome, "", "rel/run", cleanRun, "", "the keyring folder cannot be resolved (XDG_RUNTIME_DIR must be an absolute path)"},
+			{stub, home, userHome, "", badXDGRunKeyring, cleanRun, "", "the keyring folder cannot be resolved (not a directory)"},
+			{stub, home, userHome, "", "", runKeyringFile, "", "the keyring folder cannot be resolved (not a directory)"},
+			{stub, home, userHome, "", "", runLink, "", "the D-Bus session bus cannot be hidden (no such file or directory)"},
+			{stub, home, userHome, "", "", runBusDir, "", "the D-Bus session bus cannot be hidden (is a directory)"},
+			{stub, home, userHome, "", badXDGRunBus, cleanRun, "", "the D-Bus session bus cannot be hidden (is a directory)"},
+			{stub, home, userHome, "", "", cleanRun, "unix:abstract=/tmp/dbus-123", "the D-Bus session bus cannot be hidden (unsupported DBUS_SESSION_BUS_ADDRESS)"},
+			{stub, home, userHome, "", "", cleanRun, "tcp:host=127.0.0.1,port=1234", "the D-Bus session bus cannot be hidden (unsupported DBUS_SESSION_BUS_ADDRESS)"},
+			{stub, home, userHome, "", "", cleanRun, "unix:path=" + stub + ";unix:path=" + stub, "the D-Bus session bus cannot be hidden (unsupported DBUS_SESSION_BUS_ADDRESS)"},
+			{stub, home, userHome, "", "", cleanRun, "unix:path=" + stub + "%20", "the D-Bus session bus cannot be hidden (unsupported DBUS_SESSION_BUS_ADDRESS)"},
+			{stub, home, userHome, "", "", cleanRun, "unix:path=rel/bus", "the D-Bus session bus cannot be hidden (unsupported DBUS_SESSION_BUS_ADDRESS)"},
+			{stub, home, userHome, "", "", cleanRun, "unix:guid=0123", "the D-Bus session bus cannot be hidden (unsupported DBUS_SESSION_BUS_ADDRESS)"},
+			{stub, home, userHome, "", "", cleanRun, "unix:path=" + stub + ",path=" + stub, "the D-Bus session bus cannot be hidden (unsupported DBUS_SESSION_BUS_ADDRESS)"},
+			{stub, home, userHome, "", "", cleanRun, "unix:path=" + stub + ",bad", "the D-Bus session bus cannot be hidden (unsupported DBUS_SESSION_BUS_ADDRESS)"},
+			{stub, home, userHome, "", "", cleanRun, "unix:path=" + stub + ".missing", "the D-Bus session bus cannot be hidden (no such file or directory)"},
+			{stub, home, userHome, "", "", cleanRun, "unix:path=" + userHome, "the D-Bus session bus cannot be hidden (is a directory)"},
+			{failMsg, home, userHome, "", "", cleanRun, "", "the Linux sandbox cannot be used (operation not permitted)"},
+			{failSilent, home, userHome, "", "", cleanRun, "", "the Linux sandbox cannot be used (exit status 126)"},
+		} {
+			core.LinuxSandboxPath, core.LinuxRunDir = c.linuxSandbox, c.runDir
+			t.Setenv("HOME", c.userHome)
+			t.Setenv("XDG_DATA_HOME", c.xdgData)
+			t.Setenv("XDG_RUNTIME_DIR", c.xdgRun)
+			t.Setenv("DBUS_SESSION_BUS_ADDRESS", c.dbus)
 			srt := core.NewRuntime(c.home, "keychain", reg)
 			d := srt.CheckPolicy(req)
 			_, err := srt.ExecBlind(ctx, req)
@@ -1338,6 +1418,232 @@ func TestExecBlindSandbox(t *testing.T) {
 	if e := lastAudit(t, home); err != nil || !slices.Equal(e.Command, req.Command) || !bytes.Contains(raw, []byte(`"sandbox":true`)) ||
 		bytes.Contains(raw, []byte("sandbox-exec")) || bytes.Contains(raw, []byte("MINTRUN_DIR")) || bytes.Contains(raw, []byte("(version 1)")) {
 		t.Errorf("audit log names the sandbox prefix or lacks \"sandbox\":true (err %v):\n%s", err, raw)
+	}
+}
+
+// linuxSandboxStub points LinuxSandboxPath (with SandboxExecPath cleared) at a script that exits 0
+// on CheckPolicy's dry-run probe (no command after "--") and, when given a command after "--",
+// verifies that dirs[0] exists on disk, logs its arguments to calls.log, and execs the command.
+// It also records every cmd.Args[1:] passed to LinuxSandboxSysProcAttr.
+func linuxSandboxStub(t *testing.T) (calls, sysProc func() [][]string) {
+	t.Helper()
+	dir := t.TempDir()
+	stub, log := filepath.Join(dir, "mintrun-linux-sandbox"), filepath.Join(dir, "calls.log")
+	script := "#!/bin/sh\nfor last; do :; done\nif [ \"$last\" = \"--\" ]; then exit 0; fi\n[ -d \"$3\" ] || exit 126\nprintf '%s\\0' \"$@\" END >>\"${0%/*}/calls.log\"\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n"
+	if err := os.WriteFile(stub, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var attrs [][]string
+	oldS, oldL, oldFn := core.SandboxExecPath, core.LinuxSandboxPath, core.LinuxSandboxSysProcAttr
+	core.SandboxExecPath, core.LinuxSandboxPath = "", stub
+	core.LinuxSandboxSysProcAttr = func(cmd *exec.Cmd) {
+		attrs = append(attrs, slices.Clone(cmd.Args[1:]))
+	}
+	t.Cleanup(func() {
+		core.SandboxExecPath, core.LinuxSandboxPath, core.LinuxSandboxSysProcAttr = oldS, oldL, oldFn
+	})
+	return func() [][]string {
+			t.Helper()
+			raw, err := os.ReadFile(log)
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			if err := errors.Join(err, os.Remove(log)); err != nil {
+				t.Fatal(err)
+			}
+			var out [][]string
+			args := []string{}
+			for _, a := range strings.Split(strings.TrimSuffix(string(raw), "\x00"), "\x00") {
+				if a == "END" {
+					out, args = append(out, args), []string{}
+				} else {
+					args = append(args, a)
+				}
+			}
+			return out
+		}, func() [][]string {
+			out := attrs
+			attrs = nil
+			return out
+		}
+}
+
+// TestExecBlindLinuxSandbox pins the Linux namespace sandbox prefix: hidden directories and socket
+// files are resolved through symlinks, deduplicated, and collapsed when one lies under another;
+// CheckPolicy probes without creating a missing home on disk while ExecBlind creates it before
+// mounting; LinuxSandboxSysProcAttr runs on both the probe and the child; and the audit log keeps
+// the command as asked.
+func TestExecBlindLinuxSandbox(t *testing.T) {
+	t.Setenv("MINTRUN_APPROVE", "")
+	ctx := context.Background()
+	calls, sysProc := linuxSandboxStub(t)
+	rt, home := probeRuntime(t, "linux_sandbox_master_secret")
+	userHome, runRoot := t.TempDir(), t.TempDir()
+	defer func(rd string) { core.LinuxRunDir = rd }(core.LinuxRunDir)
+	core.LinuxRunDir = runRoot
+	t.Setenv("HOME", userHome)
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "")
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	real := func(p string) string {
+		t.Helper()
+		r, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	save := func(rules string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(home, "policy.json"), []byte(rules), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := func(name string, r *core.Runtime, req core.ExecRequest, wantArgs []string) {
+		t.Helper()
+		_ = sysProc()
+		res, err := r.ExecBlind(ctx, req)
+		var wantCalls, wantAttrs [][]string
+		if wantArgs != nil {
+			wantCalls = [][]string{wantArgs}
+			wantAttrs = [][]string{wantArgs[:len(wantArgs)-3], wantArgs}
+		}
+		if gotCalls, gotAttrs := calls(), sysProc(); err != nil || res.ExitCode != 3 ||
+			!slices.EqualFunc(gotCalls, wantCalls, slices.Equal) || !slices.EqualFunc(gotAttrs, wantAttrs, slices.Equal) {
+			t.Errorf("%s: res=%+v err=%v\ncalls %q\nwant  %q\nattrs %q\nwant  %q", name, res, err, gotCalls, wantCalls, gotAttrs, wantAttrs)
+		}
+		if e := lastAudit(t, r.HomeDir); e.ExitCode != 3 || e.Sandbox != (wantArgs != nil) {
+			t.Errorf("%s: audit entry %+v, want sandbox %v", name, e, wantArgs != nil)
+		}
+	}
+
+	req := core.ExecRequest{MintRequest: core.MintRequest{Provider: "probe"}, Command: []string{"sh", "-c", "exit 3"}}
+	asked := req
+	asked.Sandbox = true
+	baseWant := []string{"-mintrun-linux-sandbox", "-hide-dir", real(home), "--", sh, "-c", "exit 3"}
+	for _, c := range []struct {
+		name, policy string
+		req          core.ExecRequest
+		want         []string
+	}{
+		{"neither", `{}`, req, nil},
+		{"request", `{}`, asked, baseWant},
+		{"policy", `{"probe":{"sandbox":true}}`, req, baseWant},
+	} {
+		save(c.policy)
+		if d := rt.CheckPolicy(c.req); !d.Allowed || d.Sandbox != (c.want != nil) {
+			t.Errorf("%s: decision %+v", c.name, d)
+		}
+		run(c.name, rt, c.req, c.want)
+	}
+
+	// Symlinked home and relative home not created yet: CheckPolicy must not create the missing
+	// directory on disk (rule 16), while ExecBlind creates it before the sandbox mounts over it.
+	save(`{}`)
+	link := filepath.Join(t.TempDir(), "home-link")
+	if err := os.Symlink(home, link); err != nil {
+		t.Fatal(err)
+	}
+	run("symlinked home", core.NewRuntime(link, "keychain", rt.Registry), asked, baseWant)
+	parent := t.TempDir()
+	t.Chdir(parent)
+	rel := core.NewRuntime("rel", "keychain", rt.Registry)
+	if d := rel.CheckPolicy(asked); !d.Allowed || !d.Sandbox {
+		t.Fatalf("CheckPolicy on missing relative home: %+v", d)
+	}
+	if _, err := os.Lstat(filepath.Join(parent, "rel")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("CheckPolicy created missing home directory: err=%v", err)
+	}
+	relWant := []string{"-mintrun-linux-sandbox", "-hide-dir", filepath.Join(real(parent), "rel"), "--", sh, "-c", "exit 3"}
+	run("relative home not created yet", rel, asked, relWant)
+	run("relative home", rel, asked, relWant)
+
+	// Every optional keyring directory and D-Bus socket file is resolved and passed in order.
+	userKeyrings := filepath.Join(userHome, ".local", "share", "keyrings")
+	xdgData, xdgRun := t.TempDir(), t.TempDir()
+	xdgDataKeyrings := filepath.Join(xdgData, "keyrings")
+	xdgRunKeyring := filepath.Join(xdgRun, "keyring")
+	xdgRunBus := filepath.Join(xdgRun, "bus")
+	uidDir := filepath.Join(runRoot, strconv.Itoa(os.Getuid()))
+	uidKeyring := filepath.Join(uidDir, "keyring")
+	uidBus := filepath.Join(uidDir, "bus")
+	dbusSock := filepath.Join(t.TempDir(), "custom-bus")
+	if err := errors.Join(
+		os.MkdirAll(userKeyrings, 0o700),
+		os.MkdirAll(xdgDataKeyrings, 0o700),
+		os.MkdirAll(xdgRunKeyring, 0o700),
+		os.WriteFile(xdgRunBus, nil, 0o600),
+		os.MkdirAll(uidKeyring, 0o700),
+		os.WriteFile(uidBus, nil, 0o600),
+		os.WriteFile(dbusSock, nil, 0o600),
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_DATA_HOME", xdgData)
+	t.Setenv("XDG_RUNTIME_DIR", xdgRun)
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path="+dbusSock+",guid=0123456789abcdef0123456789abcdef")
+	allWant := []string{
+		"-mintrun-linux-sandbox",
+		"-hide-dir", real(home),
+		"-hide-dir", real(userKeyrings),
+		"-hide-dir", real(xdgDataKeyrings),
+		"-hide-dir", real(uidKeyring),
+		"-hide-dir", real(xdgRunKeyring),
+		"-hide-file", real(uidBus),
+		"-hide-file", real(xdgRunBus),
+		"-hide-file", real(dbusSock),
+		"--", sh, "-c", "exit 3",
+	}
+	run("all dirs and sockets", rt, asked, allWant)
+
+	// Subpath collapsing and socket deduplication:
+	// - XDG_DATA_HOME inside home is already covered by home;
+	// - XDG_RUNTIME_DIR/bus inside home is already covered by home;
+	// - DBUS_SESSION_BUS_ADDRESS pointing to uidBus is deduplicated;
+	// - a runtime whose home is inside userKeyrings collapses dirs[0] to userKeyrings.
+	inHomeData := filepath.Join(home, "xdg-data")
+	inHomeRun := filepath.Join(home, "xdg-run")
+	if err := errors.Join(
+		os.MkdirAll(filepath.Join(inHomeData, "keyrings"), 0o700),
+		os.MkdirAll(inHomeRun, 0o700),
+		os.WriteFile(filepath.Join(inHomeRun, "bus"), nil, 0o600),
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_DATA_HOME", inHomeData)
+	t.Setenv("XDG_RUNTIME_DIR", inHomeRun)
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path="+uidBus)
+	collapsedWant := []string{
+		"-mintrun-linux-sandbox",
+		"-hide-dir", real(home),
+		"-hide-dir", real(userKeyrings),
+		"-hide-dir", real(uidKeyring),
+		"-hide-file", real(uidBus),
+		"--", sh, "-c", "exit 3",
+	}
+	run("subpath and duplicate socket collapsed", rt, asked, collapsedWant)
+
+	nestedHome := filepath.Join(userKeyrings, "nested-mintrun")
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "")
+	parentCollapsedWant := []string{
+		"-mintrun-linux-sandbox",
+		"-hide-dir", real(userKeyrings),
+		"-hide-dir", real(uidKeyring),
+		"-hide-file", real(uidBus),
+		"--", sh, "-c", "exit 3",
+	}
+	run("parent replaces child dir", core.NewRuntime(nestedHome, "keychain", rt.Registry), asked, parentCollapsedWant)
+
+	raw, err := os.ReadFile(filepath.Join(home, "audit.jsonl"))
+	if e := lastAudit(t, home); err != nil || !slices.Equal(e.Command, req.Command) || !bytes.Contains(raw, []byte(`"sandbox":true`)) ||
+		bytes.Contains(raw, []byte("-mintrun-linux-sandbox")) || bytes.Contains(raw, []byte("-hide-dir")) || bytes.Contains(raw, []byte("-hide-file")) {
+		t.Errorf("audit log names the Linux sandbox prefix or lacks \"sandbox\":true (err %v):\n%s", err, raw)
 	}
 }
 

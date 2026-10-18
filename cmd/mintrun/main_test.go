@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -328,18 +329,28 @@ func TestCLISecretCheckConfigured(t *testing.T) {
 	}
 }
 
-// TestCLIExecSandbox: -sandbox runs the command behind sandbox-exec, which hands back the
-// command's exit code, and exec without it runs the command directly.
+// TestCLIExecSandbox: -sandbox runs the command behind sandbox-exec (or the Linux namespace
+// sandbox when SandboxExecPath is empty), which hands back the command's exit code, and exec
+// without it runs the command directly.
 func TestCLIExecSandbox(t *testing.T) {
 	home, _ := setupEnv(t)
 	writeFile(t, filepath.Join(home, ".mintrun", "policy.json"), `{"cloudflare":{"allow_static":true}}`)
 	setSecret(t, "cloudflare", "cf-"+leak)
 	stub := filepath.Join(home, "bin", "sandbox-exec")
+	linuxStub := filepath.Join(home, "bin", "mintrun-linux-sandbox")
 	writeFile(t, stub, stubLog+"while [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n")
-	if err := errors.Join(os.Chmod(stub, 0o755), os.MkdirAll(filepath.Join(home, "Library", "Keychains"), 0o700)); err != nil {
+	writeFile(t, linuxStub, "#!/bin/sh\nfor last; do :; done\nif [ \"$last\" = \"--\" ]; then exit 0; fi\n"+
+		strings.TrimPrefix(stubLog, "#!/bin/sh\n")+"while [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n")
+	if err := errors.Join(
+		os.Chmod(stub, 0o755),
+		os.Chmod(linuxStub, 0o755),
+		os.MkdirAll(filepath.Join(home, "Library", "Keychains"), 0o700),
+	); err != nil {
 		t.Fatal(err)
 	}
-	defer func(p string) { core.SandboxExecPath = p }(core.SandboxExecPath)
+	defer func(p, lp string, fn func(*exec.Cmd)) {
+		core.SandboxExecPath, core.LinuxSandboxPath, core.LinuxSandboxSysProcAttr = p, lp, fn
+	}(core.SandboxExecPath, core.LinuxSandboxPath, core.LinuxSandboxSysProcAttr)
 	core.SandboxExecPath = stub
 	for _, flags := range [][]string{{"-sandbox"}, nil} {
 		r := runCLI(t, "", nil, append(append([]string{"exec"}, flags...), "-provider", "cloudflare", "-perms", "static", "--", "/bin/sh", "-c", "exit 7")...)
@@ -347,6 +358,15 @@ func TestCLIExecSandbox(t *testing.T) {
 		sandboxed := strings.HasPrefix(calls, "sandbox-exec -p (version 1)\n") && strings.HasSuffix(calls, " -- /bin/sh -c exit 7\n")
 		if r.code != 7 || !r.exited || sandboxed != (flags != nil) || flags == nil && calls != "" {
 			t.Errorf("%v: exit %d (exited %v), stderr %q, stub calls %q", flags, r.code, r.exited, r.err, calls)
+		}
+	}
+	core.SandboxExecPath, core.LinuxSandboxPath, core.LinuxSandboxSysProcAttr = "", linuxStub, func(*exec.Cmd) {}
+	for _, flags := range [][]string{{"-sandbox"}, nil} {
+		r := runCLI(t, "", nil, append(append([]string{"exec"}, flags...), "-provider", "cloudflare", "-perms", "static", "--", "/bin/sh", "-c", "exit 7")...)
+		calls := takeCalls(t, home)
+		sandboxed := strings.HasPrefix(calls, "mintrun-linux-sandbox -mintrun-linux-sandbox -hide-dir ") && strings.HasSuffix(calls, " -- /bin/sh -c exit 7\n")
+		if r.code != 7 || !r.exited || sandboxed != (flags != nil) || flags == nil && calls != "" {
+			t.Errorf("linux %v: exit %d (exited %v), stderr %q, stub calls %q", flags, r.code, r.exited, r.err, calls)
 		}
 	}
 }

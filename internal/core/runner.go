@@ -350,13 +350,28 @@ func (rt *Runtime) decide(req ExecRequest) (PolicyDecision, []string, []string) 
 }
 
 // SandboxExecPath is the macOS sandbox runner a sandboxed exec goes through, a var so tests can
-// stub it; it is empty on every other OS, where the sandbox is a denial.
+// stub it; it is empty on every other OS.
 var SandboxExecPath = func() string {
 	if runtime.GOOS == "darwin" {
 		return "/usr/bin/sandbox-exec"
 	}
 	return ""
 }()
+
+// LinuxSandboxPath is the executable re-invoked in a new user and mount namespace on Linux
+// (os.Executable() on linux, empty elsewhere), and LinuxRunDir is the per-UID runtime directory
+// root ("/run/user"), both vars so tests on any OS can stub them.
+var (
+	LinuxSandboxPath = func() string {
+		if runtime.GOOS == "linux" {
+			if p, err := os.Executable(); err == nil {
+				return p
+			}
+		}
+		return ""
+	}()
+	LinuxRunDir = "/run/user"
+)
 
 // sandboxProfile allows everything except mintrun's home, the Keychain folder, and the Mach
 // services the Security framework reaches the Keychain through.
@@ -376,11 +391,14 @@ const sandboxProfile = `(version 1)
   (global-name "com.apple.security.escrow-update"))
 `
 
-// sandboxArgv returns the sandbox-exec argv the command goes behind. The profile matches real
-// paths, so both folders are made absolute and their symlinks resolved. A reason keeps only the
-// error's cause, never a path (rule 36): it reaches agents and audit.jsonl.
+// sandboxArgv returns the sandbox runner argv the command goes behind. The profile or mount table
+// matches real paths, so folders and sockets are made absolute and their symlinks resolved. A
+// reason keeps only the error's cause, never a path (rule 36): it reaches agents and audit.jsonl.
 func sandboxArgv(homeDir string) ([]string, error) {
 	if SandboxExecPath == "" {
+		if LinuxSandboxPath != "" {
+			return linuxSandboxArgv(homeDir)
+		}
 		return nil, errors.New("this host has no sandbox-exec (macOS only)")
 	}
 	if _, err := os.Stat(SandboxExecPath); err != nil {
@@ -399,6 +417,168 @@ func sandboxArgv(homeDir string) ([]string, error) {
 		return nil, fmt.Errorf("the Keychain folder cannot be resolved (%v)", pathCause(err))
 	}
 	return []string{SandboxExecPath, "-p", sandboxProfile, "-D", "MINTRUN_DIR=" + dir, "-D", "KEYCHAINS=" + keychains, "--"}, nil
+}
+
+// linuxSandboxArgv builds and probes the Linux user+mount namespace sandbox prefix: a read-only
+// mode-000 tmpfs over mintrun's home and the keyring folders (~/.local/share/keyrings,
+// $XDG_DATA_HOME/keyrings, /run/user/<uid>/keyring, $XDG_RUNTIME_DIR/keyring), and /dev/null
+// bind-mounted over the D-Bus session bus sockets (/run/user/<uid>/bus, $XDG_RUNTIME_DIR/bus, and
+// $DBUS_SESSION_BUS_ADDRESS). Any non-filesystem D-Bus address or blocked user/mount namespace
+// fails closed before any vault opens.
+func linuxSandboxArgv(homeDir string) ([]string, error) {
+	dir, err := realDir(homeDir)
+	if err != nil {
+		return nil, fmt.Errorf("mintrun's home cannot be resolved (%v)", pathCause(err))
+	}
+	dirs := []string{dir}
+	var files []string
+	addDir := func(p string) error {
+		real, ok, err := realExisting(p)
+		if err != nil || !ok {
+			return err
+		}
+		if info, err := os.Stat(real); err != nil || !info.IsDir() {
+			return errors.New("not a directory")
+		}
+		for i, d := range dirs {
+			if subpath(d, real) {
+				return nil
+			}
+			if subpath(real, d) {
+				dirs[i] = real
+				return nil
+			}
+		}
+		dirs = append(dirs, real)
+		return nil
+	}
+	addFile := func(p string) error {
+		real, ok, err := realExisting(p)
+		if err != nil || !ok {
+			return err
+		}
+		if info, err := os.Stat(real); err != nil || info.IsDir() {
+			return errors.New("is a directory")
+		}
+		for _, d := range dirs {
+			if subpath(d, real) {
+				return nil
+			}
+		}
+		if !slices.Contains(files, real) {
+			files = append(files, real)
+		}
+		return nil
+	}
+	userHome, err := os.UserHomeDir()
+	if err == nil {
+		userHome, err = filepath.EvalSymlinks(userHome)
+	}
+	if err == nil {
+		err = addDir(filepath.Join(userHome, ".local", "share", "keyrings"))
+	}
+	if xdgData := os.Getenv("XDG_DATA_HOME"); err == nil && xdgData != "" {
+		if !filepath.IsAbs(xdgData) {
+			err = errors.New("XDG_DATA_HOME must be an absolute path")
+		} else {
+			err = addDir(filepath.Join(xdgData, "keyrings"))
+		}
+	}
+	runDirs := []string{filepath.Join(LinuxRunDir, strconv.Itoa(os.Getuid()))}
+	if xdgRun := os.Getenv("XDG_RUNTIME_DIR"); err == nil && xdgRun != "" {
+		if !filepath.IsAbs(xdgRun) {
+			err = errors.New("XDG_RUNTIME_DIR must be an absolute path")
+		} else {
+			runDirs = append(runDirs, xdgRun)
+		}
+	}
+	for _, rd := range runDirs {
+		if err == nil {
+			err = addDir(filepath.Join(rd, "keyring"))
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("the keyring folder cannot be resolved (%v)", pathCause(err))
+	}
+	for _, rd := range runDirs {
+		if err = addFile(filepath.Join(rd, "bus")); err != nil {
+			break
+		}
+	}
+	if bus := os.Getenv("DBUS_SESSION_BUS_ADDRESS"); err == nil && bus != "" {
+		var sock string
+		sock, err = dbusSocketPath(bus)
+		if err == nil {
+			err = addFile(sock)
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("the D-Bus session bus cannot be hidden (%v)", pathCause(err))
+	}
+	argv := []string{LinuxSandboxPath, "-mintrun-linux-sandbox"}
+	for _, d := range dirs {
+		argv = append(argv, "-hide-dir", d)
+	}
+	for _, f := range files {
+		argv = append(argv, "-hide-file", f)
+	}
+	argv = append(argv, "--")
+	probe := exec.Command(argv[0], argv[1:]...)
+	LinuxSandboxSysProcAttr(probe)
+	var stderr bytes.Buffer
+	probe.Stderr = &stderr
+	if err := probe.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = pathCause(err).Error()
+		}
+		return nil, fmt.Errorf("the Linux sandbox cannot be used (%s)", msg)
+	}
+	return argv, nil
+}
+
+// realExisting resolves an absolute path p when it exists on disk. A missing path whose existing
+// prefix resolves returns ("", false, nil); a dangling symlink or any other error fails.
+func realExisting(p string) (string, bool, error) {
+	if real, err := filepath.EvalSymlinks(p); err == nil {
+		return real, true, nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return "", false, err
+	}
+	for cur := p; ; cur = filepath.Dir(cur) {
+		if _, err := os.Lstat(cur); !errors.Is(err, fs.ErrNotExist) {
+			_, err := filepath.EvalSymlinks(cur)
+			return "", false, err
+		}
+	}
+}
+
+// dbusSocketPath extracts and resolves the filesystem socket path from a D-Bus unix:path=...
+// address. Any other address (unix:abstract=..., tcp:..., autolaunch:, multiple ";" addresses,
+// percent escapes, or a relative path) is refused because a mount namespace cannot hide it.
+func dbusSocketPath(addr string) (string, error) {
+	rest, ok := strings.CutPrefix(addr, "unix:")
+	if !ok || strings.ContainsAny(rest, ";%") {
+		return "", errors.New("unsupported DBUS_SESSION_BUS_ADDRESS")
+	}
+	var path string
+	for _, part := range strings.Split(rest, ",") {
+		k, v, ok := strings.Cut(part, "=")
+		if !ok || (k != "path" && k != "guid") || (k == "path" && (path != "" || !filepath.IsAbs(v))) {
+			return "", errors.New("unsupported DBUS_SESSION_BUS_ADDRESS")
+		}
+		if k == "path" {
+			path = v
+		}
+	}
+	if path == "" {
+		return "", errors.New("unsupported DBUS_SESSION_BUS_ADDRESS")
+	}
+	return filepath.EvalSymlinks(path)
+}
+
+func subpath(parent, p string) bool {
+	return p == parent || strings.HasPrefix(p, strings.TrimRight(parent, string(filepath.Separator))+string(filepath.Separator))
 }
 
 // pathCause drops the path from a *fs.PathError, keeping only its cause (rule 36).
@@ -703,13 +883,17 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 	defer cancel()
 
 	cmd := exec.CommandContext(execCtx, req.Command[0], req.Command[1:]...)
+	killProcessGroup(cmd) // a timeout or cancel kills the child's whole process group (audit L2)
 	if sandbox != nil {
-		// sandbox-exec execs the resolved command in place, so the pid, the process group, and the
-		// exit code are the command's; a failed lookup (cmd.Err) still fails Start first.
+		// The sandbox runner execs the resolved command in place, so the pid, the process group,
+		// and the exit code are the command's; a failed lookup (cmd.Err) still fails Start first.
 		cmd.Args = append(append(sandbox, cmd.Path), req.Command[1:]...)
 		cmd.Path = sandbox[0]
+		if len(sandbox) > 3 && sandbox[1] == "-mintrun-linux-sandbox" {
+			_ = os.MkdirAll(sandbox[3], 0o700)
+			LinuxSandboxSysProcAttr(cmd)
+		}
 	}
-	killProcessGroup(cmd) // a timeout or cancel kills the child's whole process group (audit L2)
 	cmd.WaitDelay = PipeWaitDelay
 	if req.WorkingDir != "" {
 		cmd.Dir = req.WorkingDir
