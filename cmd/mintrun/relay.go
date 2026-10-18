@@ -6,6 +6,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -132,6 +134,7 @@ func serveRelay(ctx context.Context, rt *core.Runtime, listenAddr, certFile, key
 	httpSrv := &http.Server{
 		Handler:           srv,
 		ReadHeaderTimeout: 10 * time.Second,
+		ErrorLog:          log.New(io.Discard, "", 0),
 	}
 	fmt.Printf("mintrun relay listening on https://%s#sha256=%s\n", ln.Addr().String(), pin)
 

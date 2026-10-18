@@ -913,18 +913,25 @@ func TestCLIRelay(t *testing.T) {
 		srvDone <- serveRelay(srvCtx, serverRT, addr, certFile, keyFile)
 	}()
 
-	// Wait until the relay server is accepting connections.
+	// Wait until the relay server is accepting connections (ensuring serveRelay's startup
+	// fmt.Printf has completed before runCLI swaps os.Stdout).
 	relayURL := "https://" + addr + "#sha256=" + pin
-	t.Setenv("MINTRUN_HOME", clientHome)
-	setSecret(t, "relay", devToken) // store device token in client's default vault under key "relay"
-	var execOut cliResult
+	probeClient, err := builtin.NewRelayClient(relayURL, func(context.Context) (string, error) { return devToken, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
 	for range 40 {
-		execOut = runCLI(t, "", nil, "exec", "-relay", relayURL, "-provider", "cli-relay-prov", "-scope", "zone1", "--", "sh", "-c", `printf "val=%s" "$CLI_RELAY_TOKEN"`)
-		if execOut.exited && execOut.code == 0 {
+		if d := probeClient.CheckPolicy(context.Background(), core.ExecRequest{
+			MintRequest: core.MintRequest{Provider: "cli-relay-prov", Scope: "zone1"},
+			Command:     []string{"true"},
+		}); d.Allowed {
 			break
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
+	t.Setenv("MINTRUN_HOME", clientHome)
+	setSecret(t, "relay", devToken) // store device token in client's default vault under key "relay"
+	execOut := runCLI(t, "", nil, "exec", "-relay", relayURL, "-provider", "cli-relay-prov", "-scope", "zone1", "--", "sh", "-c", `printf "val=%s" "$CLI_RELAY_TOKEN"`)
 	if !execOut.exited || execOut.code != 0 || execOut.out != "val=[MINTRUN:REDACTED]" {
 		srvCancel()
 		t.Fatalf("exec -relay failed: %+v", execOut)

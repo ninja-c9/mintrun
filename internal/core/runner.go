@@ -790,12 +790,13 @@ func ApprovalText(header string, req ExecRequest, limit int) string {
 	if req.NoNetwork {
 		network = "blocked"
 	}
-	text := fmt.Sprintf("%s\n\nSandbox: %s\nNetwork: %s\nProvider: %q\nVault: %s\nScope: %q\nPermissions: %s\nParams: %s\nCommand: %s\nWorking directory: %s",
-		header, sandbox, network, req.Provider, orUnset(req.Vault, "(not set: the default vault)"), req.Scope, quote(req.Permissions),
-		strings.Join(params, " "), quote(req.Command), orUnset(req.WorkingDir, "(not set: mintrun's own)"))
+	device := ""
 	if req.Device != "" {
-		text += "\nDevice: " + strconv.Quote(req.Device)
+		device = "\nDevice: " + strconv.Quote(req.Device)
 	}
+	text := fmt.Sprintf("%s\n\nSandbox: %s\nNetwork: %s%s\nProvider: %q\nVault: %s\nScope: %q\nPermissions: %s\nParams: %s\nCommand: %s\nWorking directory: %s",
+		header, sandbox, network, device, req.Provider, orUnset(req.Vault, "(not set: the default vault)"), req.Scope, quote(req.Permissions),
+		strings.Join(params, " "), quote(req.Command), orUnset(req.WorkingDir, "(not set: mintrun's own)"))
 	if req.Purpose != "" {
 		text += "\nPurpose: " + strconv.Quote(req.Purpose)
 	}

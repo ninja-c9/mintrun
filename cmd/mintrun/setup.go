@@ -399,8 +399,8 @@ func (w *wizard) ask(prompt string) string {
 }
 
 func (w *wizard) askHidden(prompt string) string {
-	fmt.Print(prompt + " (typing stays hidden): ")
 	hidden := setEcho(false)
+	fmt.Print(prompt + " (typing stays hidden): ")
 	s := w.read(hidden)
 	if hidden {
 		setEcho(true) // not deferred: fatal exits without running defers

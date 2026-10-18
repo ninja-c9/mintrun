@@ -607,26 +607,37 @@ func TestCLIInit(t *testing.T) {
 
 	t.Run("interrupt", func(t *testing.T) {
 		home, _ := setupEnv(t)
-		rt, err := bootRuntime()
-		if err != nil {
-			t.Fatal(err)
+		interrupt := func(waitFor string, args ...string) {
+			t.Helper()
+			inR, inW, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer inR.Close()
+			defer inW.Close() // ends the read the wizard left waiting
+			origArgs := os.Args
+			os.Args = append([]string{"mintrun", "init"}, args...)
+			defer func() { os.Args = origArgs }()
+			var timer *time.Timer
+			pressCtrlC := func(out string) {
+				if timer == nil && strings.Contains(out, waitFor) {
+					p, _ := os.FindProcess(os.Getpid())
+					_ = p.Signal(os.Interrupt)
+					// A prompt that misses Ctrl-C reads EOF soon after, so the test fails instead of hanging.
+					timer = time.AfterFunc(5*time.Second, func() { inW.Close() })
+				}
+			}
+			r := capture(t, inR, pressCtrlC, main)
+			if timer == nil || !timer.Stop() || !r.exited || r.code != 1 || r.err != "interrupted\n" {
+				t.Errorf("init %v, interrupted: code %d (exited %v):\n%s%s", args, r.code, r.exited, r.out, r.err)
+			}
 		}
-		inR, inW, err := os.Pipe()
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer inR.Close()
-		defer inW.Close() // ends the read the wizard left waiting
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		r := capture(t, inR, nil, func() { cmdInit(ctx, rt, []string{"cloudflare"}) })
-		if !r.exited || r.code != 1 || r.err != "interrupted\n" {
-			t.Errorf("code %d (exited %v):\n%s%s", r.code, r.exited, r.out, r.err)
-		}
+		interrupt("API token (typing stays hidden): ", "cloudflare")
 		// Echo comes back on even though the hidden read never finished.
 		if c := takeCalls(t, home); c != "stty -echo\nstty echo\n" {
 			t.Errorf("stty calls %q", c)
 		}
+		interrupt("[y/N]: ")
 	})
 
 	t.Run("telegram", func(t *testing.T) {

@@ -508,7 +508,7 @@ func TestRelayEndToEnd(t *testing.T) {
 	}
 	prov.leakMaster = false
 
-	// 9. Server-side human approval includes quoted Device: line in ApprovalText and propagates allow/deny.
+	// 9. Server-side human approval includes quoted Device: line right under Network: in ApprovalText (even when truncated) and propagates allow/deny.
 	var seenPrompt string
 	allowApproval := true
 	serverRT.ApprovalFunc = func(_ context.Context, req core.ExecRequest) (bool, error) {
@@ -517,7 +517,7 @@ func TestRelayEndToEnd(t *testing.T) {
 	}
 	res, err = clientRT.ExecBlind(context.Background(), core.ExecRequest{
 		MintRequest: core.MintRequest{Provider: "cf-relay", Scope: "example.com", Permissions: []string{"dns:write"}},
-		Command:     []string{"true"},
+		Command:     []string{"true", strings.Repeat("x", 4000)},
 		Approve:     true,
 		Purpose:     "rotate preview dns",
 		Client:      "Claude Code",
@@ -525,8 +525,8 @@ func TestRelayEndToEnd(t *testing.T) {
 	if err != nil || res.ExitCode != 0 {
 		t.Fatalf("approved ExecBlind failed: res=%+v err=%v", res, err)
 	}
-	if !strings.Contains(seenPrompt, "\nDevice: \"laptop-alice\"\nPurpose: \"rotate preview dns\"") {
-		t.Fatalf("ApprovalText missing quoted Device line before Purpose:\n%s", seenPrompt)
+	if !strings.Contains(seenPrompt, "\nSandbox: off\nNetwork: open\nDevice: \"laptop-alice\"\nProvider: \"cf-relay\"\n") || !strings.Contains(seenPrompt, "TRUNCATED") {
+		t.Fatalf("ApprovalText missing quoted Device line right under Network on truncated request:\n%s", seenPrompt)
 	}
 
 	allowApproval = false

@@ -2566,7 +2566,7 @@ func TestMintLeaseAndRelayClient(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// ApprovalText with Device set quotes the device name before Purpose and Client.
+	// ApprovalText with Device set quotes the device name right under Network: before Provider:.
 	txt := core.ApprovalText("hdr", core.ExecRequest{
 		MintRequest: core.MintRequest{Provider: "leased"},
 		Command:     []string{"true"},
@@ -2574,8 +2574,9 @@ func TestMintLeaseAndRelayClient(t *testing.T) {
 		Purpose:     "ship",
 		Client:      "Cursor",
 	}, 1000)
-	if !strings.Contains(txt, "\nDevice: \"dev-1\"\nPurpose: \"ship\"\nClient: \"Cursor\"") {
-		t.Fatalf("ApprovalText missing Device line:\n%s", txt)
+	if !strings.Contains(txt, "\nSandbox: off\nNetwork: open\nDevice: \"dev-1\"\nProvider: \"leased\"\n") ||
+		!strings.Contains(txt, "\nPurpose: \"ship\"\nClient: \"Cursor\"") {
+		t.Fatalf("ApprovalText missing Device line right under Network:\n%s", txt)
 	}
 
 	clientHome := t.TempDir()
