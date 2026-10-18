@@ -1,6 +1,6 @@
 # `mintrun` Execution Plan & Backlog
 
-> **Harness Spec:** [AGENTS.md](AGENTS.md) · **Latest Release:** `v0.10.0` · **Constraints:** 100% Go `1.24.0` standard library (`0` external dependencies), `> 90%` verified statement coverage measured without build tags.
+> **Harness Spec:** [AGENTS.md](AGENTS.md) · **Latest Release:** `v0.11.0` · **Constraints:** 100% Go `1.24.0` standard library (`0` external dependencies), `> 90%` verified statement coverage measured without build tags.
 
 ---
 
@@ -504,31 +504,13 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
 
 ## 3. Deferred Backlog (Next Actionable Items)
 
-1. **`no_network` Child Sandbox Option (open):**
-   - The macOS (`sandbox-exec`) and Linux (`CLONE_NEWUSER | CLONE_NEWNS`) child sandboxes are built and verified (Workstreams Y, Z, and AA; rule 43). Both leave network access open because every built-in provider's CLI calls a network API, and a macOS `(deny network*)` rule also blocks Unix sockets (`ssh-agent`, Docker). A future `no_network: true` option for offline commands needs per-OS integration tests before it can be trusted.
-2. **Linux Host Verification:**
-   - Run integration tests against real `secret-tool` on Linux, and `-approve` with Telegram and Slack as the only channels (`OSApproval` is macOS-only).
-3. **Live Runs: Telegram, 1Password, Bitwarden & Vercel:**
-   - These have run only against stand-ins (a local Bot API, a mock `op`, a stub `bw`, a local Vercel API). The user runs each check below with a throwaway bot or account of their own, and `checks.md` §3 turns `pass` only on that run's output.
-   - **Telegram:** create a bot with @BotFather and send it `/start`, store `<user_id>:<bot_token>` at the hidden prompt of `./mintrun secret set approval-telegram`, then run `./mintrun exec -approve -provider <p> -scope <s> -- true` three times, with `<p>` a provider whose master secret is already stored: tap Allow (the command runs), tap Deny (it does not), and on macOS click the dialog first (the Telegram message is edited to show the outcome). `audit.jsonl` gets one entry per run, and no output holds the token.
-   - **1Password:** after `op signin`, `MINTRUN_VAULT=1password ./mintrun secret set mintrun-live-test`, then `secret check`, `secret set` again (one active item remains and the older one is archived), and `secret delete`.
-   - **Bitwarden:** `./mintrun plugin install bitwarden`, `export BW_SESSION="$(bw unlock --raw)"`, then `MINTRUN_VAULT=bitwarden ./mintrun secret set mintrun-live-test`, `secret check`, and `secret delete` (the note moves to the trash).
-   - **Vercel:** `./mintrun plugin install vercel`, store a Vercel token with `./mintrun secret set vercel`, then `./mintrun exec -provider vercel -ttl 300 -- npx vercel whoami` (the minted token works) and `-- sleep 60`: the account's token list shows the new token while the command runs, and it is gone after the command exits.
-4. **Live Slack Approval Run:**
-   - Slack approval has run only against a local Slack Web API. The user runs this check with a throwaway workspace and app of their own, and `checks.md` §3 "Live Slack Web API" turns `pass` only on that run's output.
-   - Create the app and store `<user_id>:<bot_token>` at the hidden prompt of `./mintrun secret set approval-slack` as README "Approve From Your Phone" says, then run `./mintrun exec -approve -provider <p> -scope <s> -- true` three times, with `<p>` a provider whose master secret is already stored: react ✅ (the command runs), react ❌ (it does not), and on macOS click the dialog first (the Slack message is edited to show the outcome). `audit.jsonl` gets one entry per run, and no output holds the token.
+1. **`no_network` Child Sandbox Option (open):** planned as **Workstream AC** in [§5](#5-roadmap-to-v0120-planned-2026-10-18-awaiting-approval). The macOS and Linux child sandboxes are built (Workstreams Y, Z, AA; rule 43) but leave the network open; AC adds a `no_network` option that blocks the command's own egress, gated behind per-OS integration tests.
+2. **Linux Host Verification:** moved to the §5 live-check runbook, item 4 (`-approve` with Telegram and Slack as the only channels; `secret-tool` is already verified).
+3. **Live Runs: Telegram, 1Password, Bitwarden & Vercel:** moved to the §5 live-check runbook, items 2–3 (each run with the user's own throwaway bot or account; `checks.md` §3 turns `pass` only on that run's output).
+4. **Live Slack Approval Run:** moved to the §5 live-check runbook, item 2 (the user's own throwaway workspace and app).
 5. **GCP `token_uri` From the Service-Account Key:**
    - Deferred: only keys outside the default Google universe carry a different `token_uri`, and honoring it also means sending revocation to that universe. Add it when such a key is in use.
-6. **Team Relay (`mintrun relay`), design only, awaiting approval:**
-   - **Goal:** one server holds the master secrets, the policy, and the audit log; a developer's laptop holds no master and receives only leases.
-   - **Server:** `mintrun relay -listen <addr>` serves HTTPS only (`crypto/tls`, TLS 1.3). Each laptop authenticates with its own client certificate (mutual TLS) or bearer token, revocable one device at a time. `POST /v1/mint` takes an `ExecRequest` and runs `CheckPolicy`, approval (Telegram, or Slack once built: the server has no screen for the macOS dialog), `Mint`, and the audit entry, then returns the lease's `env`, the values to redact, the lease ID, and the expiry; `Lease.RevokeSecret` stays on the server. `POST /v1/revoke` takes the lease ID, the exit code, and `truncated`. The server also revokes each lease when it expires, so a laptop that crashes or goes offline never keeps a credential past its TTL.
-   - **Client:** `mintrun exec -relay https://<host>` (or `MINTRUN_RELAY`) mints through the server, runs the command locally with the lease, scrubs the output against the lease values, and reports the exit to the server.
-   - **Limits the docs must state:**
-     - The lease reaches the laptop: the command, and anything else running as that user, can use it until it expires or is revoked.
-     - The server sees only what the laptop says it will run, so `blocked_commands` and the approval message are only as honest as the client. The limits a laptop cannot dodge are the ones applied at mint time: provider, scope, permissions, TTL, installations.
-     - Static mode is always refused over the relay, because it would send the master itself to the laptop.
-   - **Open questions:** who enrolls and retires devices, per-device rate limits, where the server keeps masters (the Keychain on macOS, the file vault on Linux), and failing closed while the server is down.
-   - **First slice:** per-device tokens, no static mode, Telegram approval, tests against `httptest.NewTLSServer`.
+6. **Team Relay (`mintrun relay`), design only, awaiting approval:** planned as **Workstream AE** in [§5](#5-roadmap-to-v0120-planned-2026-10-18-awaiting-approval), gated behind the R0 approval; it ships as `v0.13.0`. The design (goal, server, client, the limits the docs must state, open questions, first slice) is preserved in the AE and R0 sections there.
 
 ---
 
@@ -725,3 +707,164 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
 7. Switching key stores moves no secrets, and there is no `secret get` to copy them. The app must tell the user to set them again. **Decided:** the app tells the user to set them again.
 8. "Access ends when the task is done" holds only where the provider deletes the credential. Recommended: while a task runs, the app promises an early end only for `cloudflare` and `github` JIT leases (`ephemeral` alone cannot tell `aws` from `cloudflare`); once it ends, the app reports the entry's `revoked`, shows `expires_at` for an ephemeral lease that was not revoked (`aws`, `gcp`, a plugin), and says a static lease is the master secret itself and stays valid. **Decided:** as recommended.
 9. Should the approval timeout go above 10 minutes? Telegram and Slack would then need to follow the context's deadline instead of their own 10 minutes. **Decided:** no; it stays at most 600 s.
+
+---
+
+## 5. Roadmap to `v0.12.0` (planned 2026-10-18, awaiting approval)
+
+> Four shipped features from §3 become workstreams here, plus the §3 relay design gated behind an approval. `v0.12.0` = **AB + AC + AD**; the relay (**AE**) ships later as `v0.13.0` and only after its R0 gate is approved. One writer per docs file at a time (rule 17). Each workstream defines its checks before its code (layer 1). No code, commit, push, or tag before the user approves this section.
+
+| # | Step | Mark | Waits for |
+| :-- | :--- | :--- | :--- |
+| 1 | Release `v0.11.0` | `[SERIAL]` | — |
+| 2 | AB — `init policy` suggests the sandbox | `[SERIAL]` | 1 |
+| 3 | AD — app Stop end to end, and the app contract | `[PARALLEL]` with AB's code | 1 |
+| 4 | AC — `no_network` child option | `[SERIAL]` | AB and AD (shares `runner.go` with AB, `main_test.go` with AD) |
+| 5 | Release `v0.12.0` | `[SERIAL]` | AB, AC, AD; tag only after a yes |
+| 6 | AE — team relay (`mintrun relay`) | `[SERIAL]` | R0 approval and AC; ships as `v0.13.0` |
+| 7 | Live-check runbook | user-run | — |
+
+### Release `v0.11.0`
+
+Covers everything since `v0.10.0` (40 commits): the macOS and Linux child sandbox, the app socket channel, `mintrun apps`, `settings.json`, and `mintrun shim`.
+
+- **Files:** `README.md` (roadmap row), `plan.md` (header line 3 → `v0.11.0`), `progress.md` (row 17 → ✅ Done with the coverage figure). Docs only, no code.
+- **Deliverables:**
+  1. `[SERIAL]` In a `git archive` export of `1ac4a1e`, run §1 checks 1–5. Recommended: re-run the Linux suite and the two integration tests in a throwaway OrbStack `ubuntu:24.04`, unprivileged and as root, deleted after.
+  2. `[SERIAL]` Write the three docs edits; re-measure coverage in a fresh export and confirm the figure in `progress.md` matches it exactly (rule 5).
+  3. `[SERIAL]` Annotated tag. Proposed message: `mintrun v0.11.0 — an approval dialog that defaults to Deny and shows the vault and working directory, agents that cannot pick the vault or set the timeout, CLI shims, the macOS and Linux child sandbox, the macOS app channel, mintrun apps, and settings.json`. No GitHub Release.
+- **Verification:**
+  ```bash
+  git archive 1ac4a1e | tar -xf - -C "$EXPORT" && cd "$EXPORT"
+  gofmt -s -l cmd internal examples && go vet ./...
+  go test -count=1 -coverprofile=coverage.out ./... && go tool cover -func=coverage.out | tail -n 1 && rm -f coverage.out
+  go test -race -count=1 ./... && GOOS=linux go build ./... && GOOS=windows go build ./...
+  go build -trimpath -o mintrun ./cmd/mintrun && ./mintrun plugin list
+  git ls-remote origin refs/heads/main 'refs/tags/*'   # rule 25, right before push/tag
+  ```
+- **Approval gate:** push and tag only after a yes (layer 4). The push account is gh's active one; a 403 means it is not the expected account — ask before switching.
+
+### AB — `mintrun init policy` suggests the sandbox
+
+- **Files:** `internal/core/runner.go`, `cmd/mintrun/setup.go`, `cmd/mintrun/setup_test.go`, then docs (`README.md`, `AGENTS.md` rule 35, `checks.md` row 89, `progress.md`).
+- **Deliverables:**
+  1. `[SERIAL]` Add `func (rt *Runtime) SandboxReady() error` that reports whether this host can build the sandbox prefix, reusing the existing resolver so the check is the real one the gate runs, not a copy.
+  2. `[SERIAL]` In `(*wizard).policy()`, when the sandbox is ready the suggested rule carries `Sandbox: true` plus a one-line cost note (the network stays open until AC; Keychain/D-Bus logins fail inside; do not claim `gh` works). When it is not ready, print `Sandbox: not suggested: <cause>` with no path (rule 36). Both existing-file hints show the same rule.
+  3. `[SERIAL]` `TestCLIInit` pins both branches with a stubbed resolver. Mutants (run on a copy): always-on, never-on, note dropped, reason dropped, hint without the sandbox.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCLIInit' ./cmd/mintrun   # every new assertion shows --- PASS (rule 15)
+  gofmt -s -l cmd internal examples && go vet ./... && go test -race -count=1 ./...
+  ```
+
+### AD — app Stop end to end, and the app contract
+
+- **Files:** `cmd/mintrun/main_test.go` (`fakeApp`, new `TestCLIExecAppStop`), `README.md` (app contract), `AGENTS.md` (amend rule 42), `checks.md` (flip the X7 stop row at line 539), `progress.md`.
+- **Deliverables:**
+  1. `[SERIAL]` Give `fakeApp` a `stop` decision that replies `{"type":"stop"}` to a `started` line.
+  2. `[SERIAL]` `TestCLIExecAppStop` runs a long child (`exec -provider cloudflare -perms static -- sh -c 'echo $$ > <pidfile>; exec sleep 60'`) on a short `os.MkdirTemp` home and asserts: it returns within 5 s; the exit code equals the observed value (pin what is seen, likely 255); exactly one audit entry with `outcome: stopped` and `via: cli`; the child pid is gone.
+  3. `[SERIAL]` README states the app contract: the card shows Sandbox On/Off from the request's `sandbox` key, a missing key means an older `mintrun`; a Network line follows once AC lands; a missing `sandbox` in a `started` entry means off; Stop sends `{"type":"stop"}\n`; a connection that closes with no final entry means `mintrun` died. Amend rule 42. App-side work belongs to the separate macOS-app project (the user supplies its folder).
+  4. `[SERIAL]` Mutants (on a copy): Track not wired in `bootRuntime`; stop does not close the channel; the outcome reported as `interrupted`.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCLIExecAppStop|TestBootRuntimeSettings|TestAppTrack|TestExecBlindStop' ./...
+  gofmt -s -l cmd internal examples && go vet ./... && go test -race -count=1 ./...
+  ```
+
+### AC — `no_network` child option ("Lồng kính" / glass cage)
+
+Goal: a command that only processes local data cannot send it anywhere over the network. Implemented inside the existing sandbox, which it implies.
+
+- **Request plumbing:** add `NoNetwork` to `ExecRequest` (`no_network,omitempty`), `PolicyRule`, `PolicyDecision` (`json:"no_network"`, always shown), and `AuditEntry` (omitempty); the CLI flag `-no-network`; an MCP property (so `TestMCPExecSchema` covers it); and the app-request key `no_network`, always sent.
+- **Verdict:** `d.NoNetwork = req || rule` and it forces the sandbox on; `checkPolicy` feeds the first verdict's value back after an approval; the sandbox-prefix builder takes `noNetwork` and is called once in `decide` (rule 16 — the gate stays the single source).
+- **Mechanism (detail lives in the code, not here):**
+  - macOS: extend the sandbox profile to deny network egress. Any egress path that is a separate process rather than a syscall (launching a browser, a helper job, system network daemons, Apple Events, the pasteboard) is only denied where an integration probe proves the deny works, each with a positive control; anything unproven is documented as out of scope, not silently claimed.
+  - Linux: the sandbox helper also enters a private network namespace before dropping privileges, leaving only loopback (down). The dry-run probe in `decide` passes `-no-network` too, so an unsupported host fails closed before any vault opens.
+- **Approval text (rule 4):** a `Network: blocked` / `Network: open` line right after the `Sandbox:` line, unquoted, always shown, from the first verdict. Update every exact-text test: `TestOSApproval`, `TestTelegramApproval`, `TestSlackApproval`, `TestAppApproval`, `TestExecBlindSandbox`, `TestCheckPolicyMatchesExecBlind`, `TestMCPBridgeGovernanceTools`.
+- **Stale "macOS only" texts to correct:** `runner.go` lines 39, 107, 402 (402 updates `core_test.go:1110`); `mcp.go:169`; `main.go:192`.
+- **Scope note (document, do not overclaim):** `no_network` stops the command from sending. The command's output still returns to the agent, which has its own network. Writes to synced folders (iCloud, Dropbox) and files read later are a separate channel. 32-bit programs on Linux are killed by the syscall filter; setuid gains nothing inside; amd64 needs verification on a real x86-64 kernel.
+- **Files:** core (`runner.go`, `sandbox_linux.go`, `core_test.go`, `sandbox_linux_test.go`, `sandbox_integration_test.go`), builtin (`mcp.go`, `appbroker.go`, `appbroker_test.go`, `builtin_test.go`, `telegram_test.go`, `slack_test.go`), CLI (`main.go`, `main_test.go`), docs. New rule 46; amend rules 4, 42, 43.
+- **Deliverables:**
+  1. `[SERIAL]` Fields + verdict + builder signature.
+  2. `[SERIAL]` macOS profile deny + probe-gated out-of-process denies (each with its control).
+  3. `[SERIAL]` Linux network namespace in the helper + dry-run probe.
+  4. `[SERIAL]` Approval text line + every exact-text test.
+  5. `[SERIAL]` `TestSandboxBlocksNetwork` (`//go:build integration`, macOS and Linux): the test binary re-execs itself as a probe and checks that TCP, UDP, a pathname Unix socket, and DNS are blocked inside while resolution works outside (the control), and that a local file write and `socketpair` still work; on Linux it also checks the netns inode differs and the filter is active, each with a positive control. Extend `TestLinuxSandboxSysProcAttrAndHelper`.
+  6. `[SERIAL]` ~20 mutants on a copy, including one for the netns layer and one for the syscall-filter layer.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestSandboxBlocksNetwork' -tags integration ./internal/core   # macOS, and Linux in OrbStack
+  go test -count=1 -v -run 'TestCheckPolicyMatchesExecBlind|TestExecBlindSandbox|TestMCPExecSchema|TestOSApproval|TestTelegramApproval|TestSlackApproval|TestAppApproval|TestMCPBridgeGovernanceTools' ./...
+  gofmt -s -l cmd internal examples && go vet ./... && go test -race -count=1 ./...
+  GOOS=linux GOARCH=amd64 go build ./... && GOOS=linux GOARCH=arm64 go build ./... && GOOS=linux GOARCH=386 go build ./... && GOOS=windows go build ./...
+  ```
+
+### Release `v0.12.0`
+
+Same docs-commit shape as `v0.11.0` (README roadmap row, `plan.md` header, `progress.md` row). Re-measure coverage in an export; annotated tag after a yes; `git ls-remote` first (rule 25); no GitHub Release.
+
+### AE — team relay (`mintrun relay`), gated behind R0
+
+One company server holds the master secrets; laptops hold only short-lived leases. **R0 is an approval gate** — the relay is a major architectural change (layer 1 pause). R1–R4 start only after the user approves R0's decisions. Ships as `v0.13.0`.
+
+- **R0 (recommended defaults, awaiting approval):**
+  - Device auth: `rand.Text()` tokens shown once, stored as SHA-256 in `<home>/relay/devices.json`, compared in constant time, managed by `mintrun relay device add|remove|list`.
+  - Transport: TLS 1.3 with a required SPKI SHA-256 pin via `MINTRUN_RELAY=https://host#sha256=<hex>`.
+  - Approval: Telegram or Slack, with a quoted `Device:` line.
+  - Static mode refused; fail closed when the server is unreachable; leases held in memory (a restart only expires them).
+  - Audit: a `minted` entry plus a final entry (`unreported` at expiry) — a documented exception to rule 8.
+  - Devices cannot set the vault or the timeout; `POST /v1/check` is a read-only `CheckPolicy`; the client applies `req || verdict` for sandbox, `no_network`, and `clean_env`. Rate limits deferred.
+- **R1:** extract a mint/revoke seam in `ExecBlind` (pure refactor; coverage must not drop).
+- **R2:** server in `internal/builtin/relay.go` + `relay_test.go` (tested with `httptest.NewTLSServer`); CLI in `cmd/mintrun/relay.go`.
+- **R3:** client (`exec -relay`, `MINTRUN_RELAY`, MCP).
+- **R4:** docs, mutants, a live check, and new rule 47 carrying the §3 item 6 limits.
+
+### Coverage Gate and Hermeticity (every workstream)
+
+```bash
+go test -count=1 -coverprofile=coverage.out ./... && go tool cover -func=coverage.out | tail -n 1   # > 90% (rule 5)
+grep -c -E '/(runner|sandbox_linux)\.go:' coverage.out   # > 0 (positive control the grep matches something)
+go tool cover -func=coverage.out | grep -c ' 0.0%$'      # record uncovered functions
+rm -f coverage.out
+```
+
+New tests stay hermetic (rule 22): a plain `go test ./...` makes zero real `sandbox-exec` / namespace-helper / network calls, and the `-tags integration` run hits the real path (the positive control). Prove it on a copy whose system binaries are logging stubs.
+
+### Live-check runbook (user-run; tokens typed only by the user at hidden prompts)
+
+`unresolved` until the user runs them with their own accounts; I never type a credential.
+
+1. Real apps: `mintrun apps connect|status|disconnect`, `mintrun init mcp`, `mintrun doctor` against real Claude Code, Claude Desktop, and Cursor (L1, L2).
+2. Telegram and Slack: `init telegram` / `init slack`, then three approval runs each (allow, deny, no answer) (L3 partial, L4).
+3. 1Password, Bitwarden, Vercel against real accounts.
+4. Linux approval with Telegram and Slack as the only channels (`OSApproval` is macOS-only).
+5. The real `no_network` sandbox, including amd64 on an x86-64 host.
+6. `gh` inside the sandbox (expected to fail its Keychain read; document the result).
+7. The macOS app end to end: allow, deny, no answer, **stop**, pause (L3).
+8. `TestSandboxHidesKeychainItem` and the `no_network` integration tests on real hardware — only after the user says yes (rule 22).
+
+### What the Docs Must Say (rules 21, 23)
+
+- `no_network` blocks the command's own egress, not the agent's; the output path back to the agent is not blocked.
+- Out-of-process and deferred channels (synced folders, files read later, out-of-process launches) are out of scope unless a probe proves the deny; say which were proven.
+- Linux: 32-bit programs are killed by the filter; setuid gains nothing inside; amd64 is marked by its verification status.
+- The relay R0 limits (device tokens, the TLS pin, fail-closed, in-memory leases, the audit exception).
+
+### Docs and Rules
+
+- New rule 46 (`no_network`), new rule 47 (relay). Amend rules 4, 35, 42, 43.
+- `checks.md`: AB → row 89; AD → the X7 stop row (line 539); AC and AE get their own rows.
+- `progress.md`: a Vietnamese checkpoint per workstream, in the existing format.
+
+### Open Questions (Recommended defaults; the user decides at approval)
+
+1. `no_network` implies the sandbox (cannot block egress without it). **Recommended:** yes.
+2. The `Network:` line wording (`blocked` / `open`). **Recommended:** those two words.
+3. macOS denies only the out-of-process channels a probe proves, documenting the rest. **Recommended:** yes.
+4. Linux arches: amd64 and arm64 get the filter, others are denied. arm64 is verified in OrbStack; amd64 needs an x86-64 kernel. **Recommended:** ship amd64 with its integration row `unresolved` and the docs saying so. Alternative: deny amd64 until verified.
+5. `init policy` suggests the sandbox (AB) but not `no_network`. **Recommended:** yes.
+6. Write restrictions under `no_network` (synced folders) are documented, not built in `v0.12.0`. **Recommended:** document only.
+7. The R0 relay defaults above. **Recommended:** as listed.
+8. `v0.12.0` = AB + AC + AD; the relay ships as `v0.13.0`. **Recommended:** yes.
+9. Packaging means an annotated tag only, no GitHub Release (publishing needs a separate yes). **Recommended:** tag only.
+10. The macOS-app project's folder, so AD's app-side contract can be checked there. **Recommended:** the user supplies it when ready.
