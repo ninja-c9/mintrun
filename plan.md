@@ -478,15 +478,34 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
   go test -count=1 -v -run 'TestAppApproval|TestAppTrack' ./internal/builtin
   ```
 
+### Workstream AA — Sandbox the Blind Command on Linux
+- **Files:** `internal/core/runner.go`, `internal/core/sandbox_linux.go`, `internal/core/sandbox_other.go`, `internal/core/core_test.go`, `internal/core/sandbox_linux_test.go`, `internal/core/sandbox_integration_test.go`, `cmd/mintrun/main_test.go`, `README.md`, `AGENTS.md`, `plan.md`, `checks.md`, `progress.md`
+- **Gap:** Workstream Y built the child sandbox on macOS only (`sandbox-exec`); on Linux, a sandboxed request was denied (`blocked_by: sandbox`).
+- **Design:**
+  - `LinuxSandboxPath` defaults to `os.Executable()` on Linux when `/usr/bin/sandbox-exec` is absent. When `os.Args[1] == "-mintrun-linux-sandbox"`, `init()` in `internal/core/sandbox_linux.go` calls `runLinuxSandbox` before `main`.
+  - `linuxSandboxArgv(homeDir)` resolves `mintrun`'s home (`realDir`), resolves existing keyring directories (`~/.local/share/keyrings`, `$XDG_DATA_HOME/keyrings`, `/run/user/<uid>/keyring` via `LinuxRunDir`, `$XDG_RUNTIME_DIR/keyring`, rejecting relative `XDG_DATA_HOME`/`XDG_RUNTIME_DIR`) and D-Bus session bus sockets (`/run/user/<uid>/bus`, `$XDG_RUNTIME_DIR/bus`, and a single absolute `unix:path=<sock>` in `DBUS_SESSION_BUS_ADDRESS`, rejecting `unix:abstract=...`, `tcp:...`, `;`, `%`, or a relative path), collapses subpaths (`subpath(d, real)` and `subpath(real, d)`) and duplicate sockets, and executes a dry-run probe (`LinuxSandboxPath -mintrun-linux-sandbox -hide-dir ... -hide-file ... --` with `LinuxSandboxSysProcAttr`) during `decide` (`CheckPolicy` / `checkPolicy`) so any host that blocks unprivileged user or mount namespaces (`user.max_user_namespaces=0`, AppArmor userns restriction) fails closed before any vault opens, with zero local paths in the denial reason (`pathCause`, rule 36).
+  - `ExecBlind` creates `sandbox[3]` (`_ = os.MkdirAll(sandbox[3], 0o700)`) and calls `LinuxSandboxSysProcAttr(cmd)` (`CLONE_NEWUSER | CLONE_NEWNS`, 1-to-1 UID/GID maps, `GidMappingsEnableSetgroups: false`, `AmbientCaps: []uintptr{capSysAdmin, capSetpcap}`) when running behind `-mintrun-linux-sandbox`.
+  - In the helper, `setupLinuxSandbox` mounts a `size=4k,mode=000` `tmpfs` (`MS_NOSUID|MS_NODEV|MS_NOEXEC`) and remounts it `MS_REMOUNT|MS_RDONLY` over each `-hide-dir` (or `filepath.Dir(dirs[0])` during a `CheckPolicy` dry-run probe when `dirs[0]` does not exist yet on disk, preserving rule 16), bind-mounts `/dev/null` over each `-hide-file`, locks `PR_SET_SECUREBITS` to `0x2f` (`secbitsLockedNoRoot`), zeroes `Effective`, `Permitted`, and `Inheritable` via `SYS_CAPSET` (which also clears `Ambient` in the kernel), and when `len(cmd) > 0` calls `syscall.Chdir(cwd)` (after capabilities are dropped, so even `uid == 0` fails with `permission denied` if `cwd` is inside a hidden directory) and `syscall.Exec`s `cmd` in place (same pid and process group).
+  - `/proc/$PPID/environ` is unreadable inside the user namespace without `PR_SET_DUMPABLE` because `mintrun` is outside the child's user namespace and the child has zero capabilities (`Permission denied`, pinned in `TestSandboxHidesHome`).
+- **Deliverables:**
+  1. `[SERIAL]` core: `LinuxSandboxPath`, `LinuxRunDir`, `LinuxSandboxSysProcAttr`, `linuxSandboxArgv`, `runLinuxSandbox`, `setupLinuxSandbox`, and `ExecBlind` wiring. `TestExecBlindLinuxSandbox`, 28 Linux denial cases in `TestCheckPolicyMatchesExecBlind/sandbox`, `TestCLIExecSandbox`, and `TestLinuxSandboxSysProcAttrAndHelper` (`//go:build linux`, run both as unprivileged user and as `root`).
+  2. `[SERIAL]` `-tags integration` tests on Linux (`Ubuntu 24.04.5 LTS`, kernel `6.17.8`): `TestSandboxHidesHome` (including `/proc/$PPID/environ` and running as `root`) and `TestSandboxHidesSecretTool` (real `dbus-daemon`, `gnome-keyring-daemon`, and `/usr/bin/secret-tool`).
+  3. `[SERIAL]` 38 Linux sandbox mutants on a copy (26 in `runner.go` and 12 in `sandbox_linux.go`), each failing a test, and the hermetic proof with logging stubs on both macOS and Linux (rule 22).
+  4. `[SERIAL]` README, AGENTS.md rules 22 and 43, `checks.md`, `progress.md`.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCheckPolicyMatchesExecBlind|TestExecBlindSandbox|TestExecBlindLinuxSandbox|TestLinuxSandboxSysProcAttrAndHelper' ./internal/core
+  go test -count=1 -v -run 'TestCLIExecSandbox' ./cmd/mintrun
+  go test -count=1 -v -tags integration -run '^TestSandboxHidesHome$' ./internal/core
+  go test -count=1 -v -tags integration -run '^TestSandboxHidesSecretTool$' ./internal/core
+  ```
+
 ---
 
 ## 3. Deferred Backlog (Next Actionable Items)
 
-1. **Child Sandbox on Linux, design only:**
-   - **Goal:** what Workstream Y does on macOS: the blind command cannot read `mintrun`'s home or ask the keystore for a master secret. Until it is built, `sandbox` is a denial on Linux. It is not isolation either: the command still runs as the user, keeps the network and the rest of `HOME`, and can leave something behind that runs later outside the sandbox (rule 23).
-   - **Design:** Landlock only grants access, so hiding one directory means granting every other path. Instead `mintrun` re-executes itself in new user and mount namespaces (`SysProcAttr.Cloneflags`), mounts an empty `tmpfs` over its home, and then `exec`s the command. Ubuntu 24.04 blocks unprivileged user namespaces by default (`kernel.apparmor_restrict_unprivileged_userns=1`), so the check must probe and deny. libsecret answers over the D-Bus session bus, which a mount namespace does not hide, so `sandbox` is a denial on Linux until a test proves `secret-tool lookup` fails inside. `/proc/$PPID/environ` stays readable unless `mintrun` makes itself non-dumpable (`PR_SET_DUMPABLE`, untested).
-   - **Tests:** a `-tags integration` test on a Linux host like `TestSandboxHidesHome`, plus `secret-tool lookup` of a throwaway item failing inside.
-   - **`no_network` stays open:** every built-in provider's CLI calls a network API, so it fits offline commands only, and a macOS `(deny network*)` also blocks Unix sockets (`ssh-agent`, Docker).
+1. **`no_network` Child Sandbox Option (open):**
+   - The macOS (`sandbox-exec`) and Linux (`CLONE_NEWUSER | CLONE_NEWNS`) child sandboxes are built and verified (Workstreams Y, Z, and AA; rule 43). Both leave network access open because every built-in provider's CLI calls a network API, and a macOS `(deny network*)` rule also blocks Unix sockets (`ssh-agent`, Docker). A future `no_network: true` option for offline commands needs per-OS integration tests before it can be trusted.
 2. **Linux Host Verification:**
    - Run integration tests against real `secret-tool` on Linux, and `-approve` with Telegram and Slack as the only channels (`OSApproval` is macOS-only).
 3. **Live Runs: Telegram, 1Password, Bitwarden & Vercel:**
