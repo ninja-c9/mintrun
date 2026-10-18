@@ -455,11 +455,27 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
   2. `[SERIAL]` `TestTelegramApproval` and `TestSlackApproval` pin the new line in their exact text; `TestMCPBridgeGovernanceTools` pins that `mintrun_audit` shows a seeded entry's `"sandbox":true` and none on the blocked one.
   3. `[SERIAL]` Mutants on a copy of the repo (the new ones and rule 4's 13), each failing a test; the hermetic proof with logging stubs (rule 22).
   4. `[SERIAL]` README, AGENTS.md rules 4, 16, 31, 34, and 43, `checks.md`, `progress.md`.
-- **Not built:** `AppApproval` sends the app the request's fields, not `ApprovalText`, and `appRequest` has no sandbox; X6 adds it when it wires the app into the CLI.
+- **Not built here:** `AppApproval` sends the app the request's fields, not `ApprovalText`, so `appRequest` gained the sandbox separately (App Socket Sends the Sandbox, below).
 - **Verification:**
   ```bash
   go test -count=1 -v -run 'TestCheckPolicyMatchesExecBlind|TestExecBlindSandbox|TestOSApproval' ./internal/core
   go test -count=1 -v -run 'TestTelegramApproval|TestSlackApproval|TestMCPBridgeGovernanceTools' ./internal/builtin
+  ```
+
+### App Socket Sends the Sandbox
+- **Files:** `internal/builtin/appbroker.go`, `internal/builtin/appbroker_test.go`, `AGENTS.md`, `plan.md`, `checks.md`, `progress.md`
+- **Gap:** Workstream Z put `Sandbox: on` or `off` in `ApprovalText`, which the dialog, Telegram, and Slack show. `AppApproval` sends the app the request's fields instead, and `appRequest` had no sandbox, so the macOS app could not show it.
+- **Design:**
+  - `appRequest.Sandbox` (`json:"sandbox"`), filled from `req.Sandbox`, which `checkPolicy` sets to the verdict before it asks, so the app gets what the other channels show. It is sent when false too, so the app can tell a run without the sandbox from an older mintrun that sends no key.
+  - `AppTrack`'s started line is an `AuditEntry`, whose `sandbox` stays `omitempty` (Workstream Z), so the app reads a missing key there as off. No change.
+- **Deliverables:**
+  1. `[SERIAL]` The field, and the comment above `appRequest` that says it is mintrun's verdict.
+  2. `[SERIAL]` `TestAppApproval` compares the exact request line with the sandbox off (`Approve`, `CleanEnv`, and `FromAgent` on) and on (those three off), so a field taken from another flag fails.
+  3. `[SERIAL]` Mutants on a copy, each built first and each failing the test; the pipeline and the hermetic proof in a `git archive` export; AGENTS.md rule 42, `checks.md`, `progress.md`. README never describes the app socket, so it does not change.
+- **Not built:** the macOS app is not in this repo, and it must show the field (`progress.md`). Nothing in `cmd/mintrun` calls `AppApproval` yet (X6).
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestAppApproval|TestAppTrack' ./internal/builtin
   ```
 
 ---
@@ -593,7 +609,7 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
 - **Files:** `internal/builtin/appbroker.go`, `internal/builtin/appbroker_test.go` (new)
 - **Deliverables:**
   1. `[PARALLEL]` The macOS app listens on `<home>/app.sock` (mode 0600, inside the 0700 home), and `mintrun` dials it: one connection per approval and one per running task, newline-delimited JSON with `"v":1`.
-  2. `[PARALLEL]` `AppApproval(rt, fallback)`: when the dial fails it calls `fallback` (`OSApproval`), so a running app replaces the dialog while Telegram and Slack still race. It sends `{"v":1,"type":"approve","task":…,"request":{provider,scope,permissions,params,command,cwd,purpose,client,via,ttl_seconds}}` and reads one line of at most 4 KiB: `{"task":…,"decision":"allow"|"deny"}`. A wrong task, a malformed or oversized line, or EOF is an error, never an approval, and no dialog follows. When `ctx` ends it closes the connection, and the app drops the card. The command is sent whole, so the app must say when it shortens it.
+  2. `[PARALLEL]` `AppApproval(rt, fallback)`: when the dial fails it calls `fallback` (`OSApproval`), so a running app replaces the dialog while Telegram and Slack still race. It sends `{"v":1,"type":"approve","task":…,"request":{sandbox,provider,scope,permissions,params,command,cwd,purpose,client,via,ttl_seconds}}` (`sandbox` came later, in App Socket Sends the Sandbox) and reads one line of at most 4 KiB: `{"task":…,"decision":"allow"|"deny"}`. A wrong task, a malformed or oversized line, or EOF is an error, never an approval, and no dialog follows. When `ctx` ends it closes the connection, and the app drops the card. The command is sent whole, so the app must say when it shortens it.
   3. `[PARALLEL]` `AppTrack(rt)` returns a `Runtime.Track`. It dials with a 1 s timeout and a write deadline, and a failure means no tracking. It sends `{"v":1,"type":"started","entry":…}`, closes the stop channel on a `{"type":"stop"}` line, and closes the connection when `ctx` ends. A connection that closes with no audit entry for its task means `mintrun` died, and the app says so rather than guess.
   4. `[PARALLEL]` Trust matches `policy.json`'s: there is no owner or peer check, because a same-user process can already edit the home (rule 23) and the check would need per-OS `syscall` code. No build tags: where no app listens, the dial fails.
   5. Tests serve the socket from a short `os.MkdirTemp("", "mr")` directory, because macOS limits a socket path to 104 bytes; a longer `MINTRUN_HOME` just means no app channel.
