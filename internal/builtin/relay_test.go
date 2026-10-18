@@ -631,6 +631,28 @@ func TestRelayRateLimitAndLeaseCap(t *testing.T) {
 	if d := aliceClient.CheckPolicy(ctx, req); d.Allowed || d.BlockedBy != "relay" || !strings.Contains(d.Reason, "rate limit exceeded") {
 		t.Fatalf("expected 429 rate limit exceeded on 3rd request, got: %+v", d)
 	}
+	// The raw reply alice gets: its status, Retry-After, and the error in its body.
+	rawPost := func(path string) (int, string, string) {
+		t.Helper()
+		hreq, err := http.NewRequest(http.MethodPost, ts.URL+path, strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		hreq.Header.Set("Authorization", "Bearer "+aliceToken)
+		resp, err := ts.Client().Do(hreq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var body struct {
+			Error string `json:"error"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&body)
+		return resp.StatusCode, resp.Header.Get("Retry-After"), body.Error
+	}
+	if code, ra, msg := rawPost("/v1/check"); code != http.StatusTooManyRequests || ra != "1" || msg != "rate limit exceeded" {
+		t.Fatalf("rate-limited /v1/check = %d, Retry-After %q, error %q; want 429, \"1\", \"rate limit exceeded\"", code, ra, msg)
+	}
 	if d := bobClient.CheckPolicy(ctx, req); !d.Allowed {
 		t.Fatalf("bob should not be rate-limited by alice: %+v", d)
 	}
@@ -658,6 +680,9 @@ func TestRelayRateLimitAndLeaseCap(t *testing.T) {
 	}
 	if _, _, _, err := aliceClient.Mint(ctx, req); err == nil || !strings.Contains(err.Error(), "too many active leases for device") {
 		t.Fatalf("expected active lease cap error on 3rd mint, got: %v", err)
+	}
+	if code, ra, msg := rawPost("/v1/mint"); code != http.StatusTooManyRequests || ra != "1" || msg != "too many active leases for device" {
+		t.Fatalf("capped /v1/mint = %d, Retry-After %q, error %q; want 429, \"1\", \"too many active leases for device\"", code, ra, msg)
 	}
 	// Bob can still mint while Alice is at her cap.
 	lb, _, _, err := bobClient.Mint(ctx, req)
