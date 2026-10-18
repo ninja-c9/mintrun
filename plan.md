@@ -1,6 +1,6 @@
 # `mintrun` Execution Plan & Backlog
 
-> **Harness Spec:** [AGENTS.md](AGENTS.md) · **Latest Release:** `v0.12.0` · **Constraints:** 100% Go `1.24.0` standard library (`0` external dependencies), `> 90%` verified statement coverage measured without build tags.
+> **Harness Spec:** [AGENTS.md](AGENTS.md) · **Latest Release:** `v0.13.0` · **Constraints:** 100% Go `1.24.0` standard library (`0` external dependencies), `> 90%` verified statement coverage measured without build tags.
 
 ---
 
@@ -510,7 +510,7 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
 4. **Live Slack Approval Run:** moved to the §5 live-check runbook, item 2 (the user's own throwaway workspace and app).
 5. **GCP `token_uri` From the Service-Account Key:**
    - Deferred: only keys outside the default Google universe carry a different `token_uri`, and honoring it also means sending revocation to that universe. Add it when such a key is in use.
-6. **Team Relay (`mintrun relay`), approved with R0 defaults:** planned as **Workstream AE** in [§5](#5-roadmap-to-v0120--v0130-approved-2026-10-18); ships as `v0.13.0`.
+6. **Team Relay (`mintrun relay`, completed in `v0.13.0`, Workstream AE, rule 47):** TLS 1.3 SPKI-pinned relay server (`mintrun relay serve`), SHA-256 device token auth (`mintrun relay device add|remove|list`), client (`exec -relay`, `MINTRUN_RELAY`, `MINTRUN_RELAY_TOKEN`), and MCP support; see [§5](#5-roadmap-to-v0120--v0130-approved-2026-10-18) and [checks.md](checks.md).
 
 ---
 
@@ -712,7 +712,7 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
 
 ## 5. Roadmap to `v0.12.0` & `v0.13.0` (approved 2026-10-18)
 
-> Four shipped features from §3 become workstreams here, plus the §3 relay design. `v0.12.0` = **AB + AC + AD** (completed); the relay (**AE**) ships as `v0.13.0`. One writer per docs file at a time (rule 17). Each workstream defines its checks before its code (layer 1).
+> Four shipped features from §3 become workstreams here, plus the §3 relay design. `v0.12.0` = **AB + AC + AD** (completed); the relay (**AE**) ships as `v0.13.0` (completed). One writer per docs file at a time (rule 17). Each workstream defines its checks before its code (layer 1).
 
 | # | Step | Mark | Status |
 | :-- | :--- | :--- | :--- |
@@ -721,7 +721,7 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
 | 3 | AD — app Stop end to end, and the app contract | `[PARALLEL]` with AB's code | ✅ Done (`422610f`, `e67042e`) |
 | 4 | AC — `no_network` child option | `[SERIAL]` | ✅ Done (`fa117b5`, `bcf53d5`) |
 | 5 | Release `v0.12.0` | `[SERIAL]` | ✅ Done (`v0.12.0`) |
-| 6 | AE — team relay (`mintrun relay`) | `[SERIAL]` | In progress (`v0.13.0`) |
+| 6 | AE — team relay (`mintrun relay`) | `[SERIAL]` | ✅ Done (`eee3d19`, `252cca7`, `v0.13.0`) |
 | 7 | Live-check runbook | user-run | `unresolved` (user-run) |
 
 ### Release `v0.11.0`
