@@ -403,7 +403,7 @@ func TestCLIDoctor(t *testing.T) {
 		{"1Password vault", func(t *testing.T, home, self string) {
 			t.Setenv("MINTRUN_VAULT", "1password")
 		}, 0, []string{"-     vault 1password: not checked, since reading it can prompt"}},
-		{"CLAUDE_CONFIG_DIR absolute and relative", func(t *testing.T, home, self string) {
+		{"CLAUDE_CONFIG_DIR absolute", func(t *testing.T, home, self string) {
 			cdir := filepath.Join(home, "custom-claude")
 			t.Setenv("CLAUDE_CONFIG_DIR", cdir)
 			writeJSON(t, filepath.Join(cdir, ".claude.json"), obj{"mcpServers": obj{"mintrun": obj{"command": self, "args": []any{"mcp"}}}})
@@ -983,7 +983,8 @@ func TestCLIInit(t *testing.T) {
 		}
 		runs(t, "", []string{"mcp"}, "Antigravity: open Manage MCP Servers → View raw config, and add the entry below.")
 
-		// CLAUDE_CONFIG_DIR: an absolute path redirects Claude Code's .claude.json; a relative one is ignored.
+		// CLAUDE_CONFIG_DIR: an absolute path, surrounding space trimmed, redirects Claude Code's
+		// .claude.json; a relative one is ignored.
 		cdir := filepath.Join(home, "custom-claude")
 		customClaude := filepath.Join(cdir, ".claude.json")
 		writeJSON(t, customClaude, obj{"mcpServers": obj{"mintrun": entry}})
@@ -992,6 +993,10 @@ func TestCLIInit(t *testing.T) {
 		t.Setenv("CLAUDE_CONFIG_DIR", "relative-claude")
 		if got := idePaths()[0]; got != ide[0] {
 			t.Errorf("relative CLAUDE_CONFIG_DIR used: got %s, want %s", got, ide[0])
+		}
+		t.Setenv("CLAUDE_CONFIG_DIR", " "+cdir+"\n")
+		if got := idePaths()[0]; got != customClaude {
+			t.Errorf("padded CLAUDE_CONFIG_DIR not trimmed: got %s, want %s", got, customClaude)
 		}
 		t.Setenv("CLAUDE_CONFIG_DIR", "")
 
