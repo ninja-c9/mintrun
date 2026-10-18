@@ -41,7 +41,8 @@ type ExecRequest struct {
 	Purpose    string   `json:"purpose,omitempty"`    // The agent's reason in plain words: shown to the approver, never trusted
 	// Set by mintrun, never by an agent: MCP arguments unmarshal straight into ExecRequest.
 	Client    string `json:"-"` // MCP clientInfo name, self-reported by the AI app
-	Via       string `json:"-"` // "cli" or "mcp"
+	Device    string `json:"-"` // Relay device name from devices.json, set by the relay server
+	Via       string `json:"-"` // "cli", "mcp", or "relay"
 	Task      string `json:"-"` // ExecBlind's per-call handle (rand.Text): opaque, never a secret
 	FromAgent bool   `json:"-"` // Set by the MCP bridge after decoding: CheckPolicy then refuses any Vault or TimeoutSec, neither of which an agent picks
 }
@@ -58,15 +59,17 @@ type ExecResult struct {
 	Truncated  bool   `json:"truncated,omitempty"` // stdout or stderr passed MaxOutputBytes and was cut
 }
 
-// AuditEntry is written to `~/.mintrun/audit.jsonl` once for every ExecBlind call.
-// Secrets the runner holds are scrubbed; an entry written before the master secret loads (a
-// denial, an unknown vault or provider, a missing master) keeps the raw command, client, and
+// AuditEntry is written to `~/.mintrun/audit.jsonl` once for every ExecBlind call (and twice on a
+// relay server: "minted" when the lease is issued, plus the final outcome on revoke or "unreported"
+// at expiry). Secrets the runner holds are scrubbed; an entry written before the master secret loads
+// (a denial, an unknown vault or provider, a missing master) keeps the raw command, client, and
 // purpose (no secret is loaded yet to scrub against), so MCP mintrun_audit hands agents argv[0] only.
 type AuditEntry struct {
 	Timestamp   string   `json:"ts"`
 	Task        string   `json:"task,omitempty"`
 	Via         string   `json:"via,omitempty"`
 	Client      string   `json:"client,omitempty"`
+	Device      string   `json:"device,omitempty"`
 	Provider    string   `json:"provider"`
 	Scope       string   `json:"scope,omitempty"`
 	Permissions []string `json:"permissions,omitempty"`
@@ -75,8 +78,9 @@ type AuditEntry struct {
 	// Outcome is blocked (CheckPolicy denied; see BlockedBy), denied (a human said no), no_answer
 	// (nobody answered within ApprovalTimeout), failed (every approval channel failed, or the
 	// vault, provider, mint, or command did), stopped (Track stopped the run), interrupted (the
-	// caller's context ended), timed_out (the exec timeout), or done (a clean exit). Entries
-	// written before it existed have none.
+	// caller's context ended), timed_out (the exec timeout), done (a clean exit), or on a relay
+	// server minted (lease handed to the device) and unreported (lease expired before the device
+	// reported its exit). Entries written before it existed have none.
 	Outcome    string `json:"outcome,omitempty"`
 	BlockedBy  string `json:"blocked_by,omitempty"` // PolicyDecision.BlockedBy
 	DecidedAt  string `json:"decided_at,omitempty"` // When a human answered the approval
@@ -136,6 +140,22 @@ func hasToken(list []string, tok string) bool {
 	return false
 }
 
+// Relay is a remote mintrun server that checks policy, mints ephemeral leases, and revokes them
+// over HTTPS without exposing the master secret to the client device.
+type Relay interface {
+	CheckPolicy(ctx context.Context, req ExecRequest) PolicyDecision
+	Mint(ctx context.Context, req ExecRequest) (*Lease, PolicyDecision, string, error)
+	Revoke(ctx context.Context, leaseID, outcome string, exitCode int, truncated bool) (bool, error)
+}
+
+// RelayDenyError is a policy or human-approval denial returned by a remote relay during Mint.
+type RelayDenyError struct {
+	Outcome, BlockedBy, DecidedAt, Reason string
+	Sandbox, NoNetwork                    bool
+}
+
+func (e *RelayDenyError) Error() string { return e.Reason }
+
 // Runtime coordinates Vaults, Providers, Bridges, Policy enforcement, Blind Execution, and Audit Logging.
 type Runtime struct {
 	HomeDir      string
@@ -148,7 +168,9 @@ type Runtime struct {
 	// Track, if set, learns of each run once its lease is minted, before the command starts.
 	// Closing the channel it returns stops the run; its ctx ends once the run's final audit entry
 	// is written.
-	Track func(ctx context.Context, started AuditEntry) <-chan struct{}
+	Track       func(ctx context.Context, started AuditEntry) <-chan struct{}
+	Relay       Relay
+	RelayServer bool
 }
 
 // errStopped is the cause a Track stop cancels a run with.
@@ -236,12 +258,12 @@ func (rt *Runtime) decide(req ExecRequest) (PolicyDecision, []string, []string) 
 	if req.Provider == "" {
 		return deny("invalid_request", "exec requires a provider name")
 	}
-	// The vault is the operator's choice (MINTRUN_VAULT, or the CLI's -vault), never an agent's.
-	if req.FromAgent && req.Vault != "" {
+	// The vault is the operator's choice (MINTRUN_VAULT, or the CLI's -vault), never an agent's or a relay client's.
+	if (req.FromAgent || rt.Relay != nil || rt.RelayServer) && req.Vault != "" {
 		return deny("invalid_request", "policy denied: an agent cannot pick the vault (got %q); omit it to use the vault mintrun was started with (MINTRUN_VAULT)", req.Vault)
 	}
-	// Nor is the timeout an agent's: its timeout_seconds would lift the 5-minute limit to any length.
-	if req.FromAgent && req.TimeoutSec != 0 {
+	// Nor is the timeout an agent's or a relay client's: its timeout_seconds would lift the 5-minute limit to any length.
+	if (req.FromAgent || rt.Relay != nil || rt.RelayServer) && req.TimeoutSec != 0 {
 		return deny("invalid_request", "policy denied: an agent cannot set timeout_seconds (got %d); omit it to run with the 5-minute limit", req.TimeoutSec)
 	}
 	// The app's Pause creates <home>/paused. Lstat, so a dangling symlink pauses too; any error
@@ -275,8 +297,12 @@ func (rt *Runtime) decide(req ExecRequest) (PolicyDecision, []string, []string) 
 	rule, hasRule := rules[req.Provider]
 
 	// Non-JIT static mode (direct long-lived secret, no ephemeral token or revoke) must be
-	// explicitly opted into via policy; an agent cannot silently downgrade by requesting it.
+	// explicitly opted into via policy; an agent cannot silently downgrade by requesting it,
+	// and a relay never permits it because it would send the master secret to the device.
 	if req.Params["mode"] == "static" || hasToken(req.Permissions, "static") {
+		if rt.Relay != nil || rt.RelayServer {
+			return deny("static", "policy denied: relay does not allow static (non-JIT) mode for provider %q", req.Provider)
+		}
 		if !(hasRule && rule.AllowStatic) {
 			return deny("static", "policy denied: static (non-JIT) mode for provider %q requires \"allow_static\": true in policy.json", req.Provider)
 		}
@@ -345,7 +371,20 @@ func (rt *Runtime) decide(req ExecRequest) (PolicyDecision, []string, []string) 
 		Sandbox:          req.Sandbox || rule.Sandbox || noNet,
 		NoNetwork:        noNet,
 	}
-	if !d.Sandbox {
+	if rt.Relay != nil {
+		rd := rt.Relay.CheckPolicy(context.Background(), req)
+		if !rd.Allowed {
+			return rd, nil, nil
+		}
+		if rd.TTLSeconds > 0 && rd.TTLSeconds < d.TTLSeconds {
+			d.TTLSeconds = rd.TTLSeconds
+		}
+		d.ApprovalRequired = d.ApprovalRequired || rd.ApprovalRequired
+		d.CleanEnv = d.CleanEnv || rd.CleanEnv
+		d.NoNetwork = d.NoNetwork || rd.NoNetwork
+		d.Sandbox = d.Sandbox || rd.Sandbox || d.NoNetwork
+	}
+	if !d.Sandbox || rt.RelayServer {
 		return d, rule.AllowedEnv, nil
 	}
 	// Fail closed: a sandbox that is on but cannot be set up denies the request.
@@ -634,7 +673,7 @@ func realDir(dir string) (string, error) {
 // records whether the sandbox and no_network are on and why it denied.
 func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest, e *AuditEntry) ([]string, []string, error) {
 	d, env, sandbox := rt.decide(*req)
-	if d.Allowed && d.ApprovalRequired {
+	if d.Allowed && d.ApprovalRequired && rt.Relay == nil {
 		req.TTLSeconds, req.CleanEnv, req.Sandbox, req.NoNetwork = d.TTLSeconds, d.CleanEnv, d.Sandbox, d.NoNetwork
 		e.Sandbox, e.NoNetwork = d.Sandbox, d.NoNetwork
 		if err := rt.approve(ctx, *req, e); err != nil {
@@ -647,6 +686,9 @@ func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest, e *AuditEn
 	if !d.Allowed {
 		e.Outcome, e.BlockedBy = "blocked", d.BlockedBy
 		return nil, nil, errors.New(d.Reason)
+	}
+	if d.ApprovalRequired {
+		req.Approve = true
 	}
 	req.TTLSeconds, req.CleanEnv, req.Sandbox, req.NoNetwork = d.TTLSeconds, d.CleanEnv, d.Sandbox, d.NoNetwork
 	e.Sandbox, e.NoNetwork = d.Sandbox, d.NoNetwork
@@ -751,6 +793,9 @@ func ApprovalText(header string, req ExecRequest, limit int) string {
 	text := fmt.Sprintf("%s\n\nSandbox: %s\nNetwork: %s\nProvider: %q\nVault: %s\nScope: %q\nPermissions: %s\nParams: %s\nCommand: %s\nWorking directory: %s",
 		header, sandbox, network, req.Provider, orUnset(req.Vault, "(not set: the default vault)"), req.Scope, quote(req.Permissions),
 		strings.Join(params, " "), quote(req.Command), orUnset(req.WorkingDir, "(not set: mintrun's own)"))
+	if req.Device != "" {
+		text += "\nDevice: " + strconv.Quote(req.Device)
+	}
 	if req.Purpose != "" {
 		text += "\nPurpose: " + strconv.Quote(req.Purpose)
 	}
@@ -806,7 +851,46 @@ func FirstApproval(approvers ...func(context.Context, ExecRequest) (bool, error)
 // acquireLease mints a lease for req, scrubs e against every secret known so far, and returns an
 // idempotent revoke closure. Extracted as the seam between local vault/provider execution and
 // remote relay execution.
-func (rt *Runtime) acquireLease(ctx context.Context, req *ExecRequest, e *AuditEntry) (*Lease, []string, func(string, int) bool, error) {
+func (rt *Runtime) acquireLease(ctx context.Context, req *ExecRequest, e *AuditEntry) (*Lease, []string, func(string, int, bool) bool, error) {
+	if rt.Relay != nil {
+		lease, rd, decidedAt, err := rt.Relay.Mint(ctx, *req)
+		var rdeny *RelayDenyError
+		if errors.As(err, &rdeny) {
+			e.Outcome, e.BlockedBy, e.DecidedAt = rdeny.Outcome, rdeny.BlockedBy, rdeny.DecidedAt
+			e.Sandbox, e.NoNetwork = rdeny.Sandbox || req.Sandbox, rdeny.NoNetwork || req.NoNetwork
+			return nil, nil, nil, rdeny
+		}
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("relay mint failed: %s", err.Error())
+		}
+		e.DecidedAt = decidedAt
+		req.CleanEnv = req.CleanEnv || rd.CleanEnv
+		req.NoNetwork = req.NoNetwork || rd.NoNetwork
+		req.Sandbox = req.Sandbox || rd.Sandbox || req.NoNetwork
+		e.Sandbox, e.NoNetwork = req.Sandbox, req.NoNetwork
+		secrets := leaseSecrets("", lease)
+		leaseID := Scrub(lease.ID, secrets)
+		redactSet := append(secrets, lease.ID)
+		e.Command, e.Client, e.Purpose = scrubAll(req.Command, redactSet), Scrub(req.Client, redactSet), Scrub(req.Purpose, redactSet)
+		e.LeaseID, e.Ephemeral = leaseID, lease.Ephemeral
+		if lease.Ephemeral && !lease.ExpiresAt.IsZero() {
+			e.ExpiresAt = lease.ExpiresAt.UTC().Format(time.RFC3339)
+		}
+		done, revoked := false, false
+		revoke := func(outcome string, exitCode int, truncated bool) bool {
+			if !done && lease.Ephemeral {
+				done = true
+				revokeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				if ok, err := rt.Relay.Revoke(revokeCtx, lease.ID, outcome, exitCode, truncated); err == nil {
+					revoked = ok
+				}
+			}
+			return revoked
+		}
+		return lease, redactSet, revoke, nil
+	}
+
 	vaultName := req.Vault
 	if vaultName == "" {
 		vaultName = rt.DefaultVault
@@ -838,6 +922,15 @@ func (rt *Runtime) acquireLease(ctx context.Context, req *ExecRequest, e *AuditE
 		scrub(secrets)
 		return nil, nil, nil, fmt.Errorf("provider %q mint failed: %s", req.Provider, Scrub(err.Error(), secrets))
 	}
+	if rt.RelayServer && (!lease.Ephemeral || slices.Contains(leaseSecrets("", lease), masterSecret)) {
+		if lease.Ephemeral {
+			revokeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = provider.Revoke(revokeCtx, masterSecret, lease)
+			cancel()
+		}
+		scrub(secrets)
+		return nil, nil, nil, fmt.Errorf("provider %q returned a non-ephemeral or master-secret lease, which relay refuses", req.Provider)
+	}
 	// A plugin may (wrongly) use a secret as lease.ID: report it scrubbed, and redact the raw ID everywhere else.
 	leaseID := Scrub(lease.ID, secrets)
 	redactSet := append(secrets, lease.ID)
@@ -848,7 +941,7 @@ func (rt *Runtime) acquireLease(ctx context.Context, req *ExecRequest, e *AuditE
 	}
 
 	done, revoked := false, false
-	revoke := func(_ string, _ int) bool {
+	revoke := func(_ string, _ int, _ bool) bool {
 		if !done && lease.Ephemeral {
 			done = true
 			revokeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -860,6 +953,63 @@ func (rt *Runtime) acquireLease(ctx context.Context, req *ExecRequest, e *AuditE
 		return revoked
 	}
 	return lease, redactSet, revoke, nil
+}
+
+// MintLease runs the policy gate, human approval, and provider mint for a remote relay client,
+// writes the "minted" audit entry, and returns the lease, the enforced PolicyDecision, the minted
+// entry, and an idempotent finish(outcome, exitCode, truncated) function that revokes the lease and
+// writes the final audit entry.
+func (rt *Runtime) MintLease(ctx context.Context, req ExecRequest) (*Lease, PolicyDecision, AuditEntry, func(string, int, bool) AuditEntry, error) {
+	start := time.Now()
+	if req.Task == "" {
+		req.Task = rand.Text()
+	}
+	e := AuditEntry{
+		Timestamp: start.UTC().Format(time.RFC3339), Task: req.Task, Via: req.Via, Client: req.Client, Device: req.Device,
+		Provider: req.Provider, Scope: req.Scope, Permissions: req.Permissions, Command: req.Command, Purpose: req.Purpose,
+	}
+	_, _, err := rt.checkPolicy(ctx, &req, &e)
+	if err != nil {
+		e.ExitCode, e.Error, e.DurationMs = 126, err.Error(), time.Since(start).Milliseconds()
+		rt.writeAudit(e)
+		return nil, PolicyDecision{}, e, nil, &RelayDenyError{
+			Outcome: e.Outcome, BlockedBy: e.BlockedBy, DecidedAt: e.DecidedAt,
+			Reason: err.Error(), Sandbox: e.Sandbox, NoNetwork: e.NoNetwork,
+		}
+	}
+	lease, _, revoke, err := rt.acquireLease(ctx, &req, &e)
+	if err != nil {
+		e.Outcome, e.ExitCode, e.Error, e.DurationMs = "failed", 1, err.Error(), time.Since(start).Milliseconds()
+		rt.writeAudit(e)
+		return nil, PolicyDecision{}, e, nil, err
+	}
+	e.Outcome, e.DurationMs = "minted", time.Since(start).Milliseconds()
+	rt.writeAudit(e)
+
+	d := PolicyDecision{
+		Allowed:    true,
+		TTLSeconds: req.TTLSeconds,
+		CleanEnv:   req.CleanEnv,
+		Sandbox:    req.Sandbox,
+		NoNetwork:  req.NoNetwork,
+	}
+	var finished bool
+	var final AuditEntry
+	finish := func(outcome string, exitCode int, truncated bool) AuditEntry {
+		if !finished {
+			finished = true
+			final = e
+			final.Timestamp = time.Now().UTC().Format(time.RFC3339)
+			final.Outcome = outcome
+			final.ExitCode = exitCode
+			final.Truncated = truncated
+			final.Revoked = revoke(outcome, exitCode, truncated)
+			final.DurationMs = time.Since(start).Milliseconds()
+			rt.writeAudit(final)
+		}
+		return final
+	}
+	return lease, d, e, finish, nil
 }
 
 // ExecBlind resolves the master credential from Vault, mints a scoped JIT lease from the Provider,
@@ -889,9 +1039,19 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 
 	lease, redactSet, revoke, err := rt.acquireLease(ctx, &req, &e)
 	if err != nil {
+		var rdeny *RelayDenyError
+		if errors.As(err, &rdeny) {
+			write(126, rdeny.Error())
+			return nil, err
+		}
 		return failed(err)
 	}
-	defer func() { _ = revoke("interrupted", -1) }()
+	defer func() { _ = revoke("interrupted", -1, false) }()
+	if rt.Relay != nil && req.Sandbox {
+		if sandbox, err = sandboxArgv(rt.HomeDir, req.NoNetwork); err != nil {
+			return failed(fmt.Errorf("policy denied: sandbox is on, but %v", err))
+		}
+	}
 
 	runCtx, stop := context.WithCancelCause(ctx)
 	defer stop(nil)
@@ -969,11 +1129,12 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 		e.Outcome = "failed"
 	}
 
-	// Revoke before returning so we can report accurate revocation status.
-	revoked := revoke(e.Outcome, exitCode)
-
 	stdout, outCut := stdoutBuf.scrubbed(redactSet)
 	stderr, errCut := stderrBuf.scrubbed(redactSet)
+	truncated := outCut || errCut
+	// Revoke before returning so we can report accurate revocation status.
+	revoked := revoke(e.Outcome, exitCode, truncated)
+
 	res := &ExecResult{
 		ExitCode:   exitCode,
 		Stdout:     stdout,
@@ -982,7 +1143,7 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 		Ephemeral:  lease.Ephemeral,
 		Revoked:    revoked,
 		DurationMs: time.Since(start).Milliseconds(),
-		Truncated:  outCut || errCut,
+		Truncated:  truncated,
 	}
 
 	errMsg := ""
@@ -998,12 +1159,13 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 var cleanEnvBase = []string{"PATH", "HOME", "TMPDIR", "USER", "LANG", "TERM", "SSL_CERT_FILE"}
 
 // childEnv returns the blind child's environment, sorted for determinism. The file-vault
-// passphrase (MINTRUN_VAULT_KEY) never reaches the child, in any mode.
+// passphrase (MINTRUN_VAULT_KEY) and the relay device token (MINTRUN_RELAY_TOKEN) never reach the
+// child, in any mode.
 func childEnv(clean bool, allowed []string, leaseEnv map[string]string) []string {
 	env := make(map[string]string)
 	for _, kv := range os.Environ() {
 		k, v, ok := strings.Cut(kv, "=")
-		if !ok || k == "MINTRUN_VAULT_KEY" {
+		if !ok || k == "MINTRUN_VAULT_KEY" || k == "MINTRUN_RELAY_TOKEN" {
 			continue
 		}
 		if clean && !slices.Contains(cleanEnvBase, k) &&

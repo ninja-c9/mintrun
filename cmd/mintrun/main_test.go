@@ -4,11 +4,17 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"math/big"
 	"net"
 	"os"
 	"os/exec"
@@ -802,6 +808,163 @@ func TestCLIExecPaused(t *testing.T) {
 	if e := lastAudit(t, home); e.Outcome != "done" || e.Via != "cli" {
 		t.Errorf("audit entry = %+v", e)
 	}
+}
+
+func generateTestTLSCert(t *testing.T, dir string) (certFile, keyFile, pin string) {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		DNSNames:     []string{"localhost"},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	certFile = filepath.Join(dir, "cert.pem")
+	keyFile = filepath.Join(dir, "key.pem")
+	writeFile(t, certFile, string(certPEM))
+	writeFile(t, keyFile, string(keyPEM))
+	pin, err = builtin.RelayCertPin(certPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return certFile, keyFile, pin
+}
+
+func TestCLIRelay(t *testing.T) {
+	serverHome := t.TempDir()
+	clientHome := t.TempDir()
+	t.Setenv("MINTRUN_FILE_VAULT", "1")
+	t.Setenv("MINTRUN_VAULT", "keychain")
+	t.Setenv("MINTRUN_HOME", serverHome)
+
+	if r := runCLI(t, "", nil, "relay", "device", "list"); r.exited || !strings.Contains(r.out, "No relay devices enrolled.") {
+		t.Fatalf("empty device list: %+v", r)
+	}
+	rAdd := runCLI(t, "", nil, "relay", "device", "add", "laptop-cli")
+	if rAdd.exited || !strings.Contains(rAdd.out, `Enrolled relay device "laptop-cli"`) {
+		t.Fatalf("device add: %+v", rAdd)
+	}
+	lines := strings.Split(strings.TrimSpace(rAdd.out), "\n")
+	devToken := strings.TrimSpace(lines[len(lines)-1])
+	if !strings.HasPrefix(devToken, "mr_dev_") {
+		t.Fatalf("expected mr_dev_ token, got %q", devToken)
+	}
+	if r := runCLI(t, "", nil, "relay", "device", "list"); r.exited || !strings.Contains(r.out, "laptop-cli") {
+		t.Fatalf("device list: %+v", r)
+	}
+	if r := runCLI(t, "", nil, "relay", "device", "add", "temp-dev"); r.exited {
+		t.Fatalf("device add temp-dev: %+v", r)
+	}
+	if r := runCLI(t, "", nil, "relay", "device", "remove", "temp-dev"); r.exited || !strings.Contains(r.out, `Removed relay device "temp-dev"`) {
+		t.Fatalf("device remove: %+v", r)
+	}
+
+	// Error paths for relay CLI subcommands.
+	for _, args := range [][]string{
+		{"relay"},
+		{"relay", "unknown"},
+		{"relay", "serve"},
+		{"relay", "device"},
+		{"relay", "device", "unknown"},
+		{"relay", "device", "add"},
+		{"relay", "device", "add", "laptop-cli"},
+		{"relay", "device", "remove"},
+		{"relay", "device", "remove", "missing"},
+	} {
+		if r := runCLI(t, "", nil, args...); !r.exited || r.code != 1 {
+			t.Fatalf("expected %v to exit 1, got %+v", args, r)
+		}
+	}
+
+	// Start serveRelay on an ephemeral port, run `mintrun exec -relay` against it, then shut down.
+	certFile, keyFile, pin := generateTestTLSCert(t, serverHome)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	serverRT, err := bootRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Register an in-memory ephemeral test provider on serverRT.
+	_ = serverRT.Registry.Register(&cliRelayProvider{})
+	setSecret(t, "cli-relay-prov", "server_master_secret_123")
+
+	srvCtx, srvCancel := context.WithCancel(context.Background())
+	srvDone := make(chan error, 1)
+	go func() {
+		srvDone <- serveRelay(srvCtx, serverRT, addr, certFile, keyFile)
+	}()
+
+	// Wait until the relay server is accepting connections.
+	relayURL := "https://" + addr + "#sha256=" + pin
+	t.Setenv("MINTRUN_HOME", clientHome)
+	setSecret(t, "relay", devToken) // store device token in client's default vault under key "relay"
+	var execOut cliResult
+	for range 40 {
+		execOut = runCLI(t, "", nil, "exec", "-relay", relayURL, "-provider", "cli-relay-prov", "-scope", "zone1", "--", "sh", "-c", `printf "val=%s" "$CLI_RELAY_TOKEN"`)
+		if execOut.exited && execOut.code == 0 {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !execOut.exited || execOut.code != 0 || execOut.out != "val=[MINTRUN:REDACTED]" {
+		srvCancel()
+		t.Fatalf("exec -relay failed: %+v", execOut)
+	}
+
+	// Also verify MINTRUN_RELAY + MINTRUN_RELAY_TOKEN env wiring through bootRuntime.
+	t.Setenv("MINTRUN_RELAY", relayURL)
+	t.Setenv("MINTRUN_RELAY_TOKEN", devToken)
+	if r := runCLI(t, "", nil, "exec", "-provider", "cli-relay-prov", "-scope", "zone1", "--", "true"); !r.exited || r.code != 0 {
+		srvCancel()
+		t.Fatalf("exec with MINTRUN_RELAY failed: %+v", r)
+	}
+
+	srvCancel()
+	if err := <-srvDone; err != nil {
+		t.Fatalf("serveRelay returned error: %v", err)
+	}
+}
+
+type cliRelayProvider struct{}
+
+func (p *cliRelayProvider) Manifest() core.Manifest {
+	return core.Manifest{Name: "cli-relay-prov", Kind: core.KindProvider, Version: "1.0.0"}
+}
+
+func (p *cliRelayProvider) Mint(_ context.Context, _ string, req core.MintRequest) (*core.Lease, error) {
+	tok := "ephemeral_cli_relay_secret_token"
+	return &core.Lease{
+		ID:        "cli-lease-1",
+		Provider:  "cli-relay-prov",
+		Scope:     req.Scope,
+		Env:       map[string]string{"CLI_RELAY_TOKEN": tok},
+		Redact:    []string{tok},
+		ExpiresAt: time.Now().Add(time.Minute),
+		Ephemeral: true,
+	}, nil
+}
+
+func (p *cliRelayProvider) Revoke(_ context.Context, _ string, _ *core.Lease) error {
+	return nil
 }
 
 // TestMain supplies a deterministic file-vault passphrase for the suite. The

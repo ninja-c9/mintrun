@@ -2557,6 +2557,127 @@ func TestExecBlindTrackEndsAfterAudit(t *testing.T) {
 	}
 }
 
+func TestMintLeaseAndRelayClient(t *testing.T) {
+	t.Setenv("MINTRUN_APPROVE", "")
+	const master = "relay_core_master_secret"
+	serverRT, serverHome, revokes := leasedRuntime(t, master)
+	serverRT.RelayServer = true
+	if err := os.WriteFile(filepath.Join(serverHome, "policy.json"), []byte(`{"leased":{"max_ttl_seconds":90,"clean_env":true,"allow_static":true}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// ApprovalText with Device set quotes the device name before Purpose and Client.
+	txt := core.ApprovalText("hdr", core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "leased"},
+		Command:     []string{"true"},
+		Device:      "dev-1",
+		Purpose:     "ship",
+		Client:      "Cursor",
+	}, 1000)
+	if !strings.Contains(txt, "\nDevice: \"dev-1\"\nPurpose: \"ship\"\nClient: \"Cursor\"") {
+		t.Fatalf("ApprovalText missing Device line:\n%s", txt)
+	}
+
+	clientHome := t.TempDir()
+	if err := os.WriteFile(filepath.Join(clientHome, "policy.json"), []byte(`{"leased":{"allowed_env":["*"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clientRT := core.NewRuntime(clientHome, "keychain", core.NewRegistry())
+	var lastFinish func(string, int, bool) core.AuditEntry
+	var checkCalls int
+	clientRT.Relay = &inlineRelay{
+		checkFn: func(_ context.Context, req core.ExecRequest) core.PolicyDecision {
+			checkCalls++
+			req.FromAgent, req.Device, req.Via = true, "dev-1", "relay"
+			return serverRT.CheckPolicy(req)
+		},
+		mintFn: func(ctx context.Context, req core.ExecRequest) (*core.Lease, core.PolicyDecision, string, error) {
+			req.FromAgent, req.Device, req.Via = true, "dev-1", "relay"
+			lease, d, entry, finish, err := serverRT.MintLease(ctx, req)
+			if err != nil {
+				return nil, core.PolicyDecision{}, "", err
+			}
+			lastFinish = finish
+			return lease, d, entry.DecidedAt, nil
+		},
+		revokeFn: func(_ context.Context, _, outcome string, exitCode int, truncated bool) (bool, error) {
+			final := lastFinish(outcome, exitCode, truncated)
+			return final.Revoked, nil
+		},
+	}
+
+	// Static mode (even with allow_static:true in policy.json), vault override, and timeout override
+	// are denied locally on clientRT before calling checkFn, and on serverRT even when FromAgent is false.
+	for _, bad := range []core.ExecRequest{
+		{MintRequest: core.MintRequest{Provider: "leased", Permissions: []string{"static"}}, Command: []string{"true"}},
+		{MintRequest: core.MintRequest{Provider: "leased"}, Vault: "other", Command: []string{"true"}},
+		{MintRequest: core.MintRequest{Provider: "leased"}, TimeoutSec: 15, Command: []string{"true"}},
+	} {
+		before := checkCalls
+		if d := clientRT.CheckPolicy(bad); d.Allowed || checkCalls != before {
+			t.Fatalf("expected CheckPolicy(%+v) to deny locally before contacting relay (checkCalls=%d->%d): %+v", bad, before, checkCalls, d)
+		}
+		if d := serverRT.CheckPolicy(bad); d.Allowed {
+			t.Fatalf("expected serverRT.CheckPolicy(%+v) to deny: %+v", bad, d)
+		}
+		if _, _, _, _, err := serverRT.MintLease(context.Background(), bad); err == nil {
+			t.Fatalf("expected MintLease(%+v) to deny", bad)
+		}
+	}
+
+	// Successful relay ExecBlind: strips MINTRUN_RELAY_TOKEN, scrubs lease secret, writes minted + done on server.
+	t.Setenv("MINTRUN_RELAY_TOKEN", "mr_dev_secret_token_value")
+	res, err := clientRT.ExecBlind(context.Background(), core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "leased", TTLSeconds: 300},
+		Command:     []string{"sh", "-c", `printf "tok=%s" "$MINTRUN_RELAY_TOKEN"`},
+	})
+	if err != nil || res.ExitCode != 0 || !res.Revoked || revokes.Load() != 1 || res.Stdout != "tok=" {
+		t.Fatalf("ExecBlind via relay: res=%+v err=%v revokes=%d", res, err, revokes.Load())
+	}
+	if e := lastAudit(t, serverHome); e.Outcome != "done" || e.Device != "dev-1" || !e.Revoked {
+		t.Fatalf("unexpected server final audit entry: %+v", e)
+	}
+
+	// Denied human approval on server returns *RelayDenyError (exit 126 on client).
+	serverRT.ApprovalFunc = func(context.Context, core.ExecRequest) (bool, error) { return false, nil }
+	if _, err := clientRT.ExecBlind(context.Background(), core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "leased"},
+		Command:     []string{"true"},
+		Approve:     true,
+	}); err == nil || !strings.Contains(err.Error(), "denied") {
+		t.Fatalf("expected denied approval error, got: %v", err)
+	}
+	if e := lastAudit(t, clientHome); e.Outcome != "denied" || e.ExitCode != 126 {
+		t.Fatalf("unexpected client denied entry: %+v", e)
+	}
+
+	// Non-ephemeral lease ("probe" provider from probeRuntime) on RelayServer is refused and never returned.
+	if _, err := clientRT.ExecBlind(context.Background(), core.ExecRequest{
+		MintRequest: core.MintRequest{Provider: "probe"},
+		Command:     []string{"true"},
+	}); err == nil || strings.Contains(err.Error(), master) || !strings.Contains(err.Error(), "non-ephemeral or master-secret lease") {
+		t.Fatalf("expected non-ephemeral/master-leaking lease to be refused, got: %v", err)
+	}
+}
+
+type inlineRelay struct {
+	checkFn  func(context.Context, core.ExecRequest) core.PolicyDecision
+	mintFn   func(context.Context, core.ExecRequest) (*core.Lease, core.PolicyDecision, string, error)
+	revokeFn func(context.Context, string, string, int, bool) (bool, error)
+}
+
+func (r *inlineRelay) CheckPolicy(ctx context.Context, req core.ExecRequest) core.PolicyDecision {
+	return r.checkFn(ctx, req)
+}
+
+func (r *inlineRelay) Mint(ctx context.Context, req core.ExecRequest) (*core.Lease, core.PolicyDecision, string, error) {
+	return r.mintFn(ctx, req)
+}
+
+func (r *inlineRelay) Revoke(ctx context.Context, id, outcome string, code int, trunc bool) (bool, error) {
+	return r.revokeFn(ctx, id, outcome, code, trunc)
+}
+
 func TestMain(m *testing.M) {
 	if os.Getenv("MINTRUN_VAULT_KEY") == "" {
 		os.Setenv("MINTRUN_VAULT_KEY", "mintrun-unit-test-passphrase")

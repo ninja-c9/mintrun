@@ -119,6 +119,9 @@ func bootRuntime() (*core.Runtime, error) {
 	if err := core.LoadExternalPlugins(rt.PluginsDir(), reg); err != nil {
 		return nil, err
 	}
+	if err := configureRelay(rt, os.Getenv("MINTRUN_RELAY")); err != nil {
+		return nil, err
+	}
 	return rt, nil
 }
 
@@ -171,6 +174,8 @@ func main() {
 		cmdShim(ctx, rt, os.Getenv("PATH"), os.Args[2:])
 	case "apps":
 		cmdApps(ctx, os.Args[2:])
+	case "relay":
+		cmdRelay(ctx, rt, os.Args[2:])
 	case "-h", "--help", "help":
 		printUsage()
 	default:
@@ -191,6 +196,7 @@ func cmdExec(ctx context.Context, rt *core.Runtime, args []string) {
 	cleanEnv := fs.Bool("clean-env", false, "Run the command with only PATH/HOME/TMPDIR/USER/LANG/TERM/SSL_CERT_FILE, policy allowed_env, and the lease env")
 	sandbox := fs.Bool("sandbox", false, "Run the command in the OS sandbox (macOS and Linux), away from mintrun's home and the keystore")
 	noNetwork := fs.Bool("no-network", false, "Block the command's network egress inside the OS sandbox (implies -sandbox)")
+	relayURL := fs.String("relay", "", "Remote relay URL (https://host:port#sha256=<spki-hex>; overrides MINTRUN_RELAY)")
 
 	var cmdArgs []string
 	var flagArgs []string
@@ -210,6 +216,11 @@ func cmdExec(ctx context.Context, rt *core.Runtime, args []string) {
 
 	if len(cmdArgs) == 0 {
 		fatal("usage: mintrun exec -provider cloudflare -scope example.com -- <command> [args...]")
+	}
+	if *relayURL != "" {
+		if err := configureRelay(rt, *relayURL); err != nil {
+			fatal("%v", err)
+		}
 	}
 
 	var permList []string
@@ -423,6 +434,7 @@ Usage:
   mintrun doctor                                              Check the setup without changing anything
   mintrun shim [list|install|remove] [tool...]                Intercept bare CLI calls (gh, aws, gcloud, wrangler, vercel, psql)
   mintrun apps status|connect|disconnect [-app <list>]        Add mintrun to Claude Code, Claude Desktop or Cursor (JSON output)
+  mintrun relay serve|device ...                              Serve the team relay over TLS 1.3 or manage enrolled devices
   mintrun secret set <provider> [secret]                      Store master secret in OS Keychain vault
   mintrun secret check <provider>                             Verify secret exists without exposing value
   mintrun secret delete <provider>                            Delete master secret from vault
