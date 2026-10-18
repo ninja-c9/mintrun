@@ -803,6 +803,65 @@ func FirstApproval(approvers ...func(context.Context, ExecRequest) (bool, error)
 	}
 }
 
+// acquireLease mints a lease for req, scrubs e against every secret known so far, and returns an
+// idempotent revoke closure. Extracted as the seam between local vault/provider execution and
+// remote relay execution.
+func (rt *Runtime) acquireLease(ctx context.Context, req *ExecRequest, e *AuditEntry) (*Lease, []string, func(string, int) bool, error) {
+	vaultName := req.Vault
+	if vaultName == "" {
+		vaultName = rt.DefaultVault
+	}
+	vault, err := rt.Registry.Vault(vaultName)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	provider, err := rt.Registry.Provider(req.Provider)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	masterSecret, err := vault.GetSecret(ctx, req.Provider)
+	if err != nil {
+		// No hint here: only the vault can tell a miss from a failure, so a miss names its own fix.
+		return nil, nil, nil, fmt.Errorf("vault %q could not load master secret for %q: %w", vaultName, req.Provider, err)
+	}
+
+	// From here on the entry is scrubbed of every secret known so far.
+	lease, err := provider.Mint(ctx, masterSecret, req.MintRequest)
+	secrets := leaseSecrets(masterSecret, lease)
+	scrub := func(set []string) {
+		e.Command, e.Client, e.Purpose = scrubAll(req.Command, set), Scrub(req.Client, set), Scrub(req.Purpose, set)
+	}
+	if err != nil {
+		// Mint errors may echo the master secret (plugin stderr, API response bodies).
+		// Return a scrubbed string, not %w: the raw error must never reach the caller.
+		scrub(secrets)
+		return nil, nil, nil, fmt.Errorf("provider %q mint failed: %s", req.Provider, Scrub(err.Error(), secrets))
+	}
+	// A plugin may (wrongly) use a secret as lease.ID: report it scrubbed, and redact the raw ID everywhere else.
+	leaseID := Scrub(lease.ID, secrets)
+	redactSet := append(secrets, lease.ID)
+	scrub(redactSet)
+	e.LeaseID, e.Ephemeral = leaseID, lease.Ephemeral
+	if lease.Ephemeral && !lease.ExpiresAt.IsZero() {
+		e.ExpiresAt = lease.ExpiresAt.UTC().Format(time.RFC3339)
+	}
+
+	done, revoked := false, false
+	revoke := func(_ string, _ int) bool {
+		if !done && lease.Ephemeral {
+			done = true
+			revokeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := provider.Revoke(revokeCtx, masterSecret, lease); err == nil {
+				revoked = true
+			}
+		}
+		return revoked
+	}
+	return lease, redactSet, revoke, nil
+}
+
 // ExecBlind resolves the master credential from Vault, mints a scoped JIT lease from the Provider,
 // executes the target command with injected environment variables, scrubs all secrets from output,
 // and immediately revokes the ephemeral lease before returning. Every call writes one audit entry.
@@ -828,56 +887,11 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 		return nil, err
 	}
 
-	vaultName := req.Vault
-	if vaultName == "" {
-		vaultName = rt.DefaultVault
-	}
-	vault, err := rt.Registry.Vault(vaultName)
+	lease, redactSet, revoke, err := rt.acquireLease(ctx, &req, &e)
 	if err != nil {
 		return failed(err)
 	}
-	provider, err := rt.Registry.Provider(req.Provider)
-	if err != nil {
-		return failed(err)
-	}
-
-	masterSecret, err := vault.GetSecret(ctx, req.Provider)
-	if err != nil {
-		// No hint here: only the vault can tell a miss from a failure, so a miss names its own fix.
-		return failed(fmt.Errorf("vault %q could not load master secret for %q: %w", vaultName, req.Provider, err))
-	}
-
-	// From here on the entry is scrubbed of every secret known so far.
-	lease, err := provider.Mint(ctx, masterSecret, req.MintRequest)
-	secrets := leaseSecrets(masterSecret, lease)
-	scrub := func(set []string) {
-		e.Command, e.Client, e.Purpose = scrubAll(req.Command, set), Scrub(req.Client, set), Scrub(req.Purpose, set)
-	}
-	if err != nil {
-		// Mint errors may echo the master secret (plugin stderr, API response bodies).
-		// Return a scrubbed string, not %w: the raw error must never reach the caller.
-		scrub(secrets)
-		return failed(fmt.Errorf("provider %q mint failed: %s", req.Provider, Scrub(err.Error(), secrets)))
-	}
-	// A plugin may (wrongly) use a secret as lease.ID: report it scrubbed, and redact the raw ID everywhere else.
-	leaseID := Scrub(lease.ID, secrets)
-	redactSet := append(secrets, lease.ID)
-	scrub(redactSet)
-	e.LeaseID, e.Ephemeral = leaseID, lease.Ephemeral
-	if lease.Ephemeral && !lease.ExpiresAt.IsZero() {
-		e.ExpiresAt = lease.ExpiresAt.UTC().Format(time.RFC3339)
-	}
-
-	revoked := false
-	defer func() {
-		if lease != nil && lease.Ephemeral {
-			revokeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			if err := provider.Revoke(revokeCtx, masterSecret, lease); err == nil {
-				revoked = true
-			}
-		}
-	}()
+	defer func() { _ = revoke("interrupted", -1) }()
 
 	runCtx, stop := context.WithCancelCause(ctx)
 	defer stop(nil)
@@ -956,14 +970,7 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 	}
 
 	// Revoke before returning so we can report accurate revocation status.
-	if lease.Ephemeral {
-		revokeCtx, cancelRevoke := context.WithTimeout(context.Background(), 10*time.Second)
-		if err := provider.Revoke(revokeCtx, masterSecret, lease); err == nil {
-			revoked = true
-			lease.Ephemeral = false // prevent duplicate revoke in defer
-		}
-		cancelRevoke()
-	}
+	revoked := revoke(e.Outcome, exitCode)
 
 	stdout, outCut := stdoutBuf.scrubbed(redactSet)
 	stderr, errCut := stderrBuf.scrubbed(redactSet)
@@ -971,8 +978,8 @@ func (rt *Runtime) ExecBlind(ctx context.Context, req ExecRequest) (*ExecResult,
 		ExitCode:   exitCode,
 		Stdout:     stdout,
 		Stderr:     stderr,
-		LeaseID:    leaseID,
-		Ephemeral:  lease.Ephemeral || revoked,
+		LeaseID:    e.LeaseID,
+		Ephemeral:  lease.Ephemeral,
 		Revoked:    revoked,
 		DurationMs: time.Since(start).Milliseconds(),
 		Truncated:  outCut || errCut,
