@@ -738,8 +738,30 @@ func TestRelayRateLimitAndLeaseCap(t *testing.T) {
 			t.Fatal("parallel mints neither reached the provider nor failed within a minute")
 		}
 	}
+	// Alice's mints in flight count against her cap only: Bob's mint still reaches the provider.
+	var bobLease *core.Lease
+	bobDone := make(chan error, 1)
+	go func() {
+		l, _, _, err := bobClient.Mint(ctx, req)
+		if err != nil {
+			arrived <- struct{}{}
+		}
+		bobLease = l
+		bobDone <- err
+	}()
+	select {
+	case <-arrived:
+	case <-time.After(time.Minute):
+		t.Fatal("bob's mint neither reached the provider nor failed within a minute")
+	}
 	releaseOnce()
 	wg.Wait()
+	if err := <-bobDone; err != nil {
+		t.Fatalf("bob's mint while alice's were in flight: %v", err)
+	}
+	if ok, err := bobClient.Revoke(ctx, bobLease.ID, "done", 0, false); err != nil || !ok {
+		t.Fatalf("Revoke(bob) = %v, %v", ok, err)
+	}
 	close(leases)
 	close(errs)
 	prov.mu.Lock()
