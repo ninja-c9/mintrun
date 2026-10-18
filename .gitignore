@@ -1,5 +1,6 @@
 /mintrun
 /macos/MintrunMenuBar
+dist/
 *.exe
 *.test
 *.out

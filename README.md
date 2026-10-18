@@ -159,6 +159,7 @@ mintrun/
 │   └── README.md                         # Build and usage instructions for the macOS Menu Bar companion
 ├── examples/plugins/                     # Plugins built into the binary (`plugin install <name>`): bitwarden (vault), vercel & postgres-jit (providers)
 ├── scripts/
+│   ├── release.sh                        # Release archives for macOS and Linux (arm64, amd64) with SHA256SUMS, unsigned
 │   └── verify.sh                         # Every acceptance check: gofmt, go vet, tests with a coverage gate above 90%, build & smoke test
 └── docs/
     ├── assets/                           # SVG architectural diagrams
