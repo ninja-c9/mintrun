@@ -433,3 +433,20 @@
 - **Chưa xử lý:** Workstream AC (`no_network` cho lệnh con), phát hành `v0.12.0`, và Workstream AE (`mintrun relay` cho `v0.13.0`).
 - **Next step:** Triển khai Workstream AC (`no_network` child option).
 
+## Checkpoint — Workstream AC: Cách ly mạng `no_network` cho tiến trình con trên macOS và Linux (2026-10-18)
+
+- **Hoàn thành:** Workstream AC (`"no_network": true` trong `policy.json`, `-no-network` trên CLI, `no_network: true` trong MCP `mintrun_exec`).
+- **Outputs:** `internal/core/runner.go`, `internal/core/sandbox_linux.go`, `internal/core/core_test.go`, `internal/core/sandbox_linux_test.go`, `internal/core/sandbox_integration_test.go`, `internal/builtin/mcp.go`, `internal/builtin/appbroker.go`, `internal/builtin/appbroker_test.go`, `internal/builtin/telegram_test.go`, `internal/builtin/slack_test.go`, `internal/builtin/builtin_test.go`, `cmd/mintrun/main.go`, `cmd/mintrun/main_test.go`, `README.md`, `AGENTS.md` (cập nhật luật 4, 42, 43 và thêm luật 46), `checks.md`, `progress.md`.
+- **Quyết định:**
+  - `no_network` tự động bật `sandbox` (`d.Sandbox = req.Sandbox || rule.Sandbox || d.NoNetwork`) và chỉ cho phép siết chặt (`d.NoNetwork = req.NoNetwork || rule.NoNetwork`).
+  - Văn bản duyệt (`core.ApprovalText`) ghi `Network: blocked` hoặc `Network: open` ngay dưới dòng `Sandbox: on|off` (trước mọi trường do agent gửi); `AppApproval` gửi `"no_network": true|false` trong dòng `approve`; `AuditEntry` và `PolicyDecision` đều báo `no_network`.
+  - Trên macOS, `sandboxArgv(home, true)` dùng `sandboxProfileNoNetwork` (`sandboxProfile + "(deny network*)\n"`).
+  - Trên Linux (`amd64` và `arm64`; các kiến trúc khác bị từ chối fail-closed tại `linuxSandboxArgv`), helper `-mintrun-linux-sandbox -no-network` vừa gọi `unshare(CLONE_NEWNET)` (để nguyên `lo` ở trạng thái down) khi còn giữ `CAP_SYS_ADMIN`, vừa cài bộ lọc `seccomp-bpf` 9 lệnh (`SECCOMP_SET_MODE_FILTER`) ngay trước `exec` (và trong cả bước dry-run probe của `decide`) để trả `EPERM` cho `socket`, `connect`, `bind` trong khi vẫn cho phép `socketpair(AF_UNIX)`.
+- **Kiểm chứng:** Mục `Workstream AC` trong [checks.md](checks.md).
+  - Trên macOS 27.0 (`-tags integration`): `TestSandboxBlocksNetwork` (`1.53s`), `TestSandboxHidesHome` (`0.80s`), và `TestSandboxHidesKeychainItem` (`0.31s`) đều pass (chứng minh TCP, UDP, Unix socket trên đĩa, `net.Resolver`, và `/usr/bin/dns-sd -t 1 -G v4 localhost` đều bị chặn khi `no_network: true` và thành công khi tắt, trong khi ghi file cục bộ ngoài `~/.mintrun`, truyền byte qua `socketpair(AF_UNIX)`, và đọc `Lease.Env` vẫn hoạt động).
+  - Trên máy ảo OrbStack `ubuntu:24.04` (`linux/arm64`, kernel `6.17.8`): `TestLinuxSandboxSysProcAttrAndHelper`, `TestCheckPolicyMatchesExecBlind/sandbox`, `TestExecBlindLinuxSandbox`, `TestSandboxHidesHome`, và `TestSandboxBlocksNetwork` đều pass cả khi chạy user thường và `root`; máy ảo tạm đã được xoá sau khi kiểm chứng.
+  - Trên bản sao của cây code, **20/20 mutant** (16 trên macOS + 4 trên máy ảo Linux) đều biên dịch sạch và bị test bắt.
+  - Độ phủ câu lệnh tổng đạt **95.4%** (`cmd/mintrun` 95.3%, `internal/builtin` 94.9%, `internal/core` 95.9%); `gofmt`, `go vet`, và `go test -race` sạch.
+- **Chưa kiểm chứng:** Chạy thực tế `TestSandboxBlocksNetwork` trên một kernel `linux/amd64` thật (đã ghi rõ `unresolved` trong `checks.md` và `README.md`).
+- **Next step:** Phát hành `v0.12.0` (Step 5), sau đó triển khai Workstream AE (`mintrun relay` cho `v0.13.0`, Step 6).
+
