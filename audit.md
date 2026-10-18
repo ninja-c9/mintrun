@@ -15,7 +15,7 @@ An initial comprehensive security review identified 24 findings across the runti
 | :--- | :---: | :--- | :---: |
 | **Critical** | 3 | Live GitHub installation token leaked as `lease_id`; path traversal in plugin install; file-vault key derived from filesystem path | ✅ Fixed |
 | **High** | 5 | Fail-open policy evaluation (empty scope/permissions, malformed `policy.json`, implicit/ungated `static` mode); unscrubbed mint errors; external plugin shadowing built-ins | ✅ Fixed |
-| **Medium** | 8 | Ambient host environment inheritance; secrets on helper CLI `argv`; silent keystore fallback; misleading `revoked: true` on non-revocable leases; HTTP remote plugin install; case-sensitive command filter; no network sandbox | ✅ 7 Fixed · 1 Deferred (`M2` OS network sandbox) |
+| **Medium** | 8 | Ambient host environment inheritance; secrets on helper CLI `argv`; silent keystore fallback; misleading `revoked: true` on non-revocable leases; HTTP remote plugin install; case-sensitive command filter; no network sandbox | ✅ Fixed |
 | **Low** | 8 | Unbounded child output buffers; single-process kill on timeout; non-atomic vault writes; unchecked `rand.Read`; unsigned `X-Amz-Security-Token`; legacy plaintext vault map; `.github/` history; non-hermetic Keychain test | ✅ Fixed |
 
 ---
@@ -73,7 +73,7 @@ An initial comprehensive security review identified 24 findings across the runti
 | ID | Severity | Location | Finding | Resolution |
 | :--- | :---: | :--- | :--- | :--- |
 | **M1** | Medium | `internal/core/runner.go` | Child process inherited full `os.Environ()` | Added `-clean-env` / MCP `clean_env` and policy `clean_env` / `allowed_env` globs; `MINTRUN_VAULT_KEY` is never inherited |
-| **M2** | Medium | `internal/core/runner.go` | Child process retains network access and can exfiltrate lease tokens via script interpreters | Documented in [README.md](README.md); OS network sandbox (`no_network: true`) deferred pending per-OS integration testing |
+| **M2** | Medium | `internal/core/runner.go` | Child process retains network access and can exfiltrate lease tokens via script interpreters | Fixed in `v0.12.0` (opt-in): `no_network` (policy `"no_network": true`, CLI `-no-network`, MCP `no_network`) runs the child in the OS sandbox with egress blocked: `sandbox-exec` `(deny network*)` on macOS, `CLONE_NEWNET` plus a `seccomp-bpf` filter on `socket`, `connect`, and `bind` on Linux `amd64`/`arm64`; without it the network stays open, as [README.md](README.md) says (rule 46) |
 | **M3** | Medium | `internal/builtin/cloudflare.go` | `AWSProvider.Revoke` returned `nil`, reporting `revoked: true` for STS tokens that cannot be revoked early | `AWSProvider.Revoke` returns an error for ephemeral STS leases so `revoked: false` is reported; duration clamped to 900–43200s |
 | **M4** | Medium | `internal/core/runner.go` | Denylist command filter alone cannot stop shell or interpreter env dumps | Combined case-insensitive command filtering with `clean_env` / `allowed_env` environment isolation |
 | **M5** | Medium | `internal/builtin/keychain.go`, `cmd/mintrun/main.go` | Secrets passed on `argv` (`security -w`, `secret set <provider> <secret>`) were visible in `ps` and shell history | macOS Keychain writes via `security -i` on `stdin`; Linux uses `secret-tool` on `stdin`; CLI disables echo via `stty` and warns when a secret is passed on `argv` (`op item create` argv deferred) |
