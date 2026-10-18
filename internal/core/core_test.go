@@ -2136,9 +2136,8 @@ func TestAuditActivityFields(t *testing.T) {
 	}
 }
 
-// TestMain supplies a deterministic file-vault passphrase for the suite. The
-// AES-256-GCM fallback now mandates MINTRUN_VAULT_KEY (audit C3); tests that need
-// the "no passphrase" error path override it locally with t.Setenv.
+// countingReadSeeker counts the bytes TailAudit reads through it and can fail a read, or a seek
+// from the start.
 type countingReadSeeker struct {
 	rs       io.ReadSeeker
 	readB    int
@@ -2211,7 +2210,7 @@ not json
 		}
 	}
 
-	// On a 512 KiB seekable log, asking for the last 2 entries reads only the final 64 KiB chunk.
+	// On a 570 KiB seekable log, asking for the last 2 entries reads only the final 64 KiB chunk.
 	var big strings.Builder
 	for range 4000 {
 		big.WriteString(`{"provider":"aws","exit_code":0,"purpose":"` + strings.Repeat("p", 100) + `"}` + "\n")
@@ -2744,6 +2743,9 @@ func (r *inlineRelay) Revoke(ctx context.Context, id, outcome string, code int, 
 	return r.revokeFn(ctx, id, outcome, code, trunc)
 }
 
+// TestMain supplies a deterministic file-vault passphrase for the suite. The
+// AES-256-GCM fallback now mandates MINTRUN_VAULT_KEY (audit C3); tests that need
+// the "no passphrase" error path override it locally with t.Setenv.
 func TestMain(m *testing.M) {
 	if os.Getenv("MINTRUN_VAULT_KEY") == "" {
 		os.Setenv("MINTRUN_VAULT_KEY", "mintrun-unit-test-passphrase")
