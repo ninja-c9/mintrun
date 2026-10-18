@@ -16,6 +16,7 @@ Engineered with **100% Go standard library**, **zero external dependencies**, an
   <a href="#architecture-everything-is-a-plugin"><img src="https://img.shields.io/badge/Dependencies-Zero_(100%25_stdlib)-10B981?style=flat-square" alt="Zero Dependencies" /></a>
   <a href="#ai-agent-integration-mcp"><img src="https://img.shields.io/badge/MCP-JSON--RPC_2.0_Ready-38BDF8?style=flat-square" alt="MCP Ready" /></a>
   <a href="#verification--testing"><img src="https://img.shields.io/badge/Coverage-94.7%25_Verified-A78BFA?style=flat-square" alt="94.7% Coverage" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue?style=flat-square" alt="License: Apache-2.0" /></a>
 </p>
 
 <p align="center">
@@ -686,6 +687,12 @@ go test -tags integration -count=1 -v -run TestSandboxHidesSecretTool ./internal
 # macOS and Linux (amd64/arm64): check that -no-network blocks TCP, UDP, Unix sockets, and DNS inside the sandbox while local file I/O and socketpair work
 go test -tags integration -count=1 -v -run TestSandboxBlocksNetwork ./internal/core
 ```
+
+---
+
+## License
+
+`mintrun` is licensed under the [Apache License 2.0](LICENSE).
 
 ---
 
