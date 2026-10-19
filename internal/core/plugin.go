@@ -117,6 +117,9 @@ func (r *Registry) Register(p Plugin) error {
 	if m.Name == "" {
 		return errors.New("plugin manifest missing name")
 	}
+	if strings.Contains(m.Name, "@") {
+		return fmt.Errorf("plugin name %q must not contain '@', which separates a provider type from its account", m.Name)
+	}
 	// An external plugin must never shadow a built-in of the same name (audit H5).
 	if !m.Builtin {
 		if ex, ok := r.vaults[m.Name]; ok && ex.Manifest().Builtin {
@@ -158,14 +161,54 @@ func (r *Registry) Vault(name string) (VaultPlugin, error) {
 	return v, nil
 }
 
+// Provider resolves a provider name or alias: the exact name first, else the type before the
+// alias's '@', so "github@work" runs the github provider. The error quotes the name as given.
 func (r *Registry) Provider(name string) (ProviderPlugin, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	p, ok := r.providers[name]
 	if !ok {
+		typ, _ := SplitProvider(name)
+		p, ok = r.providers[typ]
+	}
+	if !ok {
 		return nil, fmt.Errorf("provider plugin %q not found", name)
 	}
 	return p, nil
+}
+
+// SplitProvider splits a provider alias, "<type>@<account>", at its first '@'. A bare "<type>"
+// is the default account and has no account. It checks nothing: decide refuses a malformed
+// alias before any vault or provider is looked up.
+func SplitProvider(name string) (typ, account string) {
+	typ, account, _ = strings.Cut(name, "@")
+	return typ, account
+}
+
+// ValidName reports whether name is 1 to 64 ASCII letters, digits, '.', '_', or '-', other than
+// "." and "..": the rule for a provider alias's account and a relay device's name.
+func ValidName(name string) bool {
+	if name == "" || len(name) > 64 || name == "." || name == ".." {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// ProviderForm is what ValidProvider accepts, for the errors that refuse anything else.
+const ProviderForm = `<type> or <type>@<account>, where the account is 1 to 64 lowercase ASCII letters, digits, '.', '_', or '-', other than "." and ".."`
+
+// ValidProvider reports whether p is a bare provider type or "<type>@<account>" with a non-empty
+// type and a lowercase ValidName account. The built-in vaults fold a key's case, so "github@Work"
+// would read the "github@work" secret while missing the "github@work" rule in policy.json.
+func ValidProvider(p string) bool {
+	typ, account, ok := strings.Cut(p, "@")
+	return !ok || (typ != "" && ValidName(account) && account == strings.ToLower(account))
 }
 
 func (r *Registry) Bridge(name string) (BridgePlugin, error) {
@@ -366,6 +409,9 @@ func safePluginName(name string) (string, error) {
 	}
 	if n == "." || n == ".." || n != filepath.Base(n) || strings.ContainsAny(n, `/\`) {
 		return "", fmt.Errorf("plugin name %q must be a single path segment", name)
+	}
+	if strings.Contains(n, "@") {
+		return "", fmt.Errorf("plugin name %q must not contain '@', which separates a provider type from its account", name)
 	}
 	return n, nil
 }

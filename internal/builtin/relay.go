@@ -35,19 +35,6 @@ type RelayDevice struct {
 	CreatedAt   string `json:"created_at"`
 }
 
-func validDeviceName(name string) bool {
-	if name == "" || len(name) > 64 || name == "." || name == ".." {
-		return false
-	}
-	for i := 0; i < len(name); i++ {
-		c := name[i]
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
-			return false
-		}
-	}
-	return true
-}
-
 func validHexSHA256(s string) bool {
 	if len(s) != 64 {
 		return false
@@ -92,7 +79,7 @@ func ListRelayDevices(homeDir string) ([]RelayDevice, error) {
 	}
 	seen := make(map[string]bool, len(devs))
 	for _, d := range devs {
-		if !validDeviceName(d.Name) || !validHexSHA256(d.TokenSHA256) || seen[d.Name] {
+		if !core.ValidName(d.Name) || !validHexSHA256(d.TokenSHA256) || seen[d.Name] {
 			return nil, errors.New("devices.json is malformed (invalid device entry)")
 		}
 		seen[d.Name] = true
@@ -121,7 +108,7 @@ func writeRelayDevices(homeDir string, devs []RelayDevice) error {
 // AddRelayDevice enrolls a new device in <home>/relay/devices.json and returns its one-time
 // bearer token alongside the stored record.
 func AddRelayDevice(homeDir, name string) (string, RelayDevice, error) {
-	if !validDeviceName(name) {
+	if !core.ValidName(name) {
 		return "", RelayDevice{}, fmt.Errorf("invalid device name %q (use 1..64 ASCII letters, digits, '.', '_', or '-')", name)
 	}
 	devs, err := ListRelayDevices(homeDir)
@@ -149,7 +136,7 @@ func AddRelayDevice(homeDir, name string) (string, RelayDevice, error) {
 
 // RemoveRelayDevice removes name from <home>/relay/devices.json.
 func RemoveRelayDevice(homeDir, name string) error {
-	if !validDeviceName(name) {
+	if !core.ValidName(name) {
 		return fmt.Errorf("invalid device name %q", name)
 	}
 	devs, err := ListRelayDevices(homeDir)

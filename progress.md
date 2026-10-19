@@ -632,3 +632,15 @@
 - **Chạy thật:** home tạm dùng keychain thật (service `mintrun:github` không phụ thuộc home), policy tạm cho `static`; `mintrun exec -provider github -scope ninja-c9/mintrun -perms static -- sh -c 'curl ... /repos/ninja-c9/mintrun'` trả **HTTP 200** (`full_name: ninja-c9/mintrun`, `visibility: public`), audit `outcome: done`, `exit_code: 0`, `ephemeral: false`, `revoked: false`, 657 ms. Chạy JIT (không `static`) bị từ chối đúng như thiết kế và in rõ opt-in. Home tạm đã xóa.
 - **Bổ sung:** `mintrun exec` có cờ `-purpose "..."` (trước đây chỉ MCP gửi được), nên người dùng CLI cũng nói được mục đích cho screen và người duyệt; policy vẫn kiểm purpose (≤300 byte, không ký tự điều khiển/xuống dòng). `TestCLIExecPurpose` pin cả trường hợp hợp lệ (audit `purpose`) và không hợp lệ (`blocked_by: purpose`); mutant "nhận cờ rồi bỏ giá trị" compile được và bị test giết.
 - **Kiểm chứng:** xem mục `Live GitHub Run and the CLI -purpose Flag` trong `checks.md`.
+
+
+## Checkpoint — Nhiều tài khoản cho một provider (`type@account`, Workstream AK, 2026-10-19)
+
+- **Hoàn thành:** provider giờ có thể viết `<type>@<account>` (ví dụ `github@work`). Cả chuỗi là khóa vault và khóa `policy.json`; provider chỉ thấy type, còn runner đặt tên lease bằng alias. Không kế thừa rule: `github@work` không có rule thì được xử lý như mọi provider không có rule. `@` bị từ chối trong tên plugin. `init <type> -account <name>`, gợi ý khi thiếu secret, `doctor`, `provider` của shim, relay, MCP và audit đều theo alias. Đã ghi rule 56 trong `AGENTS.md`, mục `Multiple Accounts` và ghi chú `Breaking changes in v0.16.0` trong README, và một dòng mới trong threat model.
+- **Thay đổi phá vỡ (`v0.16.0`):** `mintrun exec` bắt buộc `-provider` (trước đây mặc định `cloudflare`). Người dùng một tài khoản không phải đổi gì khác, vì tên trần là tài khoản mặc định.
+- **Kiểm chứng:** `scripts/verify.sh` 5/5 pass, coverage 95.1% (`cmd/mintrun` 95.0%, `internal/builtin` 94.1%, `internal/core` 96.6%); 77 mutant trên bản copy, 75 bị giết, 2 không build được đã viết lại; chạy tay trong home tạm với `MINTRUN_FILE_VAULT=1` đúng như tài liệu. Chi tiết: mục `Workstream AK` trong `checks.md`.
+- **Phát hiện khi chạy tay (đã sửa):** `doctor` in `no provider has a master secret yet` dù `github@work` đã được lưu, vì `doctor` chỉ kiểm một tài khoản khi `policy.json` hoặc shim config nhắc tới nó. Câu cảnh báo giờ nói đúng điều đó, `TestCLIDoctor` pin nó, và 11 mutant `doctor` chạy lại đều bị giết.
+- **Còn lại:**
+  - `docs/video/mintrun-intro.html` vẫn in `mintrun exec -- wrangler deploy` và `mintrun exec -- printenv`, giờ sẽ dừng vì thiếu `-provider`; video mp4 không dựng lại được ở đây.
+  - Mặc định `-perms dns:write,workers:write` là của Cloudflare nhưng áp cho mọi provider được gọi; đổi nó là một thay đổi phá vỡ nữa, cần người dùng quyết.
+  - Commit chỉ nằm trên nhánh `claude/trusting-jackson-813706`: chưa merge, chưa tag `v0.16.0`, chưa push.

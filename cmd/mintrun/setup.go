@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/fs"
@@ -195,7 +196,7 @@ func cmdDoctor(ctx context.Context, rt *core.Runtime, args []string) {
 	stored := doctorVault(ctx, rt, report)
 	doctorScreen(booted.Jev, report)
 	doctorPolicy(rt, stored, report)
-	doctorShims(rt, self, os.Getenv("PATH"), report)
+	doctorShims(rt, self, os.Getenv("PATH"), stored, report)
 	doctorIDEs(self, report)
 	if failed {
 		exitFunc(1)
@@ -224,19 +225,20 @@ func doctorBinary(report reportFunc) string {
 	return self
 }
 
-// doctorVault reports the default vault, which providers have a master secret in it, the
-// approval channels, and the semantic screen's key. It returns the providers that have one.
+// doctorVault reports the default vault, which providers and accounts (knownAliases) have a
+// master secret in it, the approval channels, and the semantic screen's key. It returns the
+// providers and accounts that have one, or nil when it could not check.
 func doctorVault(ctx context.Context, rt *core.Runtime, report reportFunc) map[string]bool {
 	stored := map[string]bool{}
 	v, err := rt.Registry.Vault(rt.DefaultVault)
 	if err != nil {
 		report("FAIL", "vault: %v (check MINTRUN_VAULT)", err)
-		return stored
+		return nil
 	}
 	kv, ok := v.(*builtin.KeychainVault)
 	if !ok {
 		report("-", "vault %s: not checked, since reading it can prompt", rt.DefaultVault)
-		return stored
+		return nil
 	}
 	switch {
 	case kv.SecretTool != "":
@@ -245,7 +247,7 @@ func doctorVault(ctx context.Context, rt *core.Runtime, report reportFunc) map[s
 		report("ok", "vault: macOS Keychain")
 	case os.Getenv("MINTRUN_VAULT_KEY") == "":
 		report("FAIL", "vault: the encrypted file vault needs MINTRUN_VAULT_KEY, which is not set, so no secret can be stored or read")
-		return stored
+		return nil
 	default:
 		report("ok", "vault: encrypted file vault")
 		report("warn", "vault: %s", ideEnvWarning)
@@ -264,8 +266,19 @@ func doctorVault(ctx context.Context, rt *core.Runtime, report reportFunc) map[s
 			report("FAIL", "secret %s: %v", m.Name, err)
 		}
 	}
+	for _, a := range knownAliases(rt) {
+		switch _, err := kv.GetSecret(ctx, a); {
+		case err == nil:
+			stored[a] = true
+			report("ok", "secret %s: set", a)
+		case errors.Is(err, builtin.ErrSecretNotFound):
+			report("-", "%v", err) // the vault's error names the command that stores it (rule 37)
+		default:
+			report("FAIL", "secret %s: %v", a, err)
+		}
+	}
 	if len(stored) == 0 {
-		report("warn", "secret: no provider has a master secret yet (run mintrun init)")
+		report("warn", "secret: none of the providers and accounts above has a master secret yet (run mintrun init; an account is checked only once policy.json or the shim config names it)")
 	}
 
 	if runtime.GOOS == "darwin" {
@@ -310,6 +323,21 @@ func doctorScreen(j *builtin.JevConfig, report reportFunc) {
 	report("ok", "screen: %s with %s, on_error %s", j.Mode, model, onError)
 }
 
+// knownAliases returns the "<type>@<account>" providers that policy.json and the shim config
+// name, sorted: doctor checks the vault for each, and init policy suggests a rule for GitHub's.
+// A file that fails to load names none here; doctor reports it on its own row.
+func knownAliases(rt *core.Runtime) []string {
+	rules, _ := rt.LoadPolicies()
+	cfg, _ := loadShimConfig(rt.HomeDir)
+	names := slices.Collect(maps.Keys(rules))
+	for _, e := range cfg {
+		names = append(names, e.Provider)
+	}
+	names = slices.DeleteFunc(names, func(n string) bool { return !strings.Contains(n, "@") })
+	slices.Sort(names)
+	return slices.Compact(names)
+}
+
 // doctorPolicy reads policy.json as exec does, then strictly: exec ignores a field it does not
 // know, so a misspelled one silently drops the limit it was meant to set.
 func doctorPolicy(rt *core.Runtime, stored map[string]bool, report reportFunc) {
@@ -323,8 +351,8 @@ func doctorPolicy(rt *core.Runtime, stored map[string]bool, report reportFunc) {
 		report("FAIL", "policy: %v, so exec denies every request", err)
 		return
 	}
-	var rules map[string]core.PolicyRule
-	if err := json.Unmarshal(raw, &rules); err != nil {
+	rules, err := rt.LoadPolicies()
+	if err != nil {
 		report("FAIL", "policy: %s is malformed (%v), so exec denies every request", p, err)
 		return
 	}
@@ -393,10 +421,13 @@ func doctorIDEs(self string, report reportFunc) {
 // wizard asks on stdout and reads answers from stdin. A read waits in a goroutine, so Ctrl-C,
 // which main's signal.NotifyContext turns into a cancelled ctx, still ends a prompt.
 type wizard struct {
-	ctx   context.Context
-	rt    *core.Runtime
-	vault core.VaultPlugin
-	in    *bufio.Reader
+	ctx      context.Context
+	rt       *core.Runtime
+	vault    core.VaultPlugin
+	in       *bufio.Reader
+	account  *string  // -account: the account begin stores under, without asking
+	accounts bool     // the running step stores a provider's master secret, so begin asks for an account
+	aliases  []string // the "<type>@<account>" keys this run named, which policy suggests rules for
 }
 
 func (w *wizard) read(hidden bool) string {
@@ -439,17 +470,36 @@ func (w *wizard) confirm(prompt string) bool {
 	return a == "y" || a == "yes"
 }
 
-// begin reports whether to go on and store key: one the vault already holds is replaced only on
-// a yes. A file vault without its passphrase stops here, before anything is typed.
-func (w *wizard) begin(key string) bool {
+// begin returns the key to store under, or "" to leave the stored one unchanged: a key the vault
+// already holds is replaced only on a yes. A file vault without its passphrase stops here, before
+// anything is typed. A provider's step first asks which account the master secret is for, unless
+// -account named one, and stores it under "<type>@<account>", or "<type>" for the default.
+func (w *wizard) begin(key string) string {
 	if kv, ok := w.vault.(*builtin.KeychainVault); ok && fileVaultOnly(kv) && os.Getenv("MINTRUN_VAULT_KEY") == "" {
 		fatal("the encrypted file vault needs a passphrase: export MINTRUN_VAULT_KEY in this shell, then run mintrun init again")
 	}
+	if w.accounts {
+		var name string
+		if w.account != nil {
+			name = *w.account
+		} else {
+			name = w.ask("Account name (Enter for the default)")
+		}
+		if name != "" {
+			key += "@" + name
+		}
+		if !core.ValidProvider(key) {
+			fatal("account %q is not valid: a provider is %s", name, core.ProviderForm)
+		}
+		if name != "" { // stored already, or stored by this step unless it stops mintrun
+			w.aliases = append(w.aliases, key)
+		}
+	}
 	if _, err := w.vault.GetSecret(w.ctx, key); err == nil && !w.confirm(key+" is already stored. Replace it?") {
 		fmt.Println("Left unchanged.")
-		return false
+		return ""
 	}
-	return true
+	return key
 }
 
 func (w *wizard) store(key, val string) {
@@ -483,44 +533,68 @@ func (w *wizard) readFile(prompt string) string {
 var initSteps = []struct {
 	name, label string
 	run         func(*wizard)
+	account     bool // stores a provider's master secret, under "<name>" or "<name>@<account>"
 }{
-	{"github", "GitHub (a GitHub App's private key)", (*wizard).github},
-	{"aws", "AWS (an access key)", (*wizard).aws},
-	{"gcp", "Google Cloud (a service-account key file)", (*wizard).gcp},
-	{"cloudflare", "Cloudflare (an API token)", (*wizard).cloudflare},
-	{"telegram", "approval through Telegram", (*wizard).telegram},
-	{"slack", "approval through Slack", (*wizard).slack},
-	{"jev", "the semantic screen (a TypeSafe AI API key)", (*wizard).jev},
-	{"policy", "a policy for GitHub", (*wizard).policy},
-	{"mcp", "mintrun in your IDEs", (*wizard).mcp},
+	{"github", "GitHub (a GitHub App's private key)", (*wizard).github, true},
+	{"aws", "AWS (an access key)", (*wizard).aws, true},
+	{"gcp", "Google Cloud (a service-account key file)", (*wizard).gcp, true},
+	{"cloudflare", "Cloudflare (an API token)", (*wizard).cloudflare, true},
+	{"telegram", "approval through Telegram", (*wizard).telegram, false},
+	{"slack", "approval through Slack", (*wizard).slack, false},
+	{"jev", "the semantic screen (a TypeSafe AI API key)", (*wizard).jev, false},
+	{"policy", "a policy for GitHub", (*wizard).policy, false},
+	{"mcp", "mintrun in your IDEs", (*wizard).mcp, false},
 }
 
 // cmdInit sets mintrun up step by step: master secrets, checked before they are stored, approval
-// channels, a starting policy, and the IDEs' MCP entries. `mintrun init <step>` runs one step.
+// channels, a starting policy, and the IDEs' MCP entries. `mintrun init <step>` runs one step, and
+// -account names the account a provider's step stores its master secret under.
 func cmdInit(ctx context.Context, rt *core.Runtime, args []string) {
-	var names []string
+	var names, accountSteps []string
 	for _, s := range initSteps {
 		names = append(names, s.name)
+		if s.account {
+			accountSteps = append(accountSteps, s.name)
+		}
 	}
-	usage := "usage: mintrun init [" + strings.Join(names, "|") + "]"
-	if len(args) > 1 {
+	usage := "usage: mintrun init [" + strings.Join(names, "|") + "], or mintrun init <" + strings.Join(accountSteps, "|") + "> -account <name>"
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var account *string
+	fs.Func("account", "", func(s string) error { account = &s; return nil })
+	var steps []string
+	for { // flags may come before or after the step
+		if err := fs.Parse(args); err != nil {
+			fatal("%s", usage)
+		}
+		if fs.NArg() == 0 {
+			break
+		}
+		steps = append(steps, fs.Arg(0))
+		args = fs.Args()[1:]
+	}
+	if len(steps) > 1 || account != nil && len(steps) == 0 {
 		fatal("%s", usage)
 	}
 	vault, err := rt.Registry.Vault(rt.DefaultVault)
 	if err != nil {
 		fatal("%v", err)
 	}
-	w := &wizard{ctx: ctx, rt: rt, vault: vault, in: bufio.NewReader(os.Stdin)}
+	w := &wizard{ctx: ctx, rt: rt, vault: vault, in: bufio.NewReader(os.Stdin), account: account}
 	for _, s := range initSteps {
+		w.accounts = s.account
 		switch {
-		case len(args) == 1 && args[0] == s.name:
+		case len(steps) == 1 && steps[0] == s.name:
+			if account != nil && !s.account {
+				fatal("%s", usage)
+			}
 			s.run(w)
 			return
-		case len(args) == 0 && w.confirm("Set up "+s.label+"?"):
+		case len(steps) == 0 && w.confirm("Set up "+s.label+"?"):
 			s.run(w)
 		}
 	}
-	if len(args) == 1 {
+	if len(steps) == 1 {
 		fatal("%s", usage)
 	}
 	fmt.Println("Next: mintrun doctor")
@@ -541,7 +615,8 @@ var (
 // github stores <app_id>:<installation_id>:<pem>. An empty installation ID stores <app_id>::<pem>,
 // which pins none, so each request names one in params.installation_id.
 func (w *wizard) github() {
-	if !w.begin("github") {
+	key := w.begin("github")
+	if key == "" {
 		return
 	}
 	fmt.Println("mintrun mints a short-lived installation token per command from a GitHub App's private key.")
@@ -557,15 +632,16 @@ func (w *wizard) github() {
 	if _, err := builtin.ParseRSAPrivateKey(pem); err != nil {
 		fatal("private key: %v", err)
 	}
-	w.store("github", app+":"+inst+":"+pem)
-	fmt.Println("Run commands with -provider github -scope owner/repo -perms <permission:access, e.g. contents:read>.")
+	w.store(key, app+":"+inst+":"+pem)
+	fmt.Println("Run commands with -provider " + key + " -scope owner/repo -perms <permission:access, e.g. contents:read>.")
 	if inst == "" {
-		fmt.Println(`No installation is pinned, so each request picks one in params.installation_id. List the allowed ones in policy.json: "github": {"allowed_installations": ["<id>"]}`)
+		fmt.Printf("No installation is pinned, so each request picks one in params.installation_id. List the allowed ones in policy.json: %q: {\"allowed_installations\": [\"<id>\"]}\n", key)
 	}
 }
 
 func (w *wizard) aws() {
-	if !w.begin("aws") {
+	key := w.begin("aws")
+	if key == "" {
 		return
 	}
 	fmt.Println("mintrun signs an STS AssumeRole request with this key, so each command gets a short-lived role session.")
@@ -585,12 +661,13 @@ func (w *wizard) aws() {
 		}
 		master += ":" + token
 	}
-	w.store("aws", master)
-	fmt.Println("Run commands with -provider aws -scope arn:aws:iam::<account>:role/<name> -perms <IAM actions, e.g. s3:ListBucket>.")
+	w.store(key, master)
+	fmt.Println("Run commands with -provider " + key + " -scope arn:aws:iam::<account>:role/<name> -perms <IAM actions, e.g. s3:ListBucket>.")
 }
 
 func (w *wizard) gcp() {
-	if !w.begin("gcp") {
+	key := w.begin("gcp")
+	if key == "" {
 		return
 	}
 	raw := w.readFile("Path to the service account's JSON key file")
@@ -604,12 +681,13 @@ func (w *wizard) gcp() {
 	if _, err := builtin.ParseRSAPrivateKey(sa.PrivateKey); err != nil {
 		fatal("private_key: %v", err)
 	}
-	w.store("gcp", raw)
-	fmt.Println("Run commands with -provider gcp -perms cloud-platform.read-only (or another OAuth scope).")
+	w.store(key, raw)
+	fmt.Println("Run commands with -provider " + key + " -perms cloud-platform.read-only (or another OAuth scope).")
 }
 
 func (w *wizard) cloudflare() {
-	if !w.begin("cloudflare") {
+	key := w.begin("cloudflare")
+	if key == "" {
 		return
 	}
 	fmt.Println(`mintrun creates a short-lived token per command, so this API token needs "User → API Tokens → Edit" (the "Create Additional Tokens" template).`)
@@ -617,14 +695,14 @@ func (w *wizard) cloudflare() {
 	if !cfTokenRe.MatchString(tok) {
 		fatal("a Cloudflare API token is letters, digits, _ or -")
 	}
-	w.store("cloudflare", tok)
-	fmt.Println("Run commands with -provider cloudflare -scope <zone, e.g. example.com>.")
+	w.store(key, tok)
+	fmt.Println("Run commands with -provider " + key + " -scope <zone, e.g. example.com>.")
 }
 
 // telegram links the bot to whoever opens a one-time link, never to anyone who merely messages it,
 // and stores the pair only after a yes to the sender's name.
 func (w *wizard) telegram() {
-	if !w.begin(builtin.TelegramApprovalKey) {
+	if w.begin(builtin.TelegramApprovalKey) == "" {
 		return
 	}
 	fmt.Println("Create a bot for mintrun alone with @BotFather (/newbot): a bot with a webhook cannot be used.")
@@ -645,7 +723,7 @@ func (w *wizard) telegram() {
 // slack has no link to tie a member ID to the person typing it, so after the test request it
 // asks who answered, and removes the setting when it was someone else.
 func (w *wizard) slack() {
-	if !w.begin(builtin.SlackApprovalKey) {
+	if w.begin(builtin.SlackApprovalKey) == "" {
 		return
 	}
 	fmt.Println("Create a Slack app for mintrun alone, give its bot the scopes chat:write, reactions:read and reactions:write, install it, and copy its Bot User OAuth Token (xoxb-…).")
@@ -667,7 +745,7 @@ func (w *wizard) slack() {
 // jev stores the TypeSafe API key the semantic screen sends. It sends no test request, since every
 // call is billed.
 func (w *wizard) jev() {
-	if !w.begin(builtin.JevKey) {
+	if w.begin(builtin.JevKey) == "" {
 		return
 	}
 	fmt.Println("The semantic screen sends each request's fields (provider, scope, command, purpose), never a stored secret, to TypeSafe AI's Jev, which can ask you to approve a request. It stays off until settings.json turns it on.")
@@ -722,18 +800,33 @@ func (w *wizard) policy() {
 	} else {
 		fmt.Printf("Sandbox: not suggested: %v\n", err)
 	}
+	// The same rule for the default account and each GitHub account this run named or policy.json
+	// or the shim config names (knownAliases): a rule only tightens, since a provider without one
+	// may mint for any scope.
+	keys := []string{"github"}
+	for _, k := range slices.Concat(w.aliases, knownAliases(w.rt)) {
+		if typ, _ := core.SplitProvider(k); typ == "github" && !slices.Contains(keys, k) {
+			keys = append(keys, k)
+		}
+	}
 	p := filepath.Join(w.rt.HomeDir, "policy.json")
 	if _, err := os.Stat(p); !errors.Is(err, fs.ErrNotExist) {
 		entry, _ := json.MarshalIndent(rule, "", "  ")
 		rules, _ := w.rt.LoadPolicies()
-		if _, ok := rules["github"]; ok {
-			fmt.Printf("%s already has a github rule; left unchanged. The suggested rule:\n\"github\": %s\n", p, entry)
-		} else {
-			fmt.Printf("%s exists, so it is left unchanged. Add this key to it:\n\"github\": %s\n", p, entry)
+		for _, k := range keys {
+			if _, ok := rules[k]; ok {
+				fmt.Printf("%s already has a %s rule; left unchanged. The suggested rule:\n%q: %s\n", p, k, k, entry)
+			} else {
+				fmt.Printf("%s exists, so it is left unchanged. Add this key to it:\n%q: %s\n", p, k, entry)
+			}
 		}
 		return
 	}
-	js, _ := json.MarshalIndent(map[string]core.PolicyRule{"github": rule}, "", "  ")
+	suggested := map[string]core.PolicyRule{}
+	for _, k := range keys {
+		suggested[k] = rule
+	}
+	js, _ := json.MarshalIndent(suggested, "", "  ")
 	fmt.Printf("%s:\n%s\n", p, js)
 	if !w.confirm("Write it?") {
 		return

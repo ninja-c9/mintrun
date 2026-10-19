@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"maps"
 	"os"
@@ -54,6 +55,10 @@ func TestCLIShim(t *testing.T) {
 			{"shim", "install", "nosuch"},
 			{"shim", "install", "-scope", "acme/widgets"},
 			{"shim", "install", "-perms", "contents:read"},
+			{"shim", "install", "-provider", "github@work"},
+			{"shim", "install", "-provider", "aws@work", "gh"},
+			{"shim", "install", "-provider", "github@Work", "gh"},
+			{"shim", "install", "-provider", "github@", "gh"},
 			{"shim", "remove", "nosuch"},
 		} {
 			if res := runCLI(t, "", nil, bad...); !res.exited || res.code != 1 {
@@ -258,7 +263,9 @@ func TestCLIShim(t *testing.T) {
 			t.Fatal(err)
 		}
 		inW.Close()
-		r = capture(t, inR, nil, func() { offerShimProfiles(context.Background(), line, edits, true) })
+		r = capture(t, inR, nil, func() {
+			offerShimProfiles(&wizard{ctx: context.Background(), in: bufio.NewReader(os.Stdin)}, line, edits, true)
+		})
 		if r.code != 1 || !strings.Contains(r.err, "~/.zshenv changed while mintrun waited, so it was left unchanged") {
 			t.Errorf("edited while asking: code %d:\n%s%s", r.code, r.out, r.err)
 		}
@@ -582,6 +589,86 @@ func TestCLIShim(t *testing.T) {
 		}
 	})
 
+	t.Run("provider runs a shim as an account", func(t *testing.T) {
+		home, _ := setupEnv(t)
+		mintrunHome := filepath.Join(home, ".mintrun")
+		dir := filepath.Join(mintrunHome, "shims")
+		bin := filepath.Join(home, "bin")
+		writeFile(t, filepath.Join(bin, "gh"), stubLog+`printf 'token=%s\n' "$GH_TOKEN"`+"\n")
+		if err := os.Chmod(filepath.Join(bin, "gh"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", dir+string(os.PathListSeparator)+bin)
+		pat := "ghp_work_" + leak
+		setSecret(t, "github@work", pat)
+		writeFile(t, filepath.Join(mintrunHome, "policy.json"),
+			`{"github":{},"github@ci":{},"github@work":{"allowed_scopes":["acme/widgets"],"allow_static":true}}`)
+		provider := func() string {
+			t.Helper()
+			cfg, err := loadShimConfig(mintrunHome)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return cfg["gh"].Provider
+		}
+
+		// policy.json names GitHub accounts, so install asks which one runs gh; an answer out of
+		// range stops it before anything is linked.
+		r := runCLI(t, "9\n", nil, "shim", "install", "gh")
+		if !r.exited || r.code != 1 || !strings.Contains(r.err, "expected a number from 1 to 3") {
+			t.Fatalf("out-of-range answer: code=%d\n%s%s", r.code, r.out, r.err)
+		}
+		if _, err := os.Lstat(filepath.Join(dir, "gh")); !os.IsNotExist(err) {
+			t.Errorf("install linked gh after a bad answer: %v", err)
+		}
+		// Enter (EOF here) picks the default account, which stores no provider.
+		if r := runCLI(t, "", nil, "shim", "install", "gh"); r.exited {
+			t.Fatalf("install default: %s%s", r.out, r.err)
+		}
+		if p := provider(); p != "" {
+			t.Errorf("default account stored provider %q", p)
+		}
+		// A number picks the account, and the same reader then answers the profile question.
+		r = runCLI(t, "3\ny\n", nil, "shim", "install", "-mode", "auto", "-perms", "static", "gh")
+		if r.exited || !strings.Contains(r.out, "  1) github (the default account)\n  2) github@ci\n  3) github@work\n") {
+			t.Fatalf("install numbered: %s%s", r.out, r.err)
+		}
+		if p := provider(); p != "github@work" {
+			t.Errorf("provider = %q, want github@work", p)
+		}
+		if data, _ := os.ReadFile(filepath.Join(home, ".zshrc")); !strings.Contains(string(data), shimProfileMarker) {
+			t.Errorf(".zshrc not wired after the numbered answer:\n%s", data)
+		}
+		if r := runCLI(t, "", nil, "shim", "list"); r.exited || !strings.Contains(r.out, "github@work") {
+			t.Errorf("shim list does not show the account:\n%s%s", r.out, r.err)
+		}
+		takeCalls(t, home)
+
+		// Auto mode runs gh as github@work: that account's secret, and the scope its own rule allows.
+		r = runAsTool(t, filepath.Join(dir, "gh"), "repo", "view")
+		if !r.exited || r.code != 0 || !strings.Contains(r.out, "token=[MINTRUN:REDACTED]") || strings.Contains(r.out+r.err, pat) {
+			t.Fatalf("auto gh as github@work: code=%d\n%s%s", r.code, r.out, r.err)
+		}
+		if e := lastAudit(t, mintrunHome); e.Provider != "github@work" || e.Scope != "acme/widgets" || e.Outcome != "done" {
+			t.Errorf("audit entry = %+v, want a done github@work run on acme/widgets", e)
+		}
+
+		// -provider skips the question, and block mode names the account in both hints.
+		r = runCLI(t, "", nil, "shim", "install", "-provider", "github@work", "gh")
+		if r.exited || strings.Contains(r.out, "Which one") {
+			t.Fatalf("install -provider: %s%s", r.out, r.err)
+		}
+		takeCalls(t, home)
+		r = runAsTool(t, filepath.Join(dir, "gh"), "repo", "view")
+		if !r.exited || r.code != 126 || !strings.Contains(r.err, `MCP tool (provider="github@work")`) ||
+			!strings.Contains(r.err, "mintrun exec -provider github@work -scope acme/widgets -perms contents:read,metadata:read -- gh repo view") {
+			t.Errorf("block hint: code=%d\n%s", r.code, r.err)
+		}
+		if got := takeCalls(t, home); strings.Contains(got, "gh ") {
+			t.Errorf("gh ran in block mode: %q", got)
+		}
+	})
+
 	t.Run("fail-closed shims config and doctorShims", func(t *testing.T) {
 		for _, c := range []struct {
 			name    string
@@ -614,6 +701,12 @@ func TestCLIShim(t *testing.T) {
 			{"invalid mode", func(t *testing.T, dir, cfgPath string) {
 				writeFile(t, cfgPath, `{"gh":{"mode":"bypass"}}`)
 			}, `shims/config.json tool "gh" has invalid mode "bypass"`},
+			{"provider of another type", func(t *testing.T, dir, cfgPath string) {
+				writeFile(t, cfgPath, `{"gh":{"provider":"aws@work"}}`)
+			}, `shims/config.json tool "gh" has invalid provider "aws@work"`},
+			{"provider with an uppercase account", func(t *testing.T, dir, cfgPath string) {
+				writeFile(t, cfgPath, `{"gh":{"provider":"github@Work"}}`)
+			}, `shims/config.json tool "gh" has invalid provider "github@Work"`},
 		} {
 			t.Run(c.name, func(t *testing.T) {
 				home, _ := setupEnv(t)

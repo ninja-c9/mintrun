@@ -837,6 +837,14 @@ func TestSecretNotFoundHint(t *testing.T) {
 		SlackApprovalKey:    `secret "approval-slack" not found in vault (run mintrun init slack)`,
 		JevKey:              `secret "jev" not found in vault (run mintrun init jev)`,
 		"vercel":            `secret "vercel" not found in vault (run mintrun secret set vercel)`,
+		"github@work":       `secret "github@work" not found in vault (run mintrun init github -account work)`,
+		"GitHub@Work":       `secret "GitHub@Work" not found in vault (run mintrun init github -account work)`,
+		"cloudflare@cl-a.1": `secret "cloudflare@cl-a.1" not found in vault (run mintrun init cloudflare -account cl-a.1)`,
+		"vercel@x":          `secret "vercel@x" not found in vault (run mintrun secret set vercel@x)`,
+		" Vercel@X ":        `secret " Vercel@X " not found in vault (run mintrun secret set vercel@x)`,
+		"jev@x":             `secret "jev@x" not found in vault (run mintrun secret set jev@x)`,
+		"github@":           `secret "github@" not found in vault (run mintrun secret set github@)`,
+		"github@a@b":        `secret "github@a@b" not found in vault (run mintrun secret set github@a@b)`,
 	} {
 		if _, err := kv.GetSecret(ctx, key); err == nil || err.Error() != want || !errors.Is(err, ErrSecretNotFound) {
 			t.Errorf("GetSecret(%q) = %v, want %q wrapping ErrSecretNotFound", key, err, want)
@@ -851,6 +859,11 @@ func TestSecretNotFoundHint(t *testing.T) {
 	want := `vault "keychain" could not load master secret for "github": secret "github" not found in vault (run mintrun init github)`
 	if err == nil || err.Error() != want || !errors.Is(err, ErrSecretNotFound) {
 		t.Fatalf("ExecBlind = %v, want %q wrapping ErrSecretNotFound", err, want)
+	}
+	_, err = rt.ExecBlind(ctx, core.ExecRequest{MintRequest: core.MintRequest{Provider: "github@work", Scope: "owner/repo"}, Command: []string{"true"}})
+	want = `vault "keychain" could not load master secret for "github@work": secret "github@work" not found in vault (run mintrun init github -account work)`
+	if err == nil || err.Error() != want || !errors.Is(err, ErrSecretNotFound) {
+		t.Fatalf("ExecBlind(github@work) = %v, want %q wrapping ErrSecretNotFound", err, want)
 	}
 }
 
@@ -1723,6 +1736,30 @@ func TestMCPBridgeGovernanceTools(t *testing.T) {
 	}
 }
 
+// TestMCPAuditProviderAlias pins mintrun_audit's view of a provider alias: the label keeps its '@',
+// a bare type's filter also returns the type's aliases, and an alias's filter returns only itself.
+func TestMCPAuditProviderAlias(t *testing.T) {
+	home := t.TempDir()
+	log := `{"provider":"github"}` + "\n" + `{"provider":"github@work"}` + "\n" + `{"provider":"cloudflare@work"}` + "\n"
+	if err := os.WriteFile(filepath.Join(home, "audit.jsonl"), []byte(log), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for filter, want := range map[string][]string{
+		"":            {"github", "github@work", "cloudflare@work"},
+		"github":      {"github", "github@work"},
+		"github@work": {"github@work"},
+	} {
+		es, err := readAudit(home, filter, false, 10)
+		var got []string
+		for _, e := range es {
+			got = append(got, e.Provider)
+		}
+		if err != nil || !slices.Equal(got, want) {
+			t.Errorf("readAudit(%q) = %q (%v), want %q", filter, got, err, want)
+		}
+	}
+}
+
 // TestMCPBridgeAuditUnreadable calls mintrun_audit on an audit.jsonl that exists but cannot be
 // read: a directory fails in TailAudit's read, and a file without read permission (which root
 // reads anyway) fails at the open. The agent gets the cause, never the path, which names the home
@@ -2025,7 +2062,7 @@ func TestMCPBridgeExecCleanEnv(t *testing.T) {
 }
 
 // TestMCPBridgeClientInfo checks the client name a Serve call takes from initialize's clientInfo:
-// only [A-Za-z0-9._ ()-] is kept, cut to 64 bytes; a name with nothing left records no client; a
+// only [A-Za-z0-9._ ()@-] is kept, cut to 64 bytes; a name with nothing left records no client; a
 // "client" in the tool arguments is ignored; and two interleaved sessions on one bridge each keep
 // their own name. Every exec has an empty command, so it is blocked before any vault opens.
 func TestMCPBridgeClientInfo(t *testing.T) {
@@ -2053,7 +2090,7 @@ func TestMCPBridgeClientInfo(t *testing.T) {
 	// One session per name, labeled by scope. Characters are dropped, not replaced, before the cut.
 	want := map[string]string{}
 	for _, c := range []struct{ label, name, client string }{
-		{"filtered", "Evil\n\"Claude\" \u202e\u00e9<b>/:;@1.2_3 (beta)-x", "EvilClaude b1.2_3 (beta)-x"},
+		{"filtered", "Evil\n\"Claude\" \u202e\u00e9<b>/:;@1.2_3 (beta)-x", "EvilClaude b@1.2_3 (beta)-x"},
 		{"cut", "\u00e9" + strings.Repeat("abcdefgh", 9), strings.Repeat("abcdefgh", 8)},
 		{"empty", "", ""},
 		{"stripped", "\u202e\n\u00e9", ""},

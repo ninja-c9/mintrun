@@ -249,7 +249,7 @@ func main() {
 func cmdExec(ctx context.Context, rt *core.Runtime, args []string) {
 	defer withoutShimsOnPath(rt.HomeDir)()
 	fs := flag.NewFlagSet("exec", flag.ExitOnError)
-	provider := fs.String("provider", "cloudflare", "Provider plugin name (e.g. cloudflare, github)")
+	provider := fs.String("provider", "", "Provider as type[@account] (e.g. github or github@work), required")
 	scope := fs.String("scope", "", "Target resource scope (e.g. domain 'example.com' or repo 'owner/repo')")
 	perms := fs.String("perms", "dns:write,workers:write", "Comma-separated permissions (or 'static')")
 	vault := fs.String("vault", "", "Vault plugin override (default: keychain, or 1password)")
@@ -278,8 +278,8 @@ func cmdExec(ctx context.Context, rt *core.Runtime, args []string) {
 		_ = fs.Parse(flagArgs)
 	}
 
-	if len(cmdArgs) == 0 {
-		fatal("usage: mintrun exec -provider cloudflare -scope example.com -- <command> [args...]")
+	if *provider == "" || len(cmdArgs) == 0 {
+		fatal("usage: mintrun exec -provider <type>[@<account>] -scope <scope> -- <command> [args...]")
 	}
 	if *relayURL != "" {
 		if err := configureRelay(rt, *relayURL); err != nil {
@@ -467,7 +467,7 @@ func cmdMCP(ctx context.Context, rt *core.Runtime, args []string) {
 
 func cmdAudit(rt *core.Runtime, args []string) {
 	fs := flag.NewFlagSet("audit", flag.ExitOnError)
-	provider := fs.String("provider", "", "Filter audit entries by provider name")
+	provider := fs.String("provider", "", "Filter audit entries by provider (a bare type also matches its type@account aliases)")
 	failedOnly := fs.Bool("failed", false, "Show only failed executions (exit_code != 0 or error != '')")
 	limit := fs.Int("limit", 0, "Show only the last N matching entries")
 	_ = fs.Parse(args)

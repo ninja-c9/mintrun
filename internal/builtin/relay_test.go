@@ -33,6 +33,7 @@ type relayTestProvider struct {
 	mintErr     error
 	mintHook    func() // runs at the start of Mint, outside mu
 	revokedIDs  []string
+	mints       []string // "<req.Provider>|<master>" per Mint call
 }
 
 func (p *relayTestProvider) Manifest() core.Manifest {
@@ -42,6 +43,7 @@ func (p *relayTestProvider) Manifest() core.Manifest {
 func (p *relayTestProvider) Mint(_ context.Context, master string, req core.MintRequest) (*core.Lease, error) {
 	p.mu.Lock()
 	hook := p.mintHook
+	p.mints = append(p.mints, req.Provider+"|"+master)
 	p.mu.Unlock()
 	if hook != nil {
 		hook()
@@ -72,8 +74,9 @@ func (p *relayTestProvider) Mint(_ context.Context, master string, req core.Mint
 func (p *relayTestProvider) Revoke(_ context.Context, _ string, lease *core.Lease) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if lease.RevokeSecret != "revoke-only-server-secret-9999" {
-		return errors.New("missing server-side RevokeSecret")
+	// Revoke gets the lease as Mint returned it, never one renamed for an account.
+	if lease.RevokeSecret != "revoke-only-server-secret-9999" || lease.Provider != "cf-relay" {
+		return errors.New("missing server-side RevokeSecret, or a lease Mint did not return")
 	}
 	p.revokedIDs = append(p.revokedIDs, lease.ID)
 	return nil
@@ -288,6 +291,10 @@ func TestRelayEndToEnd(t *testing.T) {
 			"allowed_permissions": ["dns:write"],
 			"max_ttl_seconds": 120,
 			"clean_env": true
+		},
+		"cf-relay@work": {
+			"allowed_scopes": ["work.example"],
+			"max_ttl_seconds": 60
 		}
 	}`
 	if err := os.WriteFile(filepath.Join(serverHome, "policy.json"), []byte(policyJSON), 0o600); err != nil {
@@ -487,6 +494,50 @@ func TestRelayEndToEnd(t *testing.T) {
 		t.Fatalf("server screened %d times for one relay exec, want 2", n)
 	}
 
+	// 5b. An account alias reads its own master secret and its own rule on the server, with nothing
+	// inherited from the bare type's, the provider sees only its type, and every entry names the alias.
+	workMaster := "cf_master_secret_work_account_0002"
+	if err := kv.SetSecret(context.Background(), "cf-relay@work", workMaster); err != nil {
+		t.Fatalf("SetSecret alias: %v", err)
+	}
+	aliasReq := func(provider, scope string) core.ExecRequest {
+		return core.ExecRequest{
+			MintRequest: core.MintRequest{Provider: provider, Scope: scope, Permissions: []string{"dns:write"}},
+			Command:     []string{"sh", "-c", `printf "tok=%s" "$CF_API_TOKEN"`},
+		}
+	}
+	if d := clientRT.CheckPolicy(aliasReq("cf-relay@work", "example.com")); d.Allowed || d.BlockedBy != "scope" {
+		t.Fatalf("the alias took the bare type's scope: %+v", d)
+	}
+	if d := clientRT.CheckPolicy(aliasReq("cf-relay@work", "work.example")); !d.Allowed || d.TTLSeconds != 60 || d.CleanEnv {
+		t.Fatalf("alias CheckPolicy = %+v, want its own rule", d)
+	}
+	res, err = clientRT.ExecBlind(context.Background(), aliasReq("cf-relay@work", "work.example"))
+	if err != nil || res.ExitCode != 0 || !res.Revoked || res.Stdout != "tok=[MINTRUN:REDACTED]" {
+		t.Fatalf("alias ExecBlind via relay: res=%+v err=%v", res, err)
+	}
+	prov.mu.Lock()
+	lastMint := prov.mints[len(prov.mints)-1]
+	prov.mu.Unlock()
+	if lastMint != "cf-relay|"+workMaster {
+		t.Fatalf("the provider minted %q, want its type with the alias's master secret", lastMint)
+	}
+	srv, cli := readAuditLines(t, serverHome), readAuditLines(t, clientHome)
+	for i, e := range []core.AuditEntry{srv[len(srv)-2], srv[len(srv)-1], cli[len(cli)-1]} {
+		if want := []string{"minted", "done", "done"}[i]; e.Provider != "cf-relay@work" || e.Outcome != want {
+			t.Fatalf("alias audit entry %d: %+v", i, e)
+		}
+	}
+	// An alias with no rule is governed like any provider without one; with no secret it fails to
+	// mint, and the vault names the fix.
+	if d := clientRT.CheckPolicy(aliasReq("cf-relay@ci", "other.example")); !d.Allowed || d.CleanEnv {
+		t.Fatalf("an alias with no rule: %+v", d)
+	}
+	if _, err := clientRT.ExecBlind(context.Background(), aliasReq("cf-relay@ci", "other.example")); err == nil ||
+		err.Error() != `relay mint failed: vault "keychain" could not load master secret for "cf-relay@ci": secret "cf-relay@ci" not found in vault (run mintrun secret set cf-relay@ci)` {
+		t.Fatalf("an alias with no secret: %v", err)
+	}
+
 	// 6. Cross-device revoke isolation: bob cannot revoke alice's lease, and invalid outcome is rejected.
 	lease, _, _, err := aliceClient.Mint(context.Background(), core.ExecRequest{
 		MintRequest: core.MintRequest{Provider: "cf-relay", Scope: "example.com", Permissions: []string{"dns:write"}},
@@ -536,6 +587,19 @@ func TestRelayEndToEnd(t *testing.T) {
 		Command:     []string{"true"},
 	}); err == nil || strings.Contains(err.Error(), masterSecret) || !strings.Contains(err.Error(), "non-ephemeral or master-secret lease") {
 		t.Fatalf("expected master-leaking lease to be refused and scrubbed, got: %v", err)
+	}
+	// An alias's refused lease is still revoked, and Revoke gets it as the provider minted it.
+	prov.mu.Lock()
+	revokesBefore := len(prov.revokedIDs)
+	prov.mu.Unlock()
+	if _, err := clientRT.ExecBlind(context.Background(), aliasReq("cf-relay@work", "work.example")); err == nil || strings.Contains(err.Error(), workMaster) || !strings.Contains(err.Error(), `provider "cf-relay@work" returned a non-ephemeral or master-secret lease`) {
+		t.Fatalf("expected the alias's master-leaking lease to be refused and scrubbed, got: %v", err)
+	}
+	prov.mu.Lock()
+	revokesAfter := len(prov.revokedIDs)
+	prov.mu.Unlock()
+	if revokesAfter != revokesBefore+1 {
+		t.Fatalf("the alias's refused lease got %d revokes, want 1 with the lease as minted", revokesAfter-revokesBefore)
 	}
 	prov.leakMaster = false
 

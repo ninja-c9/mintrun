@@ -550,10 +550,20 @@ func (k *KeychainVault) getFileSecret(key string) (string, error) {
 }
 
 // setupHint names the command that stores key: the mintrun init step for a key init sets up
-// (initSteps in cmd/mintrun/setup.go), otherwise mintrun secret set. It folds case and space as
-// serviceName does.
+// (initSteps in cmd/mintrun/setup.go), with -account for an account of a provider init sets up,
+// otherwise mintrun secret set. It folds case and space as serviceName does.
 func setupHint(key string) string {
-	switch k := strings.TrimSpace(strings.ToLower(key)); k {
+	k := strings.TrimSpace(strings.ToLower(key))
+	if typ, account, ok := strings.Cut(k, "@"); ok {
+		switch typ {
+		case "github", "aws", "gcp", "cloudflare":
+			if core.ValidProvider(k) {
+				return "mintrun init " + typ + " -account " + account
+			}
+		}
+		return "mintrun secret set " + k
+	}
+	switch k {
 	case "github", "aws", "gcp", "cloudflare", JevKey:
 		return "mintrun init " + k
 	case TelegramApprovalKey:

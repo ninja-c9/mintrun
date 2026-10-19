@@ -101,10 +101,10 @@ func clientName(params json.RawMessage) string {
 	return shortLabel(p.ClientInfo.Name)
 }
 
-// shortLabel keeps only [A-Za-z0-9._ ()-] of s, then cuts it to 64 bytes.
+// shortLabel keeps only [A-Za-z0-9._ ()@-] of s, then cuts it to 64 bytes.
 func shortLabel(s string) string {
 	s = strings.Map(func(r rune) rune {
-		if strings.ContainsRune("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._ ()-", r) {
+		if strings.ContainsRune("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._ ()@-", r) {
 			return r
 		}
 		return -1
@@ -136,7 +136,7 @@ func (m *MCPBridge) handleRequest(ctx context.Context, rt *core.Runtime, req jso
 			"properties": map[string]any{
 				"provider": map[string]any{
 					"type":        "string",
-					"description": "Provider plugin name (e.g. 'cloudflare', 'github')",
+					"description": "Provider as type[@account] (e.g. 'github@work'); a bare type is its default account",
 				},
 				"scope": map[string]any{
 					"type":        "string",
@@ -213,13 +213,13 @@ func (m *MCPBridge) handleRequest(ctx context.Context, rt *core.Runtime, req jso
 					},
 					{
 						"name":        "mintrun_audit",
-						"description": "Return recent entries of the mintrun_exec audit log, oldest first. Text an agent wrote is left out or cut down, since a secret typed into argv is not one the runner can scrub and each request is logged as the agent sent it: scope, permissions, and purpose are left out, an error shows as [MINTRUN:REDACTED] (outcome and blocked_by give the verdict), each command is cut to its binary name, and provider, binary, and client names keep only letters, digits, and ._ ()- up to 64 bytes.",
+						"description": "Return recent entries of the mintrun_exec audit log, oldest first. Text an agent wrote is left out or cut down, since a secret typed into argv is not one the runner can scrub and each request is logged as the agent sent it: scope, permissions, and purpose are left out, an error shows as [MINTRUN:REDACTED] (outcome and blocked_by give the verdict), each command is cut to its binary name, and provider, binary, and client names keep only letters, digits, and ._ ()@- up to 64 bytes.",
 						"inputSchema": map[string]any{
 							"type": "object",
 							"properties": map[string]any{
 								"provider": map[string]any{
 									"type":        "string",
-									"description": "Only entries for this provider (case-insensitive)",
+									"description": "Only entries for this provider (case-insensitive); a bare type also matches its type@account aliases",
 								},
 								"failed_only": map[string]any{
 									"type":        "boolean",

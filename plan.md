@@ -1075,3 +1075,85 @@ All steps edit `internal/core/runner.go` or files that build against it, so none
   ```bash
   gofmt -s -l . && go vet ./... && go test -count=1 -coverprofile=coverage.out ./... && go tool cover -func=coverage.out | tail -n 1 && rm -f coverage.out && go build -trimpath -o mintrun ./cmd/mintrun && ./mintrun plugin list
   ```
+
+---
+
+## 9. Workstream AK — Multi-Account Provider Aliases (`type@account`, `v0.16.0`, 2026-10-19)
+
+> **Breaking:** `mintrun exec -provider` loses its `cloudflare` default. Nothing else changes for a single-account user.
+
+**Model.** A provider string is an identity: `<type>` (the default account) or `<type>@<account>`. The identity keys the vault secret, the `policy.json` rule, the audit `provider`, the approval text, the relay request, and the `PolicyDecision`; only the type picks code: `Registry.Provider`, `approvalOwnHosts`, and the `MintRequest` (and lease) a provider sees. There is no rule inheritance: `github@work` is governed by a `"github@work"` rule or, without one, like any provider without a rule. `<account>` is 1 to 64 bytes of `[A-Za-z0-9._-]`, not `.` or `..` (the relay device-name charset, now one helper).
+
+**Not built (on purpose):** rule inheritance, auto-picking an alias for a bare request, a credential table or per-account config, per-directory shim accounts, keystore items namespaced by home, and any change to "no rule means allow".
+
+### AK-1 — Core Gate, Registry, Lease
+- **Files:** `internal/core/runner.go`, `internal/core/plugin.go`, `internal/builtin/cloudflare.go`, `internal/builtin/relay.go`, `internal/core/core_test.go`.
+- **Deliverables:**
+  1. `[SERIAL]` `core.SplitProvider` and `core.ValidName` (relay device names call it too).
+  2. `[SERIAL]` `decide` refuses a malformed alias right after the empty-provider check: `invalid_request`, audited with exit 126, before the pause, the same reason through `mintrun_policy_check`.
+  3. `[SERIAL]` `Registry.Provider`: the exact name, else the type before the first `@`; the not-found error quotes the name as given. `Register` and `safePluginName` refuse `@`.
+  4. `[SERIAL]` `acquireLease`: the vault key stays the alias, `Mint` and `Revoke` see the type, the returned lease carries the alias; the built-ins stop hard-coding `Lease.Provider`.
+  5. `[SERIAL]` `approvalHints` looks up `approvalOwnHosts` by type; `TailAudit`: a bare type matches its aliases, an alias matches only itself.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCheckPolicyMatchesExecBlind|TestRegistryAndExternalVaultAndRemoteInstall|TestExecBlindProviderAlias|TestTailAudit|TestApprovalHints' ./internal/core
+  ```
+
+### AK-2 — MCP
+- **Files:** `internal/builtin/mcp.go`, `internal/builtin/builtin_test.go`.
+- **Deliverables:** `[SERIAL]` `shortLabel` keeps `@`; the `provider` schema description reads `type[@account]` with one example.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestMCPExecSchema|TestMCPBridgeGovernanceTools|TestMCPAuditProviderAlias' ./internal/builtin
+  ```
+
+### AK-3 — CLI `exec` and `audit`
+- **Files:** `cmd/mintrun/main.go`, `cmd/mintrun/main_test.go`.
+- **Deliverables:** `[SERIAL]` a missing `-provider` is a usage error (`fatal`, exit 1, nothing audited); usage text names `<type>[@<account>]`; `audit -provider github` also lists `github@<account>` (it hands the filter to `core.TailAudit`, which `TestTailAudit` pins).
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCLIExecRequiresProvider' ./cmd/mintrun
+  ```
+
+### AK-4 — `init` and the Missing-Secret Hint
+- **Files:** `cmd/mintrun/setup.go`, `internal/builtin/keychain.go`, their tests.
+- **Deliverables:**
+  1. `[SERIAL]` `github`, `aws`, `gcp`, `cloudflare` ask `Account name (Enter for the default): ` after the passphrase check and before the replace prompt, which names the alias; `-account <name>` skips the question.
+  2. `[SERIAL]` `setupHint`: `(run mintrun init <type> -account <name>)` for an alias of an init-step type, `(run mintrun secret set <alias>)` otherwise.
+  3. `[SERIAL]` `init policy` also suggests a rule for each alias the shim config names; it still never changes an existing `policy.json`.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCLIInit|TestSecretNotFoundHint' ./...
+  ```
+
+### AK-5 — `doctor` and Shims
+- **Files:** `cmd/mintrun/setup.go`, `cmd/mintrun/shim.go`, their tests.
+- **Deliverables:**
+  1. `[SERIAL]` `doctor` prints a vault row for every `policy.json` key and shim `provider` holding `@` (`ok`, or `-` with the vault's hint), read-only.
+  2. `[SERIAL]` `shimEntry.Provider`: validated by `loadShimConfig` (fail closed), sent by `runShim`, printed in the block hint, set by `shim install -provider` (numbered choice when `policy.json` holds several accounts of the tool's type), and checked by `doctorShims`.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCLIDoctor|TestCLIShim' ./cmd/mintrun
+  ```
+
+### AK-6 — Relay Alias
+- **Deliverables:** `[SERIAL]` a relay request for an alias mints from the server's alias secret, and both server entries and the lease name the alias.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestRelayEndToEnd|TestMintLeaseAndRelayClient' ./...
+  ```
+
+### AK-7 — Mutants
+- **Deliverables:** `[SERIAL]` on a copy of the tree, each mutant compiled first (`go test -run '^$'`) and failing a named test; the count goes in [checks.md](checks.md).
+
+### AK-8 — Docs and Rules
+- **Files:** `README.md`, `docs/threat-model.md`, `AGENTS.md`.
+- **Deliverables:** `[SERIAL]` README "Multiple accounts" and "Breaking changes in v0.16.0"; the threat model's policy-gate row; AGENTS.md rule 56 and the `shortLabel` charset in rules 16 and 41.
+- **Verification:** the rule-52 citation script passes on the tree and fails on each planted fault (fake test name, bad anchor, missing file, untracked file).
+
+### AK-9 — Acceptance
+- **Deliverables:** `[SERIAL]` `scripts/verify.sh`; bidi, conflict-marker, and leak scans with planted controls; `./mintrun` rebuilt; a manual run in a throwaway `HOME` and `MINTRUN_HOME` with `MINTRUN_FILE_VAULT=1`; commits on the branch only (no push, tag, or merge).
+- **Verification:**
+  ```bash
+  scripts/verify.sh
+  ```

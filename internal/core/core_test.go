@@ -270,6 +270,121 @@ func TestBuiltinGitHubJITEncodingScrubAndHITLApproval(t *testing.T) {
 	}
 }
 
+// aliasRecorder wraps a provider and records the provider name each Mint is asked for and the
+// lease each Revoke gets back.
+type aliasRecorder struct {
+	core.ProviderPlugin
+	asked, gotBack *[]string
+}
+
+func (r aliasRecorder) Mint(ctx context.Context, master string, req core.MintRequest) (*core.Lease, error) {
+	*r.asked = append(*r.asked, req.Provider)
+	return r.ProviderPlugin.Mint(ctx, master, req)
+}
+
+func (r aliasRecorder) Revoke(ctx context.Context, master string, lease *core.Lease) error {
+	*r.gotBack = append(*r.gotBack, lease.Provider)
+	return r.ProviderPlugin.Revoke(ctx, master, lease)
+}
+
+// TestExecBlindProviderAlias runs two accounts of the built-in GitHub provider side by side. Each
+// alias reads its own master secret and its own policy.json rule, with nothing inherited from the
+// bare type's rule; the provider is asked for its type only and gets its own lease back at revoke;
+// and the approval text, the audit entry, and the lease mintrun hands out name the alias.
+func TestExecBlindProviderAlias(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("MINTRUN_APPROVE", "")
+	type account struct {
+		inst, jwt, token string
+		minted, revoked  atomic.Int32
+	}
+	work := &account{inst: "111", jwt: "work_jwt_master", token: "ghs_work_token_0001"}
+	personal := &account{inst: "222", jwt: "home_jwt_master", token: "ghs_home_token_0002"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, a := range []*account{work, personal} {
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/app/installations/"+a.inst+"/access_tokens" && r.Header.Get("Authorization") == "Bearer "+a.jwt:
+				a.minted.Add(1)
+				_, _ = w.Write([]byte(`{"token":"` + a.token + `","expires_at":"2026-10-15T12:00:00Z"}`))
+				return
+			case r.Method == http.MethodDelete && r.URL.Path == "/installation/token" && r.Header.Get("Authorization") == "Bearer "+a.token:
+				a.revoked.Add(1)
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	home := t.TempDir()
+	reg := core.NewRegistry()
+	vault := &builtin.KeychainVault{HomeDir: home, ForceFile: true}
+	var asked, gotBack []string
+	_ = reg.Register(vault)
+	if err := reg.Register(aliasRecorder{&builtin.GitHubProvider{BaseURL: srv.URL, Client: srv.Client()}, &asked, &gotBack}); err != nil {
+		t.Fatal(err)
+	}
+	for alias, a := range map[string]*account{"github@work": work, "github@home": personal} {
+		if err := vault.SetSecret(ctx, alias, a.inst+":"+a.jwt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The bare type's rule denies both scopes used below; an alias inherits none of it.
+	policy := `{"github":{"allowed_scopes":["nope/*"]},"github@work":{"allowed_scopes":["acme/*"],"require_approval":true}}`
+	if err := os.WriteFile(filepath.Join(home, "policy.json"), []byte(policy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rt := core.NewRuntime(home, "keychain", reg)
+	var shown []string
+	rt.ApprovalFunc = func(_ context.Context, req core.ExecRequest) (bool, error) {
+		shown = append(shown, core.ApprovalText("h", req, 1<<20))
+		return true, nil
+	}
+	run := func(alias, scope string, a *account) {
+		t.Helper()
+		res, err := rt.ExecBlind(ctx, core.ExecRequest{
+			MintRequest: core.MintRequest{Provider: alias, Scope: scope},
+			Command:     []string{"sh", "-c", `test "$GITHUB_TOKEN" = "$0" && echo token-ok`, a.token},
+		})
+		if err != nil || res.ExitCode != 0 || strings.TrimSpace(res.Stdout) != "token-ok" || !res.Revoked {
+			t.Fatalf("%s: result %+v, error %v", alias, res, err)
+		}
+		if e := lastAudit(t, home); e.Provider != alias || e.Outcome != "done" {
+			t.Fatalf("%s: audit entry %+v", alias, e)
+		}
+	}
+
+	run("github@work", "acme/api", work)
+	if len(shown) != 1 || !strings.Contains(shown[0], "\nProvider: \"github@work\"\n") {
+		t.Fatalf("approval text does not name the alias: %q", shown)
+	}
+	run("github@home", "anything/x", personal) // no rule for github@home: no approval asked
+	if len(shown) != 1 {
+		t.Fatalf("github@home asked for approval through another rule: %q", shown)
+	}
+	if work.minted.Load() != 1 || work.revoked.Load() != 1 || personal.minted.Load() != 1 || personal.revoked.Load() != 1 {
+		t.Fatalf("each account must mint and revoke once with its own master: work %d/%d, home %d/%d",
+			work.minted.Load(), work.revoked.Load(), personal.minted.Load(), personal.revoked.Load())
+	}
+	if !slices.Equal(asked, []string{"github", "github"}) || !slices.Equal(gotBack, []string{"", ""}) {
+		t.Fatalf("the provider saw an account: Mint asked for %q, Revoke got back leases of %q", asked, gotBack)
+	}
+	// The bare type keeps its own rule.
+	if d := rt.CheckPolicy(core.ExecRequest{MintRequest: core.MintRequest{Provider: "github", Scope: "acme/api"}, Command: []string{"true"}}); d.BlockedBy != "scope" {
+		t.Fatalf("bare github escaped its own rule: %+v", d)
+	}
+
+	// The relay server hands out a lease that names the alias, as ExecBlind reports it.
+	lease, _, _, finish, err := rt.MintLease(ctx, core.ExecRequest{MintRequest: core.MintRequest{Provider: "github@work", Scope: "acme/api"}, Command: []string{"true"}})
+	if err != nil || lease.Provider != "github@work" || lease.Env["GITHUB_TOKEN"] != work.token {
+		t.Fatalf("MintLease: lease %+v, error %v", lease, err)
+	}
+	if e := finish("done", 0, false); !e.Revoked || e.Provider != "github@work" || gotBack[len(gotBack)-1] != "" {
+		t.Fatalf("MintLease finish: entry %+v, Revoke got back %q", e, gotBack)
+	}
+}
+
 func TestGitHubLeaseIDIsOpaqueAndTokenNeverReachesAuditOrMCP(t *testing.T) {
 	const ghAppSecret = "424242:gh_app_jwt_master_secret"
 	const ghMintedToken = "ghs_installation_token_must_not_leak"
@@ -597,6 +712,21 @@ func TestRegistryAndExternalVaultAndRemoteInstall(t *testing.T) {
 	if err := reg.Register(dummyPlugin{core.Manifest{Name: "mcp", Kind: core.KindBridge}}); err == nil || !strings.Contains(err.Error(), "built-in bridge") {
 		t.Fatalf("expected built-in bridge shadow rejection, got %v", err)
 	}
+	// An alias runs its type's provider, and an unknown type fails with the name as given.
+	if p, err := reg.Provider("github@work"); err != nil || p.Manifest().Name != "github" {
+		t.Fatalf("github@work resolved to %v, %v; want the github provider", p, err)
+	}
+	if p, err := reg.Provider("cloudflare"); err != nil || p.Manifest().Name != "cloudflare" {
+		t.Fatalf("cloudflare resolved to %v, %v", p, err)
+	}
+	if _, err := reg.Provider("nope@work"); err == nil || err.Error() != `provider plugin "nope@work" not found` {
+		t.Fatalf("expected the unknown alias quoted as given, got %v", err)
+	}
+	// '@' separates a type from its account, so no plugin may be named with one.
+	const atErr = `plugin name "x@y" must not contain '@', which separates a provider type from its account`
+	if err := reg.Register(dummyPlugin{core.Manifest{Name: "x@y", Kind: core.KindProvider}}); err == nil || err.Error() != atErr {
+		t.Fatalf("expected the '@' name rejection, got %v", err)
+	}
 
 	// Test remote plugin install + external vault RPC (get/set/delete) + error cases + RemovePlugin
 	script := `#!/bin/sh
@@ -695,6 +825,19 @@ esac
 	// C1: RemovePlugin rejects traversal names too.
 	if err := core.RemovePlugin(pluginsDir, "../../etc"); err == nil {
 		t.Fatal("expected path-traversal name rejection on remove")
+	}
+	// A name holding '@' would read as a provider alias, so install and remove refuse it.
+	atDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(atDir, "plugin.json"), []byte(`{"name":"x@y","kind":"provider"}`), 0o600)
+	_ = os.WriteFile(filepath.Join(atDir, "run"), []byte("#!/bin/sh\necho '{}'\n"), 0o700)
+	if _, err := core.InstallPlugin(ctx, pluginsDir, atDir); err == nil || err.Error() != atErr {
+		t.Fatalf("expected the '@' name rejection on install, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(pluginsDir, "x@y")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a refused '@' plugin was installed: %v", err)
+	}
+	if err := core.RemovePlugin(pluginsDir, "x@y"); err == nil || err.Error() != atErr {
+		t.Fatalf("expected the '@' name rejection on remove, got %v", err)
 	}
 	// Also test local plugin with empty entrypoint (defaults to "run")
 	defaultEpDir := t.TempDir()
@@ -1033,6 +1176,34 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 		}
 	}
 
+	// A provider alias is "<type>@<account>". Anything else holding '@' is request validation:
+	// both deny it with the same reason, audited with exit 126, before any vault is read.
+	// An account in capitals is refused too: every vault folds a key's case, so "github@Work" would
+	// read the "github@work" secret and miss the "github@work" rule.
+	for _, p := range []string{"@", "github@", "@work", "github@a@b", "github@a/b", "github@.", "github@..",
+		"github@" + strings.Repeat("a", 65), "github@caf" + string(rune(0xe9)), "github@Work", "probe@WORK"} {
+		req := probe("ok.com", []string{"dns:read"}, "true")
+		req.Provider = p
+		want := `exec requires a provider of the form <type> or <type>@<account>, where the account is 1 to 64 lowercase ASCII letters, digits, '.', '_', or '-', other than "." and ".." (got ` + strconv.Quote(p) + `)`
+		d := rt.CheckPolicy(req)
+		_, err := rt.ExecBlind(ctx, req)
+		if e := lastAudit(t, home); d.Allowed || d.BlockedBy != "invalid_request" || d.Reason != want || err == nil || err.Error() != want ||
+			e.Provider != p || e.BlockedBy != "invalid_request" || e.ExitCode != 126 || e.Error != want {
+			t.Fatalf("provider %q: decision %+v, exec error %v, audit %+v", p, d, err, e)
+		}
+	}
+	// "probe@default" and a 64-byte account are valid aliases, each its own policy.json and vault
+	// key: the "probe" rule does not apply (evil.com passes the gate), and the vault holds only "probe".
+	for _, p := range []string{"probe@default", "probe@" + strings.Repeat("a", 64)} {
+		req := probe("evil.com", []string{"dns:read"}, "true")
+		req.Provider = p
+		d := rt.CheckPolicy(req)
+		_, err := rt.ExecBlind(ctx, req)
+		if !d.Allowed || err == nil || !strings.Contains(err.Error(), `secret "`+p+`" not found`) {
+			t.Fatalf("alias %q: decision %+v, exec error %v", p, d, err)
+		}
+	}
+
 	// Only a missing policy.json means no policy. One that exists but cannot be read (a directory,
 	// a symlink to a missing file, a file without read permission, which root reads anyway) denies
 	// with the same reason in both, quoting the cause and never the path.
@@ -1047,6 +1218,11 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 			}
 			return os.Chmod(p, 0)
 		}
+	}
+	// A key no request can name denies the same way: the "probe@Work" rule would never apply,
+	// while the vault serves its folded "probe@work" secret to a request that misses it.
+	unreadable[`key "probe@Work" is not a provider of the form `+core.ProviderForm] = func(p string) error {
+		return os.WriteFile(p, []byte(`{"probe@Work":{"allowed_scopes":["ok.com"]}}`), 0o600)
 	}
 	dnsRead := probe("ok.com", []string{"dns:read"}, "true")
 	for cause, setup := range unreadable {
@@ -2334,6 +2510,28 @@ not json
 		}
 	}
 
+	// A bare type also matches its "<type>@<account>" aliases; an alias matches only itself.
+	aliasLines := []string{`{"provider":"github"}`, `{"provider":"github@work"}`, `{"provider":"GitHub@Home"}`, `{"provider":"githubx@work"}`, `{"provider":"cloudflare@work"}`}
+	aliasLog := strings.Join(aliasLines, "\n") + "\n"
+	for filter, want := range map[string][]string{
+		"github":      aliasLines[:3],
+		"GITHUB@work": aliasLines[1:2],
+		"github@home": aliasLines[2:3],
+		"cloudflare":  aliasLines[4:],
+		"work":        nil,
+	} {
+		for _, seekable := range []bool{true, false} {
+			var r io.Reader = strings.NewReader(aliasLog)
+			if !seekable {
+				r = struct{ io.Reader }{r}
+			}
+			var got []string
+			if err := core.TailAudit(r, filter, false, 10, func(line string, _ core.AuditEntry) { got = append(got, line) }); err != nil || !slices.Equal(got, want) {
+				t.Errorf("TailAudit(seek=%v, %q) = %q (%v), want %q", seekable, filter, got, err, want)
+			}
+		}
+	}
+
 	// On a 570 KiB seekable log, asking for the last 2 entries reads only the final 64 KiB chunk.
 	var big strings.Builder
 	for range 4000 {
@@ -2626,10 +2824,12 @@ func TestApprovalHints(t *testing.T) {
 	for provider, urls := range map[string][]string{
 		"github": {"https://api.github.com/repos/o/r", "HTTPS://RAW.GITHUBUSERCONTENT.COM/o/r/main/x", "http://github.com",
 			"https://githubusercontent.com:443/x", "curl https://api.github.com -o out"},
-		"aws":        {"https://sts.amazonaws.com/"},
-		"gcp":        {"https://oauth2.googleapis.com/token", "https://accounts.google.com/o/oauth2/auth"},
-		"cloudflare": {"https://api.cloudflare.com/client/v4/zones"},
-		"vercel":     {"https://api.vercel.com/v9/projects"},
+		"aws":         {"https://sts.amazonaws.com/"},
+		"gcp":         {"https://oauth2.googleapis.com/token", "https://accounts.google.com/o/oauth2/auth"},
+		"cloudflare":  {"https://api.cloudflare.com/client/v4/zones"},
+		"vercel":      {"https://api.vercel.com/v9/projects"},
+		"github@work": {"https://api.github.com/repos/o/r"}, // an alias uses its type's hosts
+		"aws@prod":    {"https://sts.amazonaws.com/"},
 	} {
 		for _, u := range urls {
 			check("none", provider, "x", u)
@@ -2644,6 +2844,7 @@ func TestApprovalHints(t *testing.T) {
 		{"github", "https://api.github.com/?next=https://evil.example"}, {"github", "https://api.github.com/x https://evil.example/y"},
 		{"github", "http://[::1"}, {"github", "https://g" + string(rune(0x130)) + "thub.com/x"},
 		{"aws", "https://api.github.com/x"}, {"probe", "https://github.com/x"}, {"", "https://github.com/x"},
+		{"github@work", "https://evil.example/x"}, {"work@github", "https://github.com/x"},
 	} {
 		check("external-url", c.provider, "x", c.arg)
 	}

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,10 +11,12 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,6 +45,7 @@ type shimEntry struct {
 	Scope       string   `json:"scope,omitempty"`       // Default scope for auto/redirect
 	Permissions []string `json:"permissions,omitempty"` // Default permissions for auto/redirect
 	Approve     bool     `json:"approve,omitempty"`     // Require human approval in auto mode
+	Provider    string   `json:"provider,omitempty"`    // <type>@<account> the shim runs as; empty means the tool's type
 }
 
 func shimProvider(tool string) string {
@@ -51,6 +55,15 @@ func shimProvider(tool string) string {
 		}
 	}
 	return ""
+}
+
+// checkShimProvider returns an error unless p is empty, tool's provider type, or an account of it.
+func checkShimProvider(tool, p string) error {
+	typ := shimProvider(tool)
+	if t, _ := core.SplitProvider(p); p == "" || t == typ && core.ValidProvider(p) {
+		return nil
+	}
+	return fmt.Errorf("tool %q has invalid provider %q (want %s or %s@<account>; a provider is %s)", tool, p, typ, typ, core.ProviderForm)
 }
 
 func shimToolNames() []string {
@@ -81,8 +94,9 @@ func shimConfigPath(homeDir string) string {
 
 // loadShimConfig reads <home>/shims/config.json fail-closed. Only a missing file (checked via
 // Lstat, rule 36) means default settings (block mode for all tools). Any read error, malformed
-// JSON, unknown field, unknown tool key, or invalid mode returns an error quoting only the
-// underlying cause and never a local filesystem path.
+// JSON, unknown field, unknown tool key, invalid mode, or a provider that is not the tool's type
+// or an account of it returns an error quoting only the underlying cause and never a local
+// filesystem path.
 func loadShimConfig(homeDir string) (map[string]shimEntry, error) {
 	p := shimConfigPath(homeDir)
 	if _, err := os.Lstat(p); errors.Is(err, fs.ErrNotExist) {
@@ -112,6 +126,9 @@ func loadShimConfig(homeDir string) (map[string]shimEntry, error) {
 		if e.Mode != "" && e.Mode != "block" && e.Mode != "auto" {
 			return nil, fmt.Errorf("shims/config.json tool %q has invalid mode %q (want \"block\" or \"auto\")", tool, e.Mode)
 		}
+		if err := checkShimProvider(tool, e.Provider); err != nil {
+			return nil, fmt.Errorf("shims/config.json %v", err)
+		}
 	}
 	return cfg, nil
 }
@@ -122,7 +139,7 @@ func writeShimConfig(homeDir string, cfg map[string]shimEntry) error {
 		if v.Mode == "block" {
 			v.Mode = ""
 		}
-		if v.Mode != "" || v.Scope != "" || len(v.Permissions) > 0 || v.Approve {
+		if v.Mode != "" || v.Scope != "" || len(v.Permissions) > 0 || v.Approve || v.Provider != "" {
 			clean[k] = v
 		}
 	}
@@ -258,7 +275,7 @@ func shimList(rt *core.Runtime, origPath string) {
 		if err != nil {
 			target = "-"
 		}
-		fmt.Printf("%-10s %-14s %-11s %-7s %s\n", t.tool, t.provider, status, mode, target)
+		fmt.Printf("%-10s %-14s %-11s %-7s %s\n", t.tool, cmp.Or(cfg[t.tool].Provider, t.provider), status, mode, target)
 	}
 }
 
@@ -269,8 +286,9 @@ func shimInstall(ctx context.Context, rt *core.Runtime, origPath string, args []
 	scope := fs.String("scope", "", "Default scope for auto/redirect")
 	perms := fs.String("perms", "", "Comma-separated default permissions for auto/redirect")
 	approve := fs.Bool("approve", false, "Require human approval in auto mode")
+	provider := fs.String("provider", "", "Provider the shim runs commands as: the tool's type or <type>@<account>")
 	if err := fs.Parse(args); err != nil {
-		fatal("usage: mintrun shim install [-mode block|auto] [-scope <scope>] [-perms <p1,p2>] [-approve] [tool...]")
+		fatal("usage: mintrun shim install [-mode block|auto] [-scope <scope>] [-perms <p1,p2>] [-approve] [-provider <type>[@<account>]] [tool...]")
 	}
 	if *mode != "block" && *mode != "auto" {
 		fatal("shim mode must be \"block\" or \"auto\", got %q", *mode)
@@ -284,8 +302,11 @@ func shimInstall(ctx context.Context, rt *core.Runtime, origPath string, args []
 			fatal("unknown shim tool %q (supported: %s)", tool, strings.Join(shimToolNames(), ", "))
 		}
 	}
-	if len(tools) > 1 && (*scope != "" || *perms != "") {
-		fatal("-scope and -perms can only be set when installing a single tool shim")
+	if len(tools) > 1 && (*scope != "" || *perms != "" || *provider != "") {
+		fatal("-scope, -perms, and -provider can only be set when installing a single tool shim")
+	}
+	if err := checkShimProvider(tools[0], *provider); err != nil {
+		fatal("-provider: %v", err)
 	}
 	self, err := mintrunPath()
 	if err != nil {
@@ -307,6 +328,10 @@ func shimInstall(ctx context.Context, rt *core.Runtime, origPath string, args []
 	if err != nil {
 		fatal("update shell profile: %v", err)
 	}
+	w := &wizard{ctx: ctx, rt: rt, in: bufio.NewReader(os.Stdin)} // one reader for every question
+	if len(tools) == 1 && *provider == "" {
+		*provider = shimAccount(w, tools[0])
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		fatal("%v", err)
 	}
@@ -326,6 +351,9 @@ func shimInstall(ctx context.Context, rt *core.Runtime, origPath string, args []
 			entry.Permissions = permList
 		}
 		entry.Approve = *approve
+		if len(tools) == 1 {
+			entry.Provider = *provider
+		}
 		cfg[tool] = entry
 	}
 	if err := writeShimConfig(rt.HomeDir, cfg); err != nil {
@@ -333,10 +361,42 @@ func shimInstall(ctx context.Context, rt *core.Runtime, origPath string, args []
 	}
 	fmt.Printf("Installed %s shim(s) in %s (%s).\n", *mode, dir, strings.Join(tools, ", "))
 	if len(edits) > 0 {
-		offerShimProfiles(ctx, line, edits, true)
+		offerShimProfiles(w, line, edits, true)
 	} else if !shimFirstOnPath(tools[0], origPath, dir) {
 		fmt.Printf("Put %s first on PATH to use the shims:\n  export PATH=%s:\"$PATH\"\n", dir, shellQuote(dir))
 	}
+}
+
+// shimAccount asks which account tool's shim runs commands as when policy.json has a rule for an
+// account of the tool's type: the default account (the answer on Enter) or one of those accounts.
+// It returns "" for the default account.
+func shimAccount(w *wizard, tool string) string {
+	typ := shimProvider(tool)
+	rules, _ := w.rt.LoadPolicies() // a policy.json that fails to load offers no choice; exec denies every run anyway
+	choices := []string{typ}
+	for _, k := range slices.Sorted(maps.Keys(rules)) {
+		if t, account := core.SplitProvider(k); t == typ && account != "" {
+			choices = append(choices, k)
+		}
+	}
+	if len(choices) == 1 {
+		return ""
+	}
+	fmt.Printf("policy.json has rules for more than one %s account. Which one should the %s shim run commands as?\n", typ, tool)
+	for i, c := range choices {
+		if i == 0 {
+			c += " (the default account)"
+		}
+		fmt.Printf("  %d) %s\n", i+1, c)
+	}
+	n, err := strconv.Atoi(cmp.Or(w.ask("Number (Enter for 1)"), "1"))
+	if err != nil || n < 1 || n > len(choices) {
+		fatal("expected a number from 1 to %d", len(choices))
+	}
+	if n == 1 {
+		return ""
+	}
+	return choices[n-1]
 }
 
 func shimRemove(ctx context.Context, rt *core.Runtime, args []string) {
@@ -373,7 +433,7 @@ func shimRemove(ctx context.Context, rt *core.Runtime, args []string) {
 			fatal("clean shell profile: %v", err)
 		}
 		if len(edits) > 0 {
-			offerShimProfiles(ctx, line, edits, false)
+			offerShimProfiles(&wizard{ctx: ctx, in: bufio.NewReader(os.Stdin)}, line, edits, false)
 		}
 	}
 }
@@ -458,7 +518,7 @@ func shimProfileEdits(line string, add bool) ([]profileEdit, error) {
 
 // offerShimProfiles shows line and the profiles edits change, and changes them only on a yes,
 // first copying each existing one to a timestamped .bak- backup with its mode, as init does.
-func offerShimProfiles(ctx context.Context, line string, edits []profileEdit, add bool) {
+func offerShimProfiles(w *wizard, line string, edits []profileEdit, add bool) {
 	var names []string
 	for _, e := range edits {
 		names = append(names, e.name)
@@ -471,7 +531,6 @@ func offerShimProfiles(ctx context.Context, line string, edits []profileEdit, ad
 	} else {
 		fmt.Printf("No shim is left, so this line can come out of %s:\n  %s\n", list, line)
 	}
-	w := &wizard{ctx: ctx, in: bufio.NewReader(os.Stdin)}
 	if !w.confirm(verb + " it (each existing file is backed up first)?") {
 		fmt.Println("Left them unchanged.")
 		return
@@ -501,13 +560,13 @@ func offerShimProfiles(ctx context.Context, line string, edits []profileEdit, ad
 // runShim handles an invocation where argv[0] is a shimmed CLI name (gh, aws, gcloud, wrangler,
 // vercel, psql).
 func runShim(ctx context.Context, rt *core.Runtime, origPath, tool string, args []string) {
-	provider := shimProvider(tool)
 	cfg, err := loadShimConfig(rt.HomeDir)
 	if err != nil {
 		fatalExit(126, "mintrun shim %q blocked: %v", tool, err)
 		return
 	}
 	entry := cfg[tool]
+	provider := cmp.Or(entry.Provider, shimProvider(tool))
 	mode := entry.Mode
 	// MINTRUN_SHIM_MODE may tighten "auto" to "block", never loosen "block" to "auto": an agent in
 	// bash controls its own environment variables (rule 11).
@@ -625,9 +684,10 @@ func ghRepoFromArgsOrGit(args []string) string {
 	return ""
 }
 
-// doctorShims checks <home>/shims when the directory exists: config.json, each tool symlink, and
-// whether <home>/shims precedes any other copy of the shimmed binary on PATH.
-func doctorShims(rt *core.Runtime, self, origPath string, report reportFunc) {
+// doctorShims checks <home>/shims when the directory exists: config.json, each tool symlink, a
+// configured provider's secret (stored holds the keys doctorVault found, nil when it could not
+// check), and whether <home>/shims precedes any other copy of the shimmed binary on PATH.
+func doctorShims(rt *core.Runtime, self, origPath string, stored map[string]bool, report reportFunc) {
 	dir := shimsDir(rt.HomeDir)
 	if _, err := os.Lstat(dir); errors.Is(err, fs.ErrNotExist) {
 		return
@@ -655,6 +715,9 @@ func doctorShims(rt *core.Runtime, self, origPath string, report reportFunc) {
 		if self != "" && got != self {
 			report("warn", "shim %s: %s points to %s, not this binary (run mintrun shim install %s)", t.tool, link, got, t.tool)
 			continue
+		}
+		if p := cfg[t.tool].Provider; p != "" && stored != nil && !stored[p] {
+			report("warn", "shim %s: runs as %s, which has no master secret", t.tool, p)
 		}
 		mode := cfg[t.tool].Mode
 		if mode == "" {

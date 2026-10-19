@@ -228,7 +228,7 @@ func NewRuntime(homeDir, defaultVault string, reg *Registry) *Runtime {
 	if _, err := rt.LoadPolicies(); err != nil {
 		what := "cannot be read"
 		switch err.(type) {
-		case *json.SyntaxError, *json.UnmarshalTypeError:
+		case *json.SyntaxError, *json.UnmarshalTypeError, policyKeyError:
 			what = "is malformed"
 		}
 		fmt.Fprintf(os.Stderr, "mintrun: WARNING: policy.json %s (%v); denying all exec until fixed\n", what, err)
@@ -259,7 +259,21 @@ func (rt *Runtime) LoadPolicies() (map[string]PolicyRule, error) {
 	if err := json.Unmarshal(raw, &rules); err != nil {
 		return nil, err
 	}
+	for name := range rules {
+		if !ValidProvider(name) {
+			return nil, policyKeyError(name)
+		}
+	}
 	return rules, nil
+}
+
+// policyKeyError is a policy.json key no request can name, refused like malformed JSON: a rule
+// keyed "github@Work" never applies, while every vault folds the key and serves the "github@work"
+// secret to a request that misses the rule.
+type policyKeyError string
+
+func (k policyKeyError) Error() string {
+	return fmt.Sprintf("key %q is not a provider of the form %s", string(k), ProviderForm)
 }
 
 // PolicyDecision is the static verdict of the exec gate for one ExecRequest (MCP mintrun_policy_check).
@@ -298,6 +312,11 @@ func (rt *Runtime) decide(req ExecRequest) (PolicyDecision, []string, []string) 
 	}
 	if req.Provider == "" {
 		return deny("invalid_request", "exec requires a provider name")
+	}
+	// "<type>@<account>" picks one of several accounts of a provider type, and the whole alias is
+	// the vault key and the policy.json key: a bare "<type>" is the default account.
+	if !ValidProvider(req.Provider) {
+		return deny("invalid_request", "exec requires a provider of the form "+ProviderForm+" (got %q)", req.Provider)
 	}
 	// The vault is the operator's choice (MINTRUN_VAULT, or the CLI's -vault), never an agent's or a relay client's.
 	if (req.FromAgent || rt.Relay != nil || rt.RelayServer) && req.Vault != "" {
@@ -895,7 +914,8 @@ var approvalHintRules = []struct {
 	{"external-url", nil, nil, nil}, // externalURL
 }
 
-// approvalOwnHosts are the domains, subdomains included, whose URLs a provider calls its own.
+// approvalOwnHosts are the domains, subdomains included, whose URLs a provider type calls its own,
+// so every account of a type shares them.
 var approvalOwnHosts = map[string][]string{
 	"github":     {"github.com", "githubusercontent.com"},
 	"aws":        {"amazonaws.com"},
@@ -918,13 +938,14 @@ func approvalHints(req ExecRequest) []string {
 		}
 		args[i] = string(b)
 	}
+	typ, _ := SplitProvider(req.Provider)
 	var hints []string
 	for _, rule := range approvalHintRules {
 		if slices.ContainsFunc(args, func(a string) bool {
 			return slices.Contains(rule.words, a) ||
 				slices.ContainsFunc(rule.prefixes, func(p string) bool { return strings.HasPrefix(a, p) }) ||
 				slices.ContainsFunc(rule.parts, func(p string) bool { return strings.Contains(a, p) }) ||
-				rule.label == "external-url" && externalURL(req.Provider, a)
+				rule.label == "external-url" && externalURL(typ, a)
 		}) {
 			hints = append(hints, rule.label)
 		}
@@ -1090,7 +1111,10 @@ func (rt *Runtime) acquireLease(ctx context.Context, req *ExecRequest, e *AuditE
 	}
 
 	// From here on the entry is scrubbed of every secret known so far.
-	lease, err := provider.Mint(ctx, masterSecret, req.MintRequest)
+	// The provider sees only its type; the account picked the master secret above.
+	mreq := req.MintRequest
+	mreq.Provider, _ = SplitProvider(req.Provider)
+	lease, err := provider.Mint(ctx, masterSecret, mreq)
 	secrets := leaseSecrets(masterSecret, lease)
 	scrub := func(set []string) {
 		e.Command, e.Client, e.Purpose = scrubAll(req.Command, set), Scrub(req.Client, set), Scrub(req.Purpose, set)
@@ -1101,10 +1125,13 @@ func (rt *Runtime) acquireLease(ctx context.Context, req *ExecRequest, e *AuditE
 		scrub(secrets)
 		return nil, nil, nil, fmt.Errorf("provider %q mint failed: %s", req.Provider, Scrub(err.Error(), secrets))
 	}
+	// Revoke gets the lease back as the provider minted it; the lease mintrun reports names the alias.
+	minted := *lease
+	lease.Provider = req.Provider
 	if rt.RelayServer && (!lease.Ephemeral || slices.Contains(leaseSecrets("", lease), masterSecret)) {
 		if lease.Ephemeral {
 			revokeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_ = provider.Revoke(revokeCtx, masterSecret, lease)
+			_ = provider.Revoke(revokeCtx, masterSecret, &minted)
 			cancel()
 		}
 		scrub(secrets)
@@ -1125,7 +1152,7 @@ func (rt *Runtime) acquireLease(ctx context.Context, req *ExecRequest, e *AuditE
 			done = true
 			revokeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			if err := provider.Revoke(revokeCtx, masterSecret, lease); err == nil {
+			if err := provider.Revoke(revokeCtx, masterSecret, &minted); err == nil {
 				revoked = true
 			}
 		}
@@ -1485,9 +1512,10 @@ func (rt *Runtime) writeAudit(entry AuditEntry) {
 }
 
 // TailAudit streams an audit log and calls fn, in log order, for each entry matching provider
-// (case-insensitive) and failedOnly; unparseable lines are skipped. With limit > 0 only the last
-// limit matches are kept and handed over at the end, and when r is seekable it walks backward from
-// the end in 64 KiB chunks and stops as soon as limit matches are found.
+// (case-insensitive; a bare type also matches its type@account aliases, an alias only itself) and
+// failedOnly; unparseable lines are skipped. With limit > 0 only the last limit matches are kept
+// and handed over at the end, and when r is seekable it walks backward from the end in 64 KiB
+// chunks and stops as soon as limit matches are found.
 func TailAudit(r io.Reader, provider string, failedOnly bool, limit int, fn func(line string, e AuditEntry)) error {
 	type match struct {
 		line string
@@ -1497,7 +1525,7 @@ func TailAudit(r io.Reader, provider string, failedOnly bool, limit int, fn func
 		line = strings.TrimRight(line, "\r\n")
 		var e AuditEntry
 		if json.Unmarshal([]byte(line), &e) == nil &&
-			(provider == "" || strings.EqualFold(e.Provider, provider)) &&
+			(provider == "" || strings.EqualFold(e.Provider, provider) || strings.EqualFold(strings.SplitN(e.Provider, "@", 2)[0], provider)) &&
 			(!failedOnly || e.ExitCode != 0 || e.Error != "") {
 			return match{line, e}, true
 		}

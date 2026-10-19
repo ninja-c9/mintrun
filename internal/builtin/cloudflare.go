@@ -69,9 +69,8 @@ func (c *CloudflareProvider) Mint(ctx context.Context, masterSecret string, req 
 	// (useful if the user stored an already-scoped token or wants zero-knowledge wrapper only).
 	if req.Params["mode"] == "static" || containsPerm(req.Permissions, "static") {
 		return &core.Lease{
-			ID:       "cf-static",
-			Provider: "cloudflare",
-			Scope:    req.Scope,
+			ID:    "cf-static",
+			Scope: req.Scope,
 			Env: map[string]string{
 				"CLOUDFLARE_API_TOKEN": masterSecret,
 				"CF_API_TOKEN":         masterSecret,
@@ -136,9 +135,8 @@ func (c *CloudflareProvider) Mint(ctx context.Context, masterSecret string, req 
 
 	subToken := createResp.Result.Value
 	return &core.Lease{
-		ID:       createResp.Result.ID,
-		Provider: "cloudflare",
-		Scope:    req.Scope,
+		ID:    createResp.Result.ID,
+		Scope: req.Scope,
 		Env: map[string]string{
 			"CLOUDFLARE_API_TOKEN": subToken,
 			"CF_API_TOKEN":         subToken,
@@ -335,9 +333,8 @@ func (g *GitHubProvider) Mint(ctx context.Context, masterSecret string, req core
 			return nil, errors.New("github static mode wraps a token; refusing to inject a GitHub App private key")
 		}
 		return &core.Lease{
-			ID:       "gh-static",
-			Provider: "github",
-			Scope:    req.Scope,
+			ID:    "gh-static",
+			Scope: req.Scope,
 			Env: map[string]string{
 				"GITHUB_TOKEN": masterSecret,
 				"GH_TOKEN":     masterSecret,
@@ -415,9 +412,8 @@ func (g *GitHubProvider) Mint(ctx context.Context, masterSecret string, req core
 		return nil, errors.New("github API returned empty installation token")
 	}
 	return &core.Lease{
-		ID:       fmt.Sprintf("gh-inst-%s-%d", instID, time.Now().Unix()), // opaque handle, safe to audit
-		Provider: "github",
-		Scope:    req.Scope,
+		ID:    fmt.Sprintf("gh-inst-%s-%d", instID, time.Now().Unix()), // opaque handle, safe to audit
+		Scope: req.Scope,
 		Env: map[string]string{
 			"GITHUB_TOKEN": resp.Token,
 			"GH_TOKEN":     resp.Token,
@@ -564,7 +560,6 @@ func (a *AWSProvider) Mint(ctx context.Context, masterSecret string, req core.Mi
 		}
 		return &core.Lease{
 			ID:        "aws-static",
-			Provider:  "aws",
 			Scope:     req.Scope,
 			Env:       env,
 			Redact:    redact,
@@ -637,9 +632,8 @@ func (a *AWSProvider) Mint(ctx context.Context, masterSecret string, req core.Mi
 	}
 	expTime, _ := time.Parse(time.RFC3339, parsed.Expiration)
 	return &core.Lease{
-		ID:       parsed.AssumedRoleID,
-		Provider: "aws",
-		Scope:    req.Scope,
+		ID:    parsed.AssumedRoleID,
+		Scope: req.Scope,
 		Env: map[string]string{
 			"AWS_ACCESS_KEY_ID":     parsed.AccessKeyID,
 			"AWS_SECRET_ACCESS_KEY": parsed.SecretAccessKey,
@@ -761,9 +755,8 @@ func (g *GCPProvider) Mint(ctx context.Context, masterSecret string, req core.Mi
 			return nil, errors.New("gcp static mode wraps an OAuth2 access token; refusing to inject a service-account private key")
 		}
 		return &core.Lease{
-			ID:       "gcp-static",
-			Provider: "gcp",
-			Scope:    req.Scope,
+			ID:    "gcp-static",
+			Scope: req.Scope,
 			Env: map[string]string{
 				"CLOUDSDK_AUTH_ACCESS_TOKEN": masterSecret,
 				"GOOGLE_OAUTH_ACCESS_TOKEN":  masterSecret,
@@ -828,9 +821,8 @@ func (g *GCPProvider) Mint(ctx context.Context, masterSecret string, req core.Mi
 		return nil, errors.New("gcp token endpoint returned an empty access_token")
 	}
 	return &core.Lease{
-		ID:       fmt.Sprintf("gcp-sa-%d", time.Now().Unix()), // opaque handle, safe to audit
-		Provider: "gcp",
-		Scope:    req.Scope,
+		ID:    fmt.Sprintf("gcp-sa-%d", time.Now().Unix()), // opaque handle, safe to audit
+		Scope: req.Scope,
 		Env: map[string]string{
 			"CLOUDSDK_AUTH_ACCESS_TOKEN": tok.AccessToken,
 			"GOOGLE_OAUTH_ACCESS_TOKEN":  tok.AccessToken,

@@ -305,10 +305,10 @@ func TestCLIDoctor(t *testing.T) {
 		name  string
 		setup func(t *testing.T, home, self string)
 		code  int
-		want  []string
+		want  []string // each must appear, or with a leading "!" must not
 	}{
 		{"fresh", nil, 0, []string{"ok    PATH: mintrun runs this binary", "ok    vault: encrypted file vault", "warn  vault: an IDE started from the Dock",
-			"-     secret github: not set", "warn  secret: no provider has a master secret yet", "-     approval: approval-telegram not set",
+			"-     secret github: not set", "warn  secret: none of the providers and accounts above has a master secret yet (run mintrun init; an account is checked only once policy.json or the shim config names it)\n", "-     approval: approval-telegram not set",
 			"-     screen: jev not set\n", "-     screen: off\n", "warn  policy: no policy.json", "warn  IDE: no IDE has a mintrun MCP entry"}},
 		{"configured", func(t *testing.T, home, self string) {
 			setSecret(t, "github", "1:2:"+leak)
@@ -347,6 +347,25 @@ func TestCLIDoctor(t *testing.T) {
 			setSecret(t, "github", "1:2:"+leak)
 			writeFile(t, policy(home), `{"nosuch":{}}`)
 		}, 0, []string{`warn  policy: no provider is named "nosuch", so its rule never applies`, "warn  policy: no rule for github, so exec allows any scope for it"}},
+		{"accounts", func(t *testing.T, home, self string) {
+			setSecret(t, "github@work", "1:2:"+leak)
+			writeFile(t, policy(home), `{"github":{},"github@work":{"allowed_scopes":["acme/widgets"]},"github@ci":{}}`)
+			shims := filepath.Join(home, ".mintrun", "shims")
+			writeFile(t, filepath.Join(shims, "config.json"), `{"gh":{"provider":"github@work"},"wrangler":{"provider":"cloudflare@client-a"}}`)
+			for _, tool := range []string{"gh", "wrangler"} {
+				if err := os.Symlink(self, filepath.Join(shims, tool)); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}, 0, []string{"ok    secret github@work: set\n", // the vault's own hint, once (rule 37)
+			`-     secret "github@ci" not found in vault (run mintrun init github -account ci)` + "\n",
+			`-     secret "cloudflare@client-a" not found in vault (run mintrun init cloudflare -account client-a)` + "\n",
+			"warn  shim wrangler: runs as cloudflare@client-a, which has no master secret\n", "ok    policy: 3 rule(s) in ",
+			"!shim gh: runs as", "!has a master secret yet", `!secret "github" not found`}},
+		{"account key not lowercase", func(t *testing.T, home, self string) {
+			writeFile(t, policy(home), `{"github@Work":{}}`)
+		}, 1, []string{"FAIL  policy: ", `is malformed (key "github@Work" is not a provider of the form <type> or <type>@<account>`,
+			`mintrun: WARNING: policy.json is malformed (key "github@Work" is not a provider of the form`}},
 		{"vault key in an IDE env", func(t *testing.T, home, self string) {
 			writeJSON(t, idePaths()[1], obj{"mcpServers": obj{"mintrun": obj{"command": self, "args": []string{"mcp"}, "env": obj{"MINTRUN_VAULT_KEY": leak}},
 				"other": obj{"command": "x", "env": obj{"API_KEY": leak}}}})
@@ -378,7 +397,12 @@ func TestCLIDoctor(t *testing.T) {
 		}, 1, []string{"FAIL  binary: ", "is a temporary `go run` binary"}},
 		{"no passphrase", func(t *testing.T, home, self string) {
 			t.Setenv("MINTRUN_VAULT_KEY", "")
-		}, 1, []string{"FAIL  vault: the encrypted file vault needs MINTRUN_VAULT_KEY"}},
+			shims := filepath.Join(home, ".mintrun", "shims")
+			writeFile(t, filepath.Join(shims, "config.json"), `{"wrangler":{"provider":"cloudflare@client-a"}}`)
+			if err := os.Symlink(self, filepath.Join(shims, "wrangler")); err != nil {
+				t.Fatal(err)
+			}
+		}, 1, []string{"FAIL  vault: the encrypted file vault needs MINTRUN_VAULT_KEY", "shim wrangler", "!which has no master secret"}},
 		{"wrong passphrase", func(t *testing.T, home, self string) {
 			setSecret(t, "github", "1:2:"+leak)
 			t.Setenv("MINTRUN_VAULT_KEY", "another-passphrase")
@@ -428,7 +452,11 @@ func TestCLIDoctor(t *testing.T) {
 				t.Errorf("code %d (exited %v), want %d:\n%s", r.code, r.exited, c.code, all)
 			}
 			for _, w := range c.want {
-				if !strings.Contains(all, w) {
+				if not, ok := strings.CutPrefix(w, "!"); ok {
+					if strings.Contains(all, not) {
+						t.Errorf("printed %q in:\n%s", not, all)
+					}
+				} else if !strings.Contains(all, w) {
 					t.Errorf("missing %q in:\n%s", w, all)
 				}
 			}
@@ -508,9 +536,14 @@ func TestCLIInit(t *testing.T) {
 
 	t.Run("usage", func(t *testing.T) {
 		home, _ := setupEnv(t)
-		usage := "usage: mintrun init [github|aws|gcp|cloudflare|telegram|slack|jev|policy|mcp]"
+		usage := "usage: mintrun init [github|aws|gcp|cloudflare|telegram|slack|jev|policy|mcp], or mintrun init <github|aws|gcp|cloudflare> -account <name>\n"
 		fails(t, "", usage, "github", "aws")
 		fails(t, "", usage, "nope")
+		// -account names a provider's account, so it needs one provider step.
+		fails(t, "", usage, "-account", "work")
+		fails(t, "", usage, "telegram", "-account", "work")
+		fails(t, "", usage, "github", "-account")
+		fails(t, "", usage, "-nope", "github")
 		before := snapshot(t, home)
 		r := runs(t, "", nil, "Set up GitHub (a GitHub App's private key)? [y/N]: ", "Set up mintrun in your IDEs? [y/N]: ", "Next: mintrun doctor")
 		if n := strings.Count(r.out, "? [y/N]: "); n != len(initSteps) {
@@ -524,7 +557,8 @@ func TestCLIInit(t *testing.T) {
 		for _, k := range keys {
 			setSecret(t, k, "old-"+k)
 		}
-		r = runs(t, strings.Repeat("y\nn\n", len(keys)), nil, "Next: mintrun doctor")
+		// The four provider steps first ask for an account: Enter picks the default.
+		r = runs(t, strings.Repeat("y\n\nn\n", 4)+strings.Repeat("y\nn\n", len(keys)-4), nil, "Next: mintrun doctor")
 		if n := strings.Count(r.out, "is already stored. Replace it? [y/N]: Left unchanged."); n != len(keys) {
 			t.Errorf("left %d secrets unchanged, want %d:\n%s", n, len(keys), r.out)
 		}
@@ -541,40 +575,68 @@ func TestCLIInit(t *testing.T) {
 		writeFile(t, bad, "not a key "+leak)
 		writeFile(t, p1, pkcs1)
 		writeFile(t, filepath.Join(home, "my key.pem"), pkcs8)
-		fails(t, "abc\n", "an App ID is digits only", "github")
-		fails(t, "123\nx1\n", "an Installation ID is digits only", "github")
-		fails(t, "123\n456\n"+bad+"\n", "private key: invalid PEM block", "github")
-		fails(t, "123\n456\n"+filepath.Join(home, "gone.pem")+"\n", "no such file or directory", "github")
+		fails(t, "\nabc\n", "an App ID is digits only", "github")
+		fails(t, "\n123\nx1\n", "an Installation ID is digits only", "github")
+		fails(t, "\n123\n456\n"+bad+"\n", "private key: invalid PEM block", "github")
+		fails(t, "\n123\n456\n"+filepath.Join(home, "gone.pem")+"\n", "no such file or directory", "github")
 		stored(t, "github", "")
 
-		runs(t, "123\n456\n"+p1+"\n", []string{"github"}, `Stored "github" in vault "keychain".`, "-provider github")
+		runs(t, "\n123\n456\n"+p1+"\n", []string{"github"}, "Account name (Enter for the default): ", `Stored "github" in vault "keychain".`, "-provider github -scope")
 		stored(t, "github", "123:456:"+strings.TrimSpace(pkcs1))
-		runs(t, "n\n", []string{"github"}, "github is already stored. Replace it? [y/N]: ", "Left unchanged.")
+		runs(t, "\nn\n", []string{"github"}, "github is already stored. Replace it? [y/N]: ", "Left unchanged.")
 		stored(t, "github", "123:456:"+strings.TrimSpace(pkcs1))
 		// A path dragged into a terminal: escaped spaces, under ~.
-		runs(t, "y\n123\n\n~/my\\ key.pem\n", []string{"github"}, "No installation is pinned")
+		runs(t, "\ny\n123\n\n~/my\\ key.pem\n", []string{"github"}, "No installation is pinned")
 		stored(t, "github", "123::"+strings.TrimSpace(pkcs8))
-		if r := runs(t, "y\n77\n88\n\""+p1+"\"\n", []string{"github"}); strings.Contains(r.out, "No installation is pinned") {
+		if r := runs(t, "\ny\n77\n88\n\""+p1+"\"\n", []string{"github"}); strings.Contains(r.out, "No installation is pinned") {
 			t.Errorf("pinned installation reported as unpinned:\n%s", r.out)
 		}
 		stored(t, "github", "77:88:"+strings.TrimSpace(pkcs1))
+
+		// An account stores under github@<account>, beside the default, which stays as it was.
+		runs(t, "work\n123\n456\n"+p1+"\n", []string{"github"}, `Stored "github@work" in vault "keychain".`, "-provider github@work -scope")
+		stored(t, "github@work", "123:456:"+strings.TrimSpace(pkcs1))
+		stored(t, "github", "77:88:"+strings.TrimSpace(pkcs1))
+		// -account skips the question, before or after the step; -account "" is the default account.
+		if r := runs(t, "n\n", []string{"github", "-account", "work"}, "github@work is already stored. Replace it? [y/N]: ", "Left unchanged."); strings.Contains(r.out, "Account name") {
+			t.Errorf("-account still asked for an account:\n%s", r.out)
+		}
+		runs(t, "y\n55\n\n"+p1+"\n", []string{"-account", "work", "github"}, `Stored "github@work"`,
+			`List the allowed ones in policy.json: "github@work": {"allowed_installations": ["<id>"]}`)
+		stored(t, "github@work", "55::"+strings.TrimSpace(pkcs1))
+		if r := runs(t, "n\n", []string{"github", "-account", ""}, "github is already stored. Replace it? [y/N]: "); strings.Contains(r.out, "Account name") {
+			t.Errorf(`-account "" still asked for an account:\n%s`, r.out)
+		}
+		// A bad account stops before anything else is asked: capitals would fold onto another
+		// account's secret in every vault, and '@', ".", and ".." are not account names.
+		for _, name := range []string{"Work", "a@b", ".", "..", "a b", strings.Repeat("a", 65)} {
+			msg := fmt.Sprintf("account %q is not valid: a provider is %s\n", name, core.ProviderForm)
+			if r := fails(t, name+"\n123\n", msg, "github"); strings.Contains(r.out, "App ID") {
+				t.Errorf("account %q: asked on:\n%s", name, r.out)
+			}
+			fails(t, "", msg, "github", "-account", name)
+		}
+		stored(t, "github@work", "55::"+strings.TrimSpace(pkcs1))
 	})
 
 	t.Run("aws", func(t *testing.T) {
 		home, _ := setupEnv(t)
 		id, asia := "AKIA"+strings.Repeat("X", 16), "ASIA"+strings.Repeat("Y", 16)
 		secret, token := leak+strings.Repeat("s", 26)+"/+0a", leak+"tok=="
-		fails(t, "AKIA123\n", "an access key ID is AKIA or ASIA followed by 16 capital letters or digits", "aws")
-		fails(t, id+"\nshort"+leak+"\n", "a secret access key is 40 letters, digits, / or +", "aws")
-		fails(t, asia+"\n"+secret+"\nbad token!\n", "a session token is letters, digits, /, + or =", "aws")
+		fails(t, "\nAKIA123\n", "an access key ID is AKIA or ASIA followed by 16 capital letters or digits", "aws")
+		fails(t, "\n"+id+"\nshort"+leak+"\n", "a secret access key is 40 letters, digits, / or +", "aws")
+		fails(t, "\n"+asia+"\n"+secret+"\nbad token!\n", "a session token is letters, digits, /, + or =", "aws")
 		stored(t, "aws", "")
 		takeCalls(t, home)
-		runs(t, id+"\n"+secret+"\n", []string{"aws"}, "Secret access key (typing stays hidden): ", `Stored "aws"`)
+		runs(t, "\n"+id+"\n"+secret+"\n", []string{"aws"}, "Secret access key (typing stays hidden): ", `Stored "aws"`)
 		stored(t, "aws", id+":"+secret)
 		if c := takeCalls(t, home); c != "stty -echo\nstty echo\n" {
 			t.Errorf("stty calls %q", c)
 		}
-		runs(t, "y\n"+asia+"\n"+secret+"\n"+token+"\n", []string{"aws"}, "Session token (an ASIA key is temporary and needs one)")
+		runs(t, "\ny\n"+asia+"\n"+secret+"\n"+token+"\n", []string{"aws"}, "Session token (an ASIA key is temporary and needs one)")
+		stored(t, "aws", asia+":"+secret+":"+token)
+		runs(t, id+"\n"+secret+"\n", []string{"aws", "-account", "prod"}, `Stored "aws@prod"`, "-provider aws@prod -scope")
+		stored(t, "aws@prod", id+":"+secret)
 		stored(t, "aws", asia+":"+secret+":"+token)
 	})
 
@@ -587,7 +649,7 @@ func TestCLIInit(t *testing.T) {
 			{"not json " + leak, "not a service-account key file"},
 		} {
 			writeFile(t, p, c.content)
-			fails(t, p+"\n", c.msg, "gcp")
+			fails(t, "\n"+p+"\n", c.msg, "gcp")
 		}
 		stored(t, "gcp", "")
 		raw, err := json.MarshalIndent(obj{"type": "service_account", "client_email": "mintrun-test", "private_key": pkcs8}, "", "  ")
@@ -595,23 +657,31 @@ func TestCLIInit(t *testing.T) {
 			t.Fatal(err)
 		}
 		writeFile(t, p, string(raw)+"\n")
-		runs(t, p+"\n", []string{"gcp"}, `Stored "gcp"`, "-provider gcp")
+		runs(t, "\n"+p+"\n", []string{"gcp"}, `Stored "gcp"`, "-provider gcp -perms")
 		stored(t, "gcp", string(raw))
+		runs(t, "ml\n"+p+"\n", []string{"gcp"}, `Stored "gcp@ml"`, "-provider gcp@ml -perms")
+		stored(t, "gcp@ml", string(raw))
 	})
 
 	t.Run("cloudflare", func(t *testing.T) {
 		home, _ := setupEnv(t)
-		fails(t, "bad token "+leak+"\n", "a Cloudflare API token is letters, digits, _ or -", "cloudflare")
+		fails(t, "\nbad token "+leak+"\n", "a Cloudflare API token is letters, digits, _ or -", "cloudflare")
 		takeCalls(t, home)
 		tok := "cf_" + leak + "-1"
-		runs(t, tok+"\n", []string{"cloudflare"}, "API token (typing stays hidden): ", `Stored "cloudflare"`)
+		runs(t, "\n"+tok+"\n", []string{"cloudflare"}, "API token (typing stays hidden): ", `Stored "cloudflare"`)
 		stored(t, "cloudflare", tok)
 		if c := takeCalls(t, home); c != "stty -echo\nstty echo\n" {
 			t.Errorf("stty calls %q", c)
 		}
+		runs(t, "client-a\n"+tok+"2\n", []string{"cloudflare"}, `Stored "cloudflare@client-a"`, "-provider cloudflare@client-a -scope")
+		stored(t, "cloudflare@client-a", tok+"2")
+		stored(t, "cloudflare", tok)
+		takeCalls(t, home)
 		// No passphrase: stop before asking for anything.
 		t.Setenv("MINTRUN_VAULT_KEY", "")
-		fails(t, tok+"\n", "the encrypted file vault needs a passphrase", "cloudflare")
+		if r := fails(t, tok+"\n", "the encrypted file vault needs a passphrase", "cloudflare"); strings.Contains(r.out, "Account name") {
+			t.Errorf("asked for an account first:\n%s", r.out)
+		}
 		if c := takeCalls(t, home); c != "" {
 			t.Errorf("ran %q", c)
 		}
@@ -660,12 +730,13 @@ func TestCLIInit(t *testing.T) {
 				t.Errorf("init %v, interrupted: code %d (exited %v):\n%s%s", args, r.code, r.exited, r.out, r.err)
 			}
 		}
-		interrupt("API token (typing stays hidden): ", "cloudflare")
+		interrupt("API token (typing stays hidden): ", "cloudflare", "-account", "")
 		// Echo comes back on even though the hidden read never finished.
 		if c := takeCalls(t, home); c != "stty -echo\nstty echo\n" {
 			t.Errorf("stty calls %q", c)
 		}
 		interrupt("[y/N]: ")
+		interrupt("Account name (Enter for the default): ", "github")
 	})
 
 	t.Run("telegram", func(t *testing.T) {
@@ -863,6 +934,48 @@ func TestCLIInit(t *testing.T) {
 		if _, err := os.Stat(p); !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("wrote policy.json after a no: %v", err)
 		}
+
+		// A GitHub account named earlier in the run gets the same rule as the default account.
+		pemPath := filepath.Join(home, "key.pem")
+		writeFile(t, pemPath, pkcs1)
+		ghWork := "y\nwork\n123\n456\n" + pemPath + "\n" + strings.Repeat("n\n", 6)
+		wantBoth := "{\n  \"github\": " + strings.ReplaceAll(wantRule, "\n", "\n  ") + ",\n  \"github@work\": " + strings.ReplaceAll(wantRule, "\n", "\n  ") + "\n}\n"
+		runs(t, ghWork+"y\n\ny\n", nil, `Stored "github@work"`, "Wrote "+p+".", "Next: mintrun doctor")
+		if got := read(); got != wantBoth {
+			t.Errorf("policy.json:\n%s\nwant:\n%s", got, wantBoth)
+		}
+		stored(t, "github@work", "123:456:"+strings.TrimSpace(pkcs1))
+		stored(t, "github", "")
+		// An account left unchanged is still named, and an existing file is never changed.
+		ghKept := "y\nwork\nn\n" + strings.Repeat("n\n", 6) + "y\n\n"
+		r = runs(t, ghKept, nil, "Left unchanged.", "already has a github rule; left unchanged. The suggested rule:\n\"github\": "+wantRule,
+			"already has a github@work rule; left unchanged. The suggested rule:\n\"github@work\": "+wantRule)
+		if n := strings.Count(r.out, "github@work rule"); n != 1 {
+			t.Errorf("named github@work %d times:\n%s", n, r.out)
+		}
+		writeFile(t, p, `{"github":{}}`)
+		runs(t, ghKept, nil, "already has a github rule", "exists, so it is left unchanged. Add this key to it:\n\"github@work\": "+wantRule)
+		if got := read(); got != `{"github":{}}` {
+			t.Errorf("policy.json changed:\n%s", got)
+		}
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+		takeCalls(t, home)
+
+		// An account only the shim config names gets the same rule too; another type's account gets none.
+		shimCfg := filepath.Join(home, ".mintrun", "shims", "config.json")
+		writeFile(t, shimCfg, `{"gh":{"provider":"github@work"},"wrangler":{"provider":"cloudflare@client-a"}}`)
+		runs(t, "\ny\n", []string{"policy"}, "Wrote "+p+".")
+		if got := read(); got != wantBoth {
+			t.Errorf("policy.json for the shim's account:\n%s\nwant:\n%s", got, wantBoth)
+		}
+		for _, f := range []string{p, shimCfg} {
+			if err := os.Remove(f); err != nil {
+				t.Fatal(err)
+			}
+		}
+		takeCalls(t, home)
 
 		// When the sandbox is not ready, the reason has no path (leak is in the path) and the rule omits sandbox.
 		core.SandboxExecPath = filepath.Join(home, "missing", leak, "sandbox-exec")

@@ -959,6 +959,33 @@ func TestCLIExecPurpose(t *testing.T) {
 	}
 }
 
+// TestCLIExecRequiresProvider: exec has no default provider since v0.16.0, so a run without one,
+// an empty one included, is a usage error that runs nothing and writes no audit entry.
+func TestCLIExecRequiresProvider(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MINTRUN_HOME", home)
+	t.Setenv("MINTRUN_FILE_VAULT", "1")
+	t.Setenv("MINTRUN_VAULT", "keychain")
+	writeFile(t, filepath.Join(home, "policy.json"), `{"cloudflare":{"allow_static":true}}`)
+	setSecret(t, "cloudflare", "cf_default_secret")
+	ran := filepath.Join(home, "ran")
+	for _, args := range [][]string{
+		{"exec", "-perms", "static", "--", "touch", ran},
+		{"run", "-perms", "static", "touch", ran},
+		{"exec", "-provider", "", "-perms", "static", "--", "touch", ran},
+	} {
+		r := runCLI(t, "", nil, args...)
+		if !r.exited || r.code != 1 || r.err != "usage: mintrun exec -provider <type>[@<account>] -scope <scope> -- <command> [args...]\n" {
+			t.Errorf("%q: code %d, exited %v, err %q", args, r.code, r.exited, r.err)
+		}
+	}
+	for _, p := range []string{ran, filepath.Join(home, "audit.jsonl")} {
+		if _, err := os.Stat(p); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("a usage error left %s behind: %v", filepath.Base(p), err)
+		}
+	}
+}
+
 func TestCLIRelay(t *testing.T) {
 	serverHome := t.TempDir()
 	clientHome := t.TempDir()
