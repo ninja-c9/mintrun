@@ -255,10 +255,11 @@ function leftWorld(B, t) {
   });
   // L3: the command the agent runs
   // printenv is refused at the gate (b21-22); from b22.5 the command is the deploy that goes through.
-  // The mintrun command is wrapped like a shell line, from the freed key line (y -180) down, so it fits the panel.
+  // The mintrun command is wrapped like a shell line in 30 px rows, ending where printenv sat (y -100), so it fits the panel
+  // and the result line (y -50, where the reply lands) stays clear.
   const L3 = B < K.relief ? [typed('$ printenv', B, K.typ, .6)]
-    : typed(['$ mintrun exec \\', '  -provider cloudflare \\', '  -- ' + (B >= K.dArr ? 'wrangler deploy' : 'printenv')].join('\n'), B, K.relief, .8).split('\n');
-  const Y3 = B < K.relief ? [-100] : [-180, -140, -100];
+    : typed(['$ mintrun exec \\', '  -provider cloudflare \\', '  -perms dns:write \\', '  -- ' + (B >= K.dArr ? 'wrangler deploy' : 'printenv')].join('\n'), B, K.relief, .8).split('\n');
+  const Y3 = B < K.relief ? [-100] : [-190, -160, -130, -100];
   let w3 = 0; L3.forEach((s, i) => { w3 = text(s, X0, Y3[i], { font: M24, col: B < K.relief ? SKY2 : MINT3 }); });
   if ((B > 1.5 && B < 3.2) || (B > 17.5 && B < 19.2)) if (Math.floor(B * 2) % 2 === 0 || (B > 2 && B < 2.6) || (B > 18 && B < 18.8)) { ctx.fillStyle = SKY2; ctx.fillRect(X0 + w3 + 4, Y3[L3.length - 1] - 14, 12, 28); }
   // L4: the leaked output, later the result handed back by mintrun

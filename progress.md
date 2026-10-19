@@ -653,5 +653,5 @@
 - **Kiểm chứng:** `scripts/verify.sh` 5/5 pass, coverage 95.1%; 6/6 mutant trên bản copy bị giết; chạy tay trong home tạm với `MINTRUN_FILE_VAULT=1` đúng như tài liệu.
 - **Còn lại:**
   - MCP `mintrun_exec` và shim `aws`, `vercel`, `psql` ở chế độ `auto` không cấu hình quyền vẫn có thể gửi danh sách rỗng (đã ghi vào giới hạn của threat model); với `aws` đó là mọi quyền của role.
-  - `docs/video/mintrun-intro.html` vẫn in `mintrun exec` không có `-perms` (phiên video sở hữu file này).
+  - Đã sửa (2026-10-19, nhánh `claude/optimistic-swartz-91670b`): panel context của agent trong `docs/video/mintrun-intro.html` giờ gõ thêm dòng `  -perms dns:write \`, gói thành 4 dòng cách 30 px để vừa khung, và `docs/video/mintrun-intro.mp4` đã render lại bằng cùng skill. Kiểm chứng: dòng V11 trong `checks.md`.
   - Commit chỉ nằm trên `claude/modest-greider-67684e`: chưa merge, chưa tag `v0.16.0`, chưa push.
