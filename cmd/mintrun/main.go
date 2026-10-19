@@ -255,6 +255,7 @@ func cmdExec(ctx context.Context, rt *core.Runtime, args []string) {
 	vault := fs.String("vault", "", "Vault plugin override (default: keychain, or 1password)")
 	ttl := fs.Int("ttl", 600, "Ephemeral token TTL in seconds")
 	cwd := fs.String("cwd", "", "Working directory for command")
+	purpose := fs.String("purpose", "", "Why this command runs: shown to an approver and checked by policy (at most 300 bytes of plain text)")
 	approve := fs.Bool("approve", false, "Ask a human before minting: the mintrun app (a macOS dialog when it is not running), plus Telegram or Slack when approval-telegram or approval-slack is set")
 	cleanEnv := fs.Bool("clean-env", false, "Run the command with only PATH/HOME/TMPDIR/USER/LANG/TERM/SSL_CERT_FILE, policy allowed_env, and the lease env")
 	sandbox := fs.Bool("sandbox", false, "Run the command in the OS sandbox (macOS and Linux), away from mintrun's home and the keystore")
@@ -301,6 +302,7 @@ func cmdExec(ctx context.Context, rt *core.Runtime, args []string) {
 			TTLSeconds:  *ttl,
 		},
 		Vault:      *vault,
+		Purpose:    *purpose,
 		Command:    cmdArgs,
 		WorkingDir: *cwd,
 		Approve:    *approve,

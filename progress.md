@@ -625,3 +625,10 @@
   - Recorder tắt: **fail-closed** sau 25 ms, `policy denied: semantic screen did not answer and jev.on_error is "deny"`, `jev_error` ghi POST lỗi.
 - **Phát hiện cần biết (không phải lỗi):** purpose rỗng làm `mismatch` 0.36, sát trên ngưỡng `ask_above 0.35`, nên `escalate` sẽ hỏi người với cả lệnh vô hại. `mintrun exec` **không có cờ `-purpose`** (chỉ MCP gửi được), nên người dùng CLI không thể nói rõ mục đích để giảm nhiễu.
 - **Đã ghi:** mục `Live TypeSafe Jev Call` trong `checks.md` (7 dòng, tất cả `pass`), kèm ghi chú xóa khóa/home tạm và không đưa đường dẫn máy vào tài liệu.
+
+
+## Checkpoint — Chạy GitHub thật và bổ sung `-purpose` cho CLI (2026-10-19)
+
+- **Chạy thật:** home tạm dùng keychain thật (service `mintrun:github` không phụ thuộc home), policy tạm cho `static`; `mintrun exec -provider github -scope ninja-c9/mintrun -perms static -- sh -c 'curl ... /repos/ninja-c9/mintrun'` trả **HTTP 200** (`full_name: ninja-c9/mintrun`, `visibility: public`), audit `outcome: done`, `exit_code: 0`, `ephemeral: false`, `revoked: false`, 657 ms. Chạy JIT (không `static`) bị từ chối đúng như thiết kế và in rõ opt-in. Home tạm đã xóa.
+- **Bổ sung:** `mintrun exec` có cờ `-purpose "..."` (trước đây chỉ MCP gửi được), nên người dùng CLI cũng nói được mục đích cho screen và người duyệt; policy vẫn kiểm purpose (≤300 byte, không ký tự điều khiển/xuống dòng). `TestCLIExecPurpose` pin cả trường hợp hợp lệ (audit `purpose`) và không hợp lệ (`blocked_by: purpose`); mutant "nhận cờ rồi bỏ giá trị" compile được và bị test giết.
+- **Kiểm chứng:** xem mục `Live GitHub Run and the CLI -purpose Flag` trong `checks.md`.

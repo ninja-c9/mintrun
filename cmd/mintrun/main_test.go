@@ -934,6 +934,31 @@ func generateTestTLSCert(t *testing.T, dir string) (certFile, keyFile, pin strin
 	return certFile, keyFile, pin
 }
 
+func TestCLIExecPurpose(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MINTRUN_HOME", home)
+	t.Setenv("MINTRUN_FILE_VAULT", "1")
+	t.Setenv("MINTRUN_VAULT", "keychain")
+	writeFile(t, filepath.Join(home, "policy.json"), `{"cloudflare":{"allow_static":true}}`)
+	setSecret(t, "cloudflare", "cf_purpose_secret")
+
+	r := runCLI(t, "", nil, "exec", "-provider", "cloudflare", "-perms", "static", "-purpose", "check the zone", "--", "true")
+	if !r.exited || r.code != 0 {
+		t.Fatalf("exec: code %d, exited %v\n%s%s", r.code, r.exited, r.out, r.err)
+	}
+	if e := lastAudit(t, home); e.Outcome != "done" || e.Purpose != "check the zone" {
+		t.Errorf("audit entry = %+v", e)
+	}
+
+	r = runCLI(t, "", nil, "exec", "-provider", "cloudflare", "-perms", "static", "-purpose", "two\nlines", "--", "true")
+	if !r.exited || r.code != 1 || !strings.Contains(r.err, "policy denied: purpose must be at most 300 bytes of plain text") {
+		t.Fatalf("invalid purpose: code %d, exited %v, err %q", r.code, r.exited, r.err)
+	}
+	if e := lastAudit(t, home); e.BlockedBy != "purpose" {
+		t.Errorf("invalid-purpose audit entry = %+v", e)
+	}
+}
+
 func TestCLIRelay(t *testing.T) {
 	serverHome := t.TempDir()
 	clientHome := t.TempDir()
