@@ -610,5 +610,5 @@
 
 - **Tag `v0.14.0`** tại `2150b53` (AH-2: token trong `#fragment` và kiểm `Host` loopback), đúng phần lộ trình §6 của `plan.md` mà tài liệu đã ghi là hoàn thành nhưng chưa có tag.
 - **Tag `v0.15.0`** tại commit tài liệu cuối trên `main`, gồm Hints, JEV, module version cho `go install`, và baseline benchmark.
-- **Kiểm chứng trước khi tag:** `scripts/verify.sh` 5/5 pass, coverage **95.0%**, `gofmt -s -l .` sạch, `go vet` sạch, `./mintrun -version` in `mintrun 363565634bf9+dirty (go1.26.2, darwin/arm64)` (bản build sau đó trên `main` in hash `aa9b3a0`), citation PASS.
+- **Kiểm chứng trước khi tag:** `scripts/verify.sh` 5/5 pass, coverage **95.0%**, `gofmt -s -l .` sạch, `go vet` sạch, `./mintrun -version` in `mintrun a412d59e6c90+dirty (go1.26.2, darwin/arm64)` khi chạy lại acceptance lần cuối trên `main`, citation PASS.
 - **Push:** `git ls-remote` xác nhận `origin/main` vẫn ở `68cac7d` và chưa có tag `v0.14.0`/`v0.15.0` (luật 25); `git push origin main` đưa `origin/main` lên `38fa475`; `git push origin v0.14.0 v0.15.0` tạo hai tag annotated (`2349a24` → `2150b53`, `abc5080` → `38fa475`).
