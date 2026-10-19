@@ -604,3 +604,11 @@
   - `go build -trimpath -o mintrun ./cmd/mintrun` rc=0; `./mintrun -version` in `mintrun 363565634bf9+dirty (go1.26.2, darwin/arm64)`; `./mintrun plugin list` liệt kê 7 built-in.
   - `scripts/verify.sh` (nay có trên `main`): `gofmt`, `go vet`, `go test`, `coverage 95.0% > 90%`, `build + smoke` đều **pass**, rc=0.
 - **Còn lại:** chạy lại scan bidi/đường dẫn và citation checker trên cây hợp nhất, commit tài liệu, rồi cắt tag `v0.14.0` (tại `2150b53`) và `v0.15.0` (tại commit tài liệu cuối) và push `main` + tag, sau khi kiểm lại `git ls-remote` (luật 25).
+
+
+## Checkpoint — Phát hành `v0.14.0` và `v0.15.0` (2026-10-19)
+
+- **Tag `v0.14.0`** tại `2150b53` (AH-2: token trong `#fragment` và kiểm `Host` loopback), đúng phần lộ trình §6 của `plan.md` mà tài liệu đã ghi là hoàn thành nhưng chưa có tag.
+- **Tag `v0.15.0`** tại commit tài liệu cuối trên `main`, gồm Hints, JEV, module version cho `go install`, và baseline benchmark.
+- **Kiểm chứng trước khi tag:** `scripts/verify.sh` 5/5 pass, coverage **95.0%**, `gofmt -s -l .` sạch, `go vet` sạch, `./mintrun -version` in `mintrun 363565634bf9+dirty (go1.26.2, darwin/arm64)` (bản build sau đó trên `main` in hash `aa9b3a0`), citation PASS.
+- **Push:** `main` và hai tag được đẩy lên `origin`, sau khi `git ls-remote` xác nhận `origin/main` vẫn ở `68cac7d` và chưa có tag `v0.14.0`/`v0.15.0` (luật 25).
