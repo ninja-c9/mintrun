@@ -554,7 +554,7 @@ func (k *KeychainVault) getFileSecret(key string) (string, error) {
 // serviceName does.
 func setupHint(key string) string {
 	switch k := strings.TrimSpace(strings.ToLower(key)); k {
-	case "github", "aws", "gcp", "cloudflare":
+	case "github", "aws", "gcp", "cloudflare", JevKey:
 		return "mintrun init " + k
 	case TelegramApprovalKey:
 		return "mintrun init telegram"

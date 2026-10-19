@@ -309,16 +309,18 @@ func TestCLIDoctor(t *testing.T) {
 	}{
 		{"fresh", nil, 0, []string{"ok    PATH: mintrun runs this binary", "ok    vault: encrypted file vault", "warn  vault: an IDE started from the Dock",
 			"-     secret github: not set", "warn  secret: no provider has a master secret yet", "-     approval: approval-telegram not set",
-			"warn  policy: no policy.json", "warn  IDE: no IDE has a mintrun MCP entry"}},
+			"-     screen: jev not set\n", "-     screen: off\n", "warn  policy: no policy.json", "warn  IDE: no IDE has a mintrun MCP entry"}},
 		{"configured", func(t *testing.T, home, self string) {
 			setSecret(t, "github", "1:2:"+leak)
 			setSecret(t, builtin.TelegramApprovalKey, "4242:"+tgToken)
 			setSecret(t, builtin.SlackApprovalKey, "U0TEST:"+slackToken)
+			setSecret(t, builtin.JevKey, "ts_"+leak)
+			writeFile(t, filepath.Join(home, ".mintrun", "settings.json"), `{"jev":{"mode":"escalate","model":"jev-1.13.0"}}`)
 			writeFile(t, policy(home), `{"github":{"allowed_scopes":["acme/widgets"],"clean_env":true}}`)
 			writeJSON(t, idePaths()[0], obj{"mcpServers": obj{"mintrun": obj{"command": self, "args": []string{"mcp"}},
 				"other": obj{"command": "x", "env": obj{"API_KEY": leak}}}})
 		}, 0, []string{"ok    secret github: set\n", "-     secret aws: not set\n", "ok    approval: approval-telegram set\n", "ok    approval: approval-slack set\n", // names only
-			"ok    policy: 1 rule(s) in ", "ok    Claude Code: runs this binary"}},
+			"ok    screen: jev set\n", "ok    screen: escalate with jev-1.13.0, on_error escalate\n", "ok    policy: 1 rule(s) in ", "ok    Claude Code: runs this binary"}},
 		{"unknown policy field", func(t *testing.T, home, self string) {
 			writeFile(t, policy(home), `{"github":{"allowed_scope":["acme/*"]}}`)
 		}, 1, []string{`FAIL  policy: json: unknown field "allowed_scope"; exec ignores that field`}},
@@ -365,6 +367,10 @@ func TestCLIDoctor(t *testing.T) {
 		{"bad Telegram setting", func(t *testing.T, home, self string) {
 			setSecret(t, builtin.TelegramApprovalKey, leak)
 		}, 1, []string{"FAIL  approval: approval-telegram must be <user_id>:<bot_token>"}},
+		{"screen model alias", func(t *testing.T, home, self string) {
+			writeFile(t, filepath.Join(home, ".mintrun", "settings.json"), `{"jev":{"mode":"deny","model":"jev-latest","on_error":"pass"}}`)
+		}, 0, []string{"-     screen: jev not set\n",
+			"warn  screen: deny with jev-latest, an alias TypeSafe moves without notice: name a version such as jev-1.13.0\n"}},
 		{"go run binary", func(t *testing.T, home, self string) {
 			p := filepath.Join(home, "go-build123", "b001", "exe", "mintrun")
 			writeFile(t, p, "")
@@ -385,7 +391,8 @@ func TestCLIDoctor(t *testing.T) {
 			if err := os.Symlink(p+".missing", p); err != nil {
 				t.Fatal(err)
 			}
-		}, 1, []string{"FAIL  secret github: read vault.json: no such file or directory\n", "FAIL  approval: read vault.json: no such file or directory\n"}},
+		}, 1, []string{"FAIL  secret github: read vault.json: no such file or directory\n", "FAIL  approval: read vault.json: no such file or directory\n",
+			"FAIL  screen: read vault.json: no such file or directory\n"}},
 		{"nothing on PATH", func(t *testing.T, home, self string) {
 			t.Setenv("PATH", t.TempDir())
 		}, 0, []string{"warn  PATH: no mintrun on it"}},
@@ -501,7 +508,7 @@ func TestCLIInit(t *testing.T) {
 
 	t.Run("usage", func(t *testing.T) {
 		home, _ := setupEnv(t)
-		usage := "usage: mintrun init [github|aws|gcp|cloudflare|telegram|slack|policy|mcp]"
+		usage := "usage: mintrun init [github|aws|gcp|cloudflare|telegram|slack|jev|policy|mcp]"
 		fails(t, "", usage, "github", "aws")
 		fails(t, "", usage, "nope")
 		before := snapshot(t, home)
@@ -513,7 +520,7 @@ func TestCLIInit(t *testing.T) {
 			t.Errorf("init with no yes changed a file or ran a command")
 		}
 		// A yes to a step whose secret is stored still asks before replacing it.
-		keys := []string{"github", "aws", "gcp", "cloudflare", builtin.TelegramApprovalKey, builtin.SlackApprovalKey}
+		keys := []string{"github", "aws", "gcp", "cloudflare", builtin.TelegramApprovalKey, builtin.SlackApprovalKey, builtin.JevKey}
 		for _, k := range keys {
 			setSecret(t, k, "old-"+k)
 		}
@@ -608,6 +615,22 @@ func TestCLIInit(t *testing.T) {
 		if c := takeCalls(t, home); c != "" {
 			t.Errorf("ran %q", c)
 		}
+	})
+
+	t.Run("jev", func(t *testing.T) {
+		home, _ := setupEnv(t)
+		fails(t, "bad key "+leak+"\n", "a TypeSafe API key is printable ASCII with no spaces", "jev")
+		stored(t, builtin.JevKey, "")
+		takeCalls(t, home)
+		// Nothing is sent: every call is billed.
+		key := "ts_" + leak + "-1"
+		runs(t, key+"\n", []string{"jev"}, "TypeSafe API key (typing stays hidden): ", `Stored "jev" in vault "keychain".`, `"jev": {"mode": "escalate"}`)
+		stored(t, builtin.JevKey, key)
+		if c := takeCalls(t, home); c != "stty -echo\nstty echo\n" {
+			t.Errorf("stty calls %q", c)
+		}
+		runs(t, "n\n", []string{"jev"}, "jev is already stored. Replace it? [y/N]: ", "Left unchanged.")
+		stored(t, builtin.JevKey, key)
 	})
 
 	t.Run("interrupt", func(t *testing.T) {

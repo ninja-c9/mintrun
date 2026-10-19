@@ -197,6 +197,7 @@ func (s *WatchServer) handleConn(ctx context.Context, conn net.Conn) {
 			Purpose:    env.Request.Purpose,
 			Client:     env.Request.Client,
 			Via:        env.Request.Via,
+			Jev:        env.Request.Jev,
 		}
 		text := core.ApprovalText("mintrun approval request ("+env.Task+")", req, 3500)
 		item := &WatchApproval{

@@ -258,15 +258,19 @@ func (e *ExternalPlugin) call(ctx context.Context, req rpcRequest) (*rpcResponse
 
 // quote returns text the plugin wrote (a traceback names its own path) fit for an error that
 // reaches agents and audit.jsonl: scrubbed of the master first, because the runner scrubs only
-// the whole master and a replaced home inside it would leak the rest, then with the user's home
-// shown as ~ and the mintrun home as $MINTRUN_HOME (rule 36).
+// the whole master and a replaced home inside it would leak the rest, then through ShortHomes.
+func (e *ExternalPlugin) quote(text string, req rpcRequest) string {
+	return ShortHomes(Scrub(text, []string{req.MasterSecret}), e.home)
+}
+
+// ShortHomes shows the user's home in text as ~ and the mintrun home as $MINTRUN_HOME (rule 36).
+// A relative or root home is left alone.
 // ponytail: only the paths as given are replaced, so a resolved symlink or an escaped form
 // (JSON's \u, Windows' \\) still gets through; match those if a plugin is seen printing them.
-func (e *ExternalPlugin) quote(text string, req rpcRequest) string {
-	text = Scrub(text, []string{req.MasterSecret})
+func ShortHomes(text, home string) string {
 	userHome, _ := os.UserHomeDir()
 	var oldnew []string
-	for _, p := range [][2]string{{userHome, "~"}, {e.home, "$MINTRUN_HOME"}} { // ~ wins inside the user home
+	for _, p := range [][2]string{{userHome, "~"}, {home, "$MINTRUN_HOME"}} { // ~ wins inside the user home
 		if dir := filepath.Clean(p[0]); filepath.IsAbs(dir) && filepath.Dir(dir) != dir {
 			oldnew = append(oldnew, dir, p[1])
 		}

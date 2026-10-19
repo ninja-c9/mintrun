@@ -981,3 +981,97 @@ New tests stay hermetic (rule 22): a plain `go test ./...` makes zero real `sand
   go test -count=1 -v -run '^(TestOSApproval|TestApprovalHints|TestMintLeaseAndRelayClient|TestTelegramApproval|TestSlackApproval|TestRelayEndToEnd|TestWatchServer)$' ./internal/core ./internal/builtin
   ```
 
+## 8. Workstream AJ — Jev Semantic Screen, Phase 1 (optional, off by default)
+
+> An optional screen that sends what the approver already sees to TypeSafe AI's System One (`jev-1.13.0`) once per request and can only raise approval or deny. Phase 1 ships modes `off` (default) and `escalate`; `deny` is built and tested but undocumented as calibrated. No live call is made: a live probe is a later runbook step.
+
+| # | Step | Mark | Status |
+| :-- | :--- | :--- | :--- |
+| 1 | **AJ-1** — core types and gate hook (`JevVerdict`, `JevThresholds`, `Runtime.Screen`, `decide`, `checkPolicy`, `ShortHomes`) | `[SERIAL]` | ⏳ |
+| 2 | **AJ-2** — `internal/builtin/jev.go` client, questions, routing | `[SERIAL]` after AJ-1 | ⏳ |
+| 3 | **AJ-3** — surfaces: `Risk:` line, app.sock `jev`, audit `jev_*`, `PolicyDecision.jev`, `mintrun_audit` | `[SERIAL]` after AJ-1 | ⏳ |
+| 4 | **AJ-4** — `settings.json` `jev`, `bootRuntime`, `mintrun init jev`, `setupHint`, `doctor` | `[SERIAL]` after AJ-2 | ⏳ |
+| 5 | **AJ-5** — relay: the server screens with its own key, the client never calls Jev | `[SERIAL]` after AJ-4 | ⏳ |
+| 6 | **AJ-6** — tests, hermetic proof, 17 mutants on a copy | `[SERIAL]` after AJ-5 | ⏳ |
+| 7 | **AJ-7** — README, AGENTS.md (rule 16 amendment, rule 49), checks, scans, commits | `[SERIAL]` last | ⏳ |
+
+All steps edit `internal/core/runner.go` or files that build against it, so none runs in parallel.
+
+### AJ-1 — Core Types and Gate Hook
+
+- **Files:** `internal/core/runner.go`, `internal/core/plugin.go`, `internal/core/core_test.go`.
+- **Deliverables:**
+  1. `[SERIAL]` `JevVerdict` (JSON `risk`, `labels`, `severity`, `model`; `json:"-"` route, reason, ms, error), `JevThresholds` (`ask_above` 0.35, `deny_above` 0.85, `severity_deny` 3) on `PolicyRule.Jev`, `Runtime.Screen func(ExecRequest, PolicyRule) *JevVerdict`, `ExecRequest.Jev` (`json:"-"`), `PolicyDecision.Jev`, `AuditEntry.jev_*`.
+  2. `[SERIAL]` `decide` calls `Screen` once, after every deterministic rule allowed and before `sandboxArgv`, only when `Screen != nil` and the runtime is not a relay client; it reuses `req.Jev` when set, so the second `decide` after an approval never calls again. Deny sets `blocked_by: jev`; ask sets `ApprovalRequired`; pass changes nothing.
+  3. `[SERIAL]` `checkPolicy` copies `d.Jev` into the request before the approval and into the audit entry on every exit. `ShortHomes` (factored out of `ExternalPlugin.quote`) shows the user's home as `~` and the mintrun home as `$MINTRUN_HOME`.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCheckPolicyMatchesExecBlind/jev|TestExecBlindJevOnce' ./internal/core
+  ```
+
+### AJ-2 — `internal/builtin/jev.go`
+
+- **Files:** `internal/builtin/jev.go`, `internal/builtin/jev_test.go`.
+- **Deliverables:**
+  1. `[SERIAL]` `JevScreen(rt, JevConfig)` returns nil for mode `off`. It reads the default vault's `jev` key lazily, once, posts `{"state","model","questions"}` to `jevAPI` with `Authorization: Bearer`, 5 s per call, an 8 s budget with bounded backoff on 429 and 529, 400/401/413/422 final, replies read through `io.LimitReader(…, 1<<20)`, and every error `jev systemone: <Scrub(err, key)>` quoting no address but TypeSafe's host and never the reply body.
+  2. `[SERIAL]` Eight questions (seven positive nouls plus `severity` 0–3), answers range-checked, severity from `score` (never `legend`), routing deny > ask > pass with `on_error` (`escalate` default, `deny`, `pass`).
+  3. `[SERIAL]` The state carries only what `ApprovalText` shows plus the provider's rule and a fixed trust note, homes shortened.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'Jev' ./internal/builtin
+  ```
+
+### AJ-3 — Surfaces
+
+- **Files:** `internal/core/runner.go`, `internal/builtin/appbroker.go`, `internal/builtin/watch.go`, the exact-text tests (`core_test.go`, `telegram_test.go`, `slack_test.go`, `relay_test.go`, `builtin_test.go`).
+- **Deliverables:**
+  1. `[SERIAL]` `ApprovalText` writes an unquoted `Risk:` line right under `Network:` (under `Device:` when set) from `low|medium|high|unknown|not screened`, the labels, and the model id.
+  2. `[SERIAL]` The app.sock `approve` line carries `"jev":{"risk","labels","severity","model"}`; `mintrun watch` shows the same `Risk:` line; `mintrun_policy_check` returns `jev`; `mintrun_audit` shows `jev_*` as written.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'ApprovalText|OSApproval|AppApproval|GovernanceTools|TestTelegramApproval|TestSlackApproval|TestWatchServer' ./...
+  ```
+
+### AJ-4 — Settings, `init jev`, `doctor`
+
+- **Files:** `cmd/mintrun/main.go`, `cmd/mintrun/setup.go`, `cmd/mintrun/main_test.go`, `cmd/mintrun/setup_test.go`, `internal/builtin/keychain.go`, `internal/builtin/builtin_test.go`.
+- **Deliverables:**
+  1. `[SERIAL]` `settings.json` `"jev": {"mode","model","on_error"}` with fixed refusal texts (rule 45); missing or `null` is off.
+  2. `[SERIAL]` `mintrun init jev` reads the key with echo off and stores it as `jev` in the default vault; `setupHint("jev")` names it; `doctor` shows the key as set or `-` and warns on an alias model.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestBootRuntimeSettings|TestCLIInit|TestCLIDoctor|TestSecretNotFoundHint' ./...
+  ```
+
+### AJ-5 — Relay
+
+- **Files:** `cmd/mintrun/relay.go` (or wherever `relay serve` boots), `internal/builtin/relay_test.go`.
+- **Deliverables:**
+  1. `[SERIAL]` `mintrun relay serve` screens with the server's own key; a relay client never calls Jev (`decide` skips the screen when `rt.Relay != nil`) and copies the server's verdict; the `minted` entry carries `jev_*`.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestRelayEndToEnd' ./internal/builtin
+  ```
+
+### AJ-6 — Tests, Hermetic Proof, Mutants
+
+- **Deliverables:**
+  1. `[SERIAL]` `TestJevClient`, `TestJevStateNeverCarriesSecrets` (purpose canary as positive control), `TestCheckPolicyMatchesExecBlind/jev`, `TestExecBlindJevOnce`, `TestApprovalTextRisk`, `TestSecretNotFoundHint/jev`, `TestCLIInit/jev`, `TestCLIDoctor` (set, `-`, vault error, alias), `TestBootRuntimeSettings/jev`, `TestRelayEndToEnd` (server stub called, client stub never).
+  2. `[SERIAL]` On a `git archive` copy, the default `jevAPI` repointed to a logging server: plain `go test ./...` logs 0 requests; a planted test logs at least 1 (positive control).
+  3. `[SERIAL]` 17 mutants on a copy, each compiled first (`go test -run '^$'`), each failing a test; the count goes in [checks.md](checks.md).
+- **Verification:**
+  ```bash
+  go test -count=1 -run 'Jev|CheckPolicyMatchesExecBlind|ApprovalText|OSApproval|AppApproval|GovernanceTools|BootRuntimeSettings' -v ./...
+  ```
+
+### AJ-7 — Docs and Acceptance
+
+- **Files:** `README.md`, `AGENTS.md`, `plan.md`, `progress.md`, `checks.md`.
+- **Deliverables:**
+  1. `[SERIAL]` README "Semantic screen (optional, through TypeSafe AI)": the exact fields sent, no training on user data, ZDR only for enterprise customers, no published retention period, never a replacement for policy, the sandbox, or a human, off by default, cost, the `mintrun_policy_check` oracle warning, `on_error: pass` as the operator's choice, and with a relay only the server sends.
+  2. `[SERIAL]` AGENTS.md rule 16 amendment (the `jev` key is the one secret `CheckPolicy` may read) and rule 49.
+  3. `[SERIAL]` The three acceptance checks (`gofmt -s -l .` first, rule 17), bidi and local-path scans with planted positive controls, scoped commits.
+- **Verification:**
+  ```bash
+  gofmt -s -l . && go vet ./... && go test -count=1 -coverprofile=coverage.out ./... && go tool cover -func=coverage.out | tail -n 1 && rm -f coverage.out && go build -trimpath -o mintrun ./cmd/mintrun && ./mintrun plugin list
+  ```

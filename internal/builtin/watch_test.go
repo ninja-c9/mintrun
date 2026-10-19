@@ -290,6 +290,7 @@ func TestWatchServer(t *testing.T) {
 				NoNetwork:   true,
 				Purpose:     "list pull requests",
 				Client:      "Claude Code",
+				Jev:         &core.JevVerdict{Risk: "high", Labels: []string{"exfil"}},
 			})
 			if err != nil {
 				errCh <- err
@@ -308,8 +309,8 @@ func TestWatchServer(t *testing.T) {
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
-		if pending.Task != taskID || !strings.Contains(pending.Text, "Sandbox: on\nNetwork: blocked\nHints: none\nProvider: \"github\"\n") {
-			t.Fatalf("pending approval not found or missing Sandbox/Network/Hints header: %+v", pending)
+		if pending.Task != taskID || !strings.Contains(pending.Text, "Sandbox: on\nNetwork: blocked\nHints: none\nRisk: high (exfil)\n") || pending.Request.Jev == nil || pending.Request.Jev.Risk != "high" {
+			t.Fatalf("pending approval not found or missing Sandbox/Network/Risk header: %+v", pending)
 		}
 
 		r := postWatch("/api/decide", `{"task":"`+taskID+`","decision":"`+decision+`"}`, true)

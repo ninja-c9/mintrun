@@ -158,6 +158,26 @@ func TestAppApproval(t *testing.T) {
 		})
 	}
 
+	// The semantic screen's verdict goes as the app shows it (risk, labels, severity, model), never
+	// its route, reason, timing, or error.
+	t.Run("jev", func(t *testing.T) {
+		rt, ln := appListen(t)
+		three := 3
+		screened := req
+		screened.Jev = &core.JevVerdict{Risk: "high", Labels: []string{"exfil"}, Severity: &three, Model: "jev-1.13.0", Route: "ask", Reason: "r", Ms: 9, Error: "e"}
+		done := ask(context.Background(), rt, screened)
+		conn, r := appAccept(t, ln)
+		want := strings.Replace(wantSent, `"ttl_seconds":300}}`, `"ttl_seconds":300,"jev":{"risk":"high","labels":["exfil"],"severity":3,"model":"jev-1.13.0"}}}`, 1)
+		if sent, err := r.ReadString('\n'); sent != want {
+			t.Fatalf("request line %q (%v), want %q", sent, err, want)
+		}
+		_, _ = io.WriteString(conn, allow+"\n")
+		conn.Close()
+		if got := answer(t, done); !got.ok || got.err != nil {
+			t.Fatalf("got (%v, %v), want (true, nil)", got.ok, got.err)
+		}
+	})
+
 	// When ctx ends (another channel answered, or ApprovalTimeout passed), the connection closes,
 	// which tells the app to drop the card.
 	for _, tc := range []struct {

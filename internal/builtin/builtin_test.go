@@ -835,6 +835,7 @@ func TestSecretNotFoundHint(t *testing.T) {
 		" AWS ":             `secret " AWS " not found in vault (run mintrun init aws)`,
 		TelegramApprovalKey: `secret "approval-telegram" not found in vault (run mintrun init telegram)`,
 		SlackApprovalKey:    `secret "approval-slack" not found in vault (run mintrun init slack)`,
+		JevKey:              `secret "jev" not found in vault (run mintrun init jev)`,
 		"vercel":            `secret "vercel" not found in vault (run mintrun secret set vercel)`,
 	} {
 		if _, err := kv.GetSecret(ctx, key); err == nil || err.Error() != want || !errors.Is(err, ErrSecretNotFound) {
@@ -1676,6 +1677,49 @@ func TestMCPBridgeGovernanceTools(t *testing.T) {
 	}
 	if got := text(r[1]); got != "[]" {
 		t.Fatalf("expected an empty audit list, got %q", got)
+	}
+
+	// The semantic screen's verdict: mintrun_policy_check reports it and logs nothing, and
+	// mintrun_audit shows its risk, labels, severity, and model (closed sets), never its error,
+	// which can quote TypeSafe's reply.
+	jhome, two := t.TempDir(), 2
+	jrt := core.NewRuntime(jhome, "keychain", reg)
+	jrt.ApprovalFunc = rt.ApprovalFunc
+	jrt.Screen = func(core.ExecRequest, core.PolicyRule) *core.JevVerdict {
+		return &core.JevVerdict{Risk: "high", Labels: []string{"exfil"}, Severity: &two, Model: "jev-1.13.0", Route: "deny", Reason: "policy denied: semantic screen flagged exfil", Ms: 9, Error: "jev_error_canary_135"}
+	}
+	never = append(never, "jev_error_canary_135")
+	screened := call("mintrun_policy_check", `{"provider":"cloudflare","scope":"ok.com","permissions":["dns:read"],"command":["true"]}`)
+	if got := text(serve(jrt, screened)[0]); got != `{
+  "allowed": false,
+  "reason": "policy denied: semantic screen flagged exfil",
+  "blocked_by": "jev",
+  "approval_required": false,
+  "ttl_seconds": 0,
+  "clean_env": false,
+  "sandbox": false,
+  "no_network": false,
+  "jev": {
+    "risk": "high",
+    "labels": [
+      "exfil"
+    ],
+    "severity": 2,
+    "model": "jev-1.13.0"
+  }
+}` {
+		t.Fatalf("screened policy_check reply:\n%s", got)
+	}
+	if _, err := os.Stat(filepath.Join(jhome, "audit.jsonl")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("policy_check logged an entry: %v", err)
+	}
+	r = serve(jrt, strings.Replace(screened, "mintrun_policy_check", "mintrun_exec", 1), call("mintrun_audit", `{}`))
+	if raw, _ := os.ReadFile(filepath.Join(jhome, "audit.jsonl")); !strings.Contains(string(raw), "jev_error_canary_135") {
+		t.Fatalf("expected the operator log to keep the screen's error:\n%s", raw)
+	}
+	if es := audit(r[1]); len(es) != 1 || es[0].BlockedBy != "jev" || es[0].JevRisk != "high" || !slices.Equal(es[0].JevLabels, []string{"exfil"}) ||
+		es[0].JevSeverity == nil || *es[0].JevSeverity != 2 || es[0].JevModel != "jev-1.13.0" || es[0].JevMs != 9 || es[0].JevError != core.RedactedPlaceholder {
+		t.Fatalf("audit view of the screened exec: %+v", es)
 	}
 }
 

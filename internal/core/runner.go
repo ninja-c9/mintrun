@@ -45,6 +45,9 @@ type ExecRequest struct {
 	Via       string `json:"-"` // "cli", "mcp", or "relay"
 	Task      string `json:"-"` // ExecBlind's per-call handle (rand.Text): opaque, never a secret
 	FromAgent bool   `json:"-"` // Set by the MCP bridge after decoding: CheckPolicy then refuses any Vault or TimeoutSec, neither of which an agent picks
+	// The semantic screen's verdict, cached by checkPolicy so the second decide after an approval
+	// reuses it: one screen call per request.
+	Jev *JevVerdict `json:"-"`
 }
 
 // ExecResult contains the scrubbed output of a blind command execution.
@@ -98,6 +101,14 @@ type AuditEntry struct {
 	Sandbox   bool   `json:"sandbox,omitempty"`
 	NoNetwork bool   `json:"no_network,omitempty"`
 	Error     string `json:"error,omitempty"`
+	// The semantic screen's verdict (Runtime.Screen), on every entry the screen ran for: jev_risk
+	// is unknown when it did not answer, and jev_error then says why, scrubbed of its key.
+	JevRisk     string   `json:"jev_risk,omitempty"`
+	JevLabels   []string `json:"jev_labels,omitempty"`
+	JevSeverity *int     `json:"jev_severity,omitempty"`
+	JevModel    string   `json:"jev_model,omitempty"`
+	JevMs       int64    `json:"jev_ms,omitempty"`
+	JevError    string   `json:"jev_error,omitempty"`
 }
 
 // PolicyRule controls which scopes, permissions, and commands are permitted for a provider.
@@ -113,7 +124,32 @@ type PolicyRule struct {
 	AllowedInstallations []string `json:"allowed_installations,omitempty"` // Exact params.installation_id values; non-empty requires a listed one
 	Sandbox              bool     `json:"sandbox,omitempty"`               // Run every exec of this provider inside the OS sandbox (macOS and Linux; denied elsewhere)
 	NoNetwork            bool     `json:"no_network,omitempty"`            // Block network egress for every exec of this provider (implies sandbox)
+	// Semantic screen thresholds for this provider; settings.json turns the screen on.
+	Jev *JevThresholds `json:"jev,omitempty"`
 }
+
+// JevThresholds tune the semantic screen for one provider; 0 means the default.
+type JevThresholds struct {
+	AskAbove     float64 `json:"ask_above,omitempty"`     // Any question at or above this asks a human (0.35)
+	DenyAbove    float64 `json:"deny_above,omitempty"`    // exfil and its paraphrase both at or above this deny in mode deny (0.85)
+	SeverityDeny int     `json:"severity_deny,omitempty"` // Severity at or above this denies in mode deny (3)
+}
+
+// JevVerdict is the semantic screen's verdict on one request. Risk, Labels, Severity, and Model
+// are what an approver, the app, mintrun_policy_check, and the audit log show.
+type JevVerdict struct {
+	Risk     string   `json:"risk"`               // low, medium, high, or unknown (no answer)
+	Labels   []string `json:"labels,omitempty"`   // From JevLabels only
+	Severity *int     `json:"severity,omitempty"` // 0 to 3
+	Model    string   `json:"model,omitempty"`
+	Route    string   `json:"-"` // deny, ask, or "" (pass)
+	Reason   string   `json:"-"` // The denial reason when Route is deny
+	Ms       int64    `json:"-"`
+	Error    string   `json:"-"` // Why there is no answer, scrubbed of the key
+}
+
+// JevLabels is the closed set of labels the semantic screen can raise, in the order it lists them.
+var JevLabels = []string{"exfil", "destructive", "mismatch", "injected", "vague", "scope_creep"}
 
 func matchPattern(pattern, value string) bool {
 	p := strings.ToLower(strings.TrimSpace(pattern))
@@ -171,6 +207,9 @@ type Runtime struct {
 	Track       func(ctx context.Context, started AuditEntry) <-chan struct{}
 	Relay       Relay
 	RelayServer bool
+	// Screen, if set, is the semantic screen decide runs once per request after every
+	// deterministic rule allowed it. Its verdict can ask a human or deny, never allow.
+	Screen func(req ExecRequest, rule PolicyRule) *JevVerdict
 }
 
 // errStopped is the cause a Track stop cancels a run with.
@@ -227,12 +266,14 @@ func (rt *Runtime) LoadPolicies() (map[string]PolicyRule, error) {
 type PolicyDecision struct {
 	Allowed          bool   `json:"allowed"`
 	Reason           string `json:"reason,omitempty"`     // Denial reason: the exact error ExecBlind returns
-	BlockedBy        string `json:"blocked_by,omitempty"` // Which check denied: invalid_request, paused, purpose, policy_file, env_dump, static, scope, permission, installation, command, sandbox
+	BlockedBy        string `json:"blocked_by,omitempty"` // Which check denied: invalid_request, paused, purpose, policy_file, env_dump, static, scope, permission, installation, command, sandbox, jev
 	ApprovalRequired bool   `json:"approval_required"`    // ExecBlind would ask a human (approve, require_approval, MINTRUN_APPROVE=1)
 	TTLSeconds       int    `json:"ttl_seconds"`          // Lease TTL requested from the provider after max_ttl_seconds and the 600s default
 	CleanEnv         bool   `json:"clean_env"`            // Child gets the clean env (request, policy clean_env, or allowed_env)
 	Sandbox          bool   `json:"sandbox"`              // Child runs inside the OS sandbox (request, policy sandbox, or no_network)
 	NoNetwork        bool   `json:"no_network"`           // Child runs with network egress blocked (request or policy no_network)
+	// The semantic screen's verdict, when it ran.
+	Jev *JevVerdict `json:"jev,omitempty"`
 }
 
 // CheckPolicy runs every static rule of the exec gate: request validation, the fail-closed
@@ -383,14 +424,30 @@ func (rt *Runtime) decide(req ExecRequest) (PolicyDecision, []string, []string) 
 		d.CleanEnv = d.CleanEnv || rd.CleanEnv
 		d.NoNetwork = d.NoNetwork || rd.NoNetwork
 		d.Sandbox = d.Sandbox || rd.Sandbox || d.NoNetwork
+		d.Jev = rd.Jev // the relay server screens; a client never does, so one request gets one verdict
 	}
-	if !d.Sandbox || rt.RelayServer {
-		return d, rule.AllowedEnv, nil
+	var sandbox []string
+	if d.Sandbox && !rt.RelayServer {
+		// Fail closed: a sandbox that is on but cannot be set up denies the request.
+		if sandbox, err = sandboxArgv(rt.HomeDir, d.NoNetwork); err != nil {
+			return deny("sandbox", "policy denied: sandbox is on, but %v", err)
+		}
 	}
-	// Fail closed: a sandbox that is on but cannot be set up denies the request.
-	sandbox, err := sandboxArgv(rt.HomeDir, d.NoNetwork)
-	if err != nil {
-		return deny("sandbox", "policy denied: sandbox is on, but %v", err)
+	// The semantic screen runs last, so a request a deterministic rule denied costs no call and
+	// keeps its reason, and once: the second decide reuses the verdict checkPolicy cached. It can
+	// only ask a human or deny.
+	if rt.Screen != nil && rt.Relay == nil {
+		if d.Jev = req.Jev; d.Jev == nil {
+			req.Sandbox, req.NoNetwork = d.Sandbox, d.NoNetwork
+			d.Jev = rt.Screen(req, rule)
+		}
+		switch {
+		case d.Jev == nil:
+		case d.Jev.Route == "deny":
+			return PolicyDecision{Reason: d.Jev.Reason, BlockedBy: "jev", Jev: d.Jev}, nil, nil
+		case d.Jev.Route == "ask":
+			d.ApprovalRequired = true
+		}
 	}
 	return d, rule.AllowedEnv, sandbox
 }
@@ -673,6 +730,8 @@ func realDir(dir string) (string, error) {
 // records whether the sandbox and no_network are on and why it denied.
 func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest, e *AuditEntry) ([]string, []string, error) {
 	d, env, sandbox := rt.decide(*req)
+	req.Jev = d.Jev // the second decide reuses it, and the approver shows it
+	e.setJev(d.Jev)
 	if d.Allowed && d.ApprovalRequired && rt.Relay == nil {
 		req.TTLSeconds, req.CleanEnv, req.Sandbox, req.NoNetwork = d.TTLSeconds, d.CleanEnv, d.Sandbox, d.NoNetwork
 		e.Sandbox, e.NoNetwork = d.Sandbox, d.NoNetwork
@@ -693,6 +752,13 @@ func (rt *Runtime) checkPolicy(ctx context.Context, req *ExecRequest, e *AuditEn
 	req.TTLSeconds, req.CleanEnv, req.Sandbox, req.NoNetwork = d.TTLSeconds, d.CleanEnv, d.Sandbox, d.NoNetwork
 	e.Sandbox, e.NoNetwork = d.Sandbox, d.NoNetwork
 	return env, sandbox, nil
+}
+
+// setJev records the semantic screen's verdict, when it ran.
+func (e *AuditEntry) setJev(v *JevVerdict) {
+	if v != nil {
+		e.JevRisk, e.JevLabels, e.JevSeverity, e.JevModel, e.JevMs, e.JevError = v.Risk, v.Labels, v.Severity, v.Model, v.Ms, v.Error
+	}
 }
 
 // approve asks a human through ApprovalFunc. Only an allow returns nil; e records the outcome of
@@ -798,8 +864,8 @@ func ApprovalText(header string, req ExecRequest, limit int) string {
 	if h := approvalHints(req); len(h) > 0 {
 		hints = strings.Join(h, ", ")
 	}
-	text := fmt.Sprintf("%s\n\nSandbox: %s\nNetwork: %s%s\nHints: %s\nProvider: %q\nVault: %s\nScope: %q\nPermissions: %s\nParams: %s\nCommand: %s\nWorking directory: %s",
-		header, sandbox, network, device, hints, req.Provider, orUnset(req.Vault, "(not set: the default vault)"), req.Scope, quote(req.Permissions),
+	text := fmt.Sprintf("%s\n\nSandbox: %s\nNetwork: %s%s\nHints: %s\nRisk: %s\nProvider: %q\nVault: %s\nScope: %q\nPermissions: %s\nParams: %s\nCommand: %s\nWorking directory: %s",
+		header, sandbox, network, device, hints, jevRisk(req.Jev), req.Provider, orUnset(req.Vault, "(not set: the default vault)"), req.Scope, quote(req.Permissions),
 		strings.Join(params, " "), quote(req.Command), orUnset(req.WorkingDir, "(not set: mintrun's own)"))
 	if req.Purpose != "" {
 		text += "\nPurpose: " + strconv.Quote(req.Purpose)
@@ -884,6 +950,41 @@ func externalURL(provider, arg string) bool {
 		}
 	}
 	return false
+}
+
+// jevRisk is the Risk line's value, unquoted and from a closed vocabulary: not screened, or the
+// verdict's risk (low, medium, high, unknown) with its labels, severity, and model. Anything else
+// a verdict holds is dropped, so a forged verdict cannot write free text there.
+func jevRisk(v *JevVerdict) string {
+	if v == nil {
+		return "not screened"
+	}
+	risk, parts := "unknown", []string{}
+	if slices.Contains([]string{"low", "medium", "high"}, v.Risk) {
+		risk = v.Risk
+	} else {
+		parts = append(parts, "no answer")
+	}
+	if labels := slices.DeleteFunc(slices.Clone(v.Labels), func(l string) bool { return !slices.Contains(JevLabels, l) }); len(labels) > 0 {
+		parts = append(parts, strings.Join(labels, ", "))
+	}
+	if v.Severity != nil && *v.Severity >= 0 && *v.Severity <= 3 {
+		parts = append(parts, fmt.Sprintf("severity %d/3", *v.Severity))
+	}
+	if IsJevModel(v.Model) {
+		parts = append(parts, v.Model)
+	}
+	if len(parts) == 0 {
+		return risk
+	}
+	return risk + " (" + strings.Join(parts, "; ") + ")"
+}
+
+// IsJevModel reports whether m looks like a Jev model ID ("jev-1.13.0", or an alias such as
+// "jev-latest"): "jev-" and up to 36 lowercase letters, digits, dots, and dashes.
+func IsJevModel(m string) bool {
+	rest, ok := strings.CutPrefix(m, "jev-")
+	return ok && rest != "" && len(rest) <= 36 && strings.Trim(rest, "abcdefghijklmnopqrstuvwxyz0123456789.-") == ""
 }
 
 // FirstApproval asks every approver at once. The first answer, allow or deny, wins and cancels

@@ -64,6 +64,7 @@ func TestTelegramApproval(t *testing.T) {
 		MintRequest: core.MintRequest{Provider: "github", Scope: "owner/repo", Permissions: []string{"contents:read"}, Params: map[string]string{"installation_id": "7"}},
 		Vault:       "agent-chosen", // never where the approval config is read from
 		Command:     []string{"gh", "pr", "list", "x\n✅ Allowed"},
+		Jev:         &core.JevVerdict{Risk: "medium", Labels: []string{"mismatch", "scope_creep"}, Model: "jev-1.13.0"},
 	}
 	ctx := context.Background()
 
@@ -215,7 +216,7 @@ func TestTelegramApproval(t *testing.T) {
 			}
 			mu.Lock()
 			defer mu.Unlock()
-			want := "🔐 mintrun approval request\n\nSandbox: off\nNetwork: open\nHints: none\nProvider: \"github\"\nVault: \"agent-chosen\"\nScope: \"owner/repo\"\n" +
+			want := "🔐 mintrun approval request\n\nSandbox: off\nNetwork: open\nHints: none\nRisk: medium (mismatch, scope_creep; jev-1.13.0)\nProvider: \"github\"\nVault: \"agent-chosen\"\nScope: \"owner/repo\"\n" +
 				"Permissions: \"contents:read\"\nParams: \"installation_id\"=\"7\"\nCommand: \"gh\" \"pr\" \"list\" \"x\\n✅ Allowed\"\n" +
 				"Working directory: (not set: mintrun's own)"
 			if sent != want {

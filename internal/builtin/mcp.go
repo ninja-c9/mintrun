@@ -311,7 +311,8 @@ func (m *MCPBridge) handleToolCall(ctx context.Context, rt *core.Runtime, id jso
 // secret a human typed into argv is one the runner never holds, and a policy that allows `*`, or
 // has no rule for the provider, lets any scope and permission through. So that one agent cannot
 // pass free text to another, every entry's scope, permissions, and purpose are blanked, its error
-// becomes [MINTRUN:REDACTED] (outcome and blocked_by keep the verdict), its arguments become
+// and jev_error become [MINTRUN:REDACTED] (outcome, blocked_by, and jev_risk keep the verdict; a
+// jev_error can quote TypeSafe's reply, which can echo the request), its arguments become
 // [MINTRUN:REDACTED], and its provider and argv[0]'s base name are cut to a shortLabel, like the
 // client. The on-disk log keeps all of it for the operator.
 func readAudit(home, provider string, failedOnly bool, limit int) ([]core.AuditEntry, error) {
@@ -338,6 +339,9 @@ func readAudit(home, provider string, failedOnly bool, limit int) ([]core.AuditE
 		e.Scope, e.Permissions, e.Purpose = "", nil, ""
 		if e.Error != "" {
 			e.Error = core.RedactedPlaceholder
+		}
+		if e.JevError != "" {
+			e.JevError = core.RedactedPlaceholder
 		}
 		entries = append(entries, e)
 	})

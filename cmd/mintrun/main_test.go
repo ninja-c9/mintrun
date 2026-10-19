@@ -649,6 +649,10 @@ func TestBootRuntimeSettings(t *testing.T) {
 			{`{"vault":1}`, malformed + "json: cannot unmarshal number into Go struct field settings.vault of type string)"},
 			{`{"approval_timeout_seconds":1.5}`, malformed + "json: cannot unmarshal number 1.5 into Go struct field settings.approval_timeout_seconds of type int)"},
 			{`{"approval_timeout_seconds":"60"}`, malformed + "json: cannot unmarshal string into Go struct field settings.approval_timeout_seconds of type int)"},
+			{`{"jev":{"mode":"on"}}`, `settings.json: jev.mode must be "off", "escalate" or "deny"`},
+			{`{"jev":{"mode":"escalate","on_error":"allow"}}`, `settings.json: jev.on_error must be "escalate", "deny" or "pass"`},
+			{`{"jev":{"mode":"off","model":"gpt-4"}}`, `settings.json: jev.model must look like "jev-1.13.0"`},
+			{`{"jev":"escalate"}`, malformed + "json: cannot unmarshal string into Go struct field settings.jev of type builtin.JevConfig)"},
 			{"[]", malformed + "json: cannot unmarshal array into Go value of type main.settings)"},
 			{"{", malformed + "unexpected end of JSON input)"},
 		} {
@@ -684,6 +688,36 @@ func TestBootRuntimeSettings(t *testing.T) {
 				t.Fatal(err)
 			}
 			boot("mode 000", "settings.json cannot be read (permission denied)")
+		}
+	})
+
+	// jev turns the semantic screen on; off, empty, or no object leaves it out, so no request calls it.
+	t.Run("jev", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("MINTRUN_HOME", home)
+		p := filepath.Join(home, "settings.json")
+		for _, c := range []struct {
+			settings string
+			on       bool
+		}{
+			{"-", false},
+			{`{"jev":null}`, false},
+			{`{"jev":{}}`, false},
+			{`{"jev":{"mode":"off","model":"jev-1.13.0","on_error":"deny"}}`, false},
+			{`{"jev":{"mode":"escalate"}}`, true},
+			{`{"jev":{"mode":"deny","model":"jev-latest","on_error":"pass","threshold":1}}`, true},
+		} {
+			_ = os.Remove(p)
+			if c.settings != "-" {
+				writeFile(t, p, c.settings)
+			}
+			rt, err := bootRuntime()
+			if err != nil {
+				t.Fatalf("%s: %v", c.settings, err)
+			}
+			if (rt.Screen != nil) != c.on {
+				t.Errorf("%s: screen on %v, want %v", c.settings, rt.Screen != nil, c.on)
+			}
 		}
 	})
 

@@ -83,6 +83,8 @@ func defaultHomeDir() string {
 type settings struct {
 	Vault           *string `json:"vault"`
 	ApprovalTimeout *int    `json:"approval_timeout_seconds"`
+	// The semantic screen; missing, null, or mode off means off.
+	Jev *builtin.JevConfig `json:"jev"`
 }
 
 // loadSettings reads <home>/settings.json. Only a missing file means no settings (rule 36), and
@@ -111,8 +113,21 @@ func loadSettings(home string) (settings, error) {
 	if t := s.ApprovalTimeout; t != nil && (*t < 1 || *t > 600) {
 		return s, errors.New("settings.json: approval_timeout_seconds must be 1 to 600")
 	}
+	if j := s.Jev; j != nil {
+		switch {
+		case !slices.Contains([]string{"", "off", "escalate", "deny"}, j.Mode):
+			return s, errors.New(`settings.json: jev.mode must be "off", "escalate" or "deny"`)
+		case !slices.Contains([]string{"", "escalate", "deny", "pass"}, j.OnError):
+			return s, errors.New(`settings.json: jev.on_error must be "escalate", "deny" or "pass"`)
+		case j.Model != "" && !core.IsJevModel(j.Model):
+			return s, errors.New(`settings.json: jev.model must look like "jev-1.13.0"`)
+		}
+	}
 	return s, nil
 }
+
+// booted is the settings.json bootRuntime read, so doctor reports what this process runs with.
+var booted settings
 
 // bootRuntime reads settings.json once, so a change applies from the next mintrun process on (a
 // running `mintrun mcp` keeps what it read).
@@ -122,6 +137,7 @@ func bootRuntime() (*core.Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	booted = s
 	reg := core.NewRegistry()
 	kv := builtin.NewKeychainVault(home)
 	vault := os.Getenv("MINTRUN_VAULT")
@@ -151,6 +167,9 @@ func bootRuntime() (*core.Runtime, error) {
 	rt.Track = builtin.AppTrack(rt)
 	if s.ApprovalTimeout != nil {
 		rt.ApprovalTimeout = time.Duration(*s.ApprovalTimeout) * time.Second
+	}
+	if s.Jev != nil {
+		rt.Screen = builtin.JevScreen(rt, *s.Jev)
 	}
 	if err := core.LoadExternalPlugins(rt.PluginsDir(), reg); err != nil {
 		return nil, err

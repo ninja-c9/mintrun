@@ -22,9 +22,10 @@ const (
 
 // appRequest is the request the app shows. Sandbox and NoNetwork are mintrun's verdict (checkPolicy
 // sets req.Sandbox and req.NoNetwork from it before asking), sent when false too, so the app can
-// tell "off" / "open" from an older mintrun that sends no key. Every other field but via and
-// ttl_seconds comes from the agent, so the app quotes each one as core.ApprovalText does (rule 4)
-// and says when it shortens one.
+// tell "off" / "open" from an older mintrun that sends no key. Jev is the semantic screen's verdict
+// (risk, labels, severity, model), left out when the request was not screened. Every other field
+// but via and ttl_seconds comes from the agent, so the app quotes each one as core.ApprovalText
+// does (rule 4) and says when it shortens one.
 type appRequest struct {
 	Sandbox     bool              `json:"sandbox"`
 	NoNetwork   bool              `json:"no_network"`
@@ -38,6 +39,7 @@ type appRequest struct {
 	Client      string            `json:"client,omitempty"`
 	Via         string            `json:"via,omitempty"`
 	TTLSeconds  int               `json:"ttl_seconds,omitempty"`
+	Jev         *core.JevVerdict  `json:"jev,omitempty"`
 }
 
 // appDial connects to the app. Where no app listens, or the home is too long for a socket path,
@@ -82,7 +84,7 @@ func AppApproval(rt *core.Runtime, fallback func(context.Context, core.ExecReque
 			Request appRequest `json:"request"`
 		}{1, "approve", req.Task, appRequest{Sandbox: req.Sandbox, NoNetwork: req.NoNetwork, Provider: req.Provider, Scope: req.Scope,
 			Permissions: req.Permissions, Params: req.Params, Command: req.Command, Cwd: req.WorkingDir,
-			Purpose: req.Purpose, Client: req.Client, Via: req.Via, TTLSeconds: req.TTLSeconds}})
+			Purpose: req.Purpose, Client: req.Client, Via: req.Via, TTLSeconds: req.TTLSeconds, Jev: req.Jev}})
 		if _, err := conn.Write(append(line, '\n')); err != nil {
 			return fail("could not send the request")
 		}

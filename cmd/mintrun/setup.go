@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -191,7 +192,9 @@ func cmdDoctor(ctx context.Context, rt *core.Runtime, args []string) {
 		fmt.Printf("%-5s %s\n", status, fmt.Sprintf(format, a...))
 	}
 	self := doctorBinary(report)
-	doctorPolicy(rt, doctorVault(ctx, rt, report), report)
+	stored := doctorVault(ctx, rt, report)
+	doctorScreen(booted.Jev, report)
+	doctorPolicy(rt, stored, report)
 	doctorShims(rt, self, os.Getenv("PATH"), report)
 	doctorIDEs(self, report)
 	if failed {
@@ -221,8 +224,8 @@ func doctorBinary(report reportFunc) string {
 	return self
 }
 
-// doctorVault reports the default vault, which providers have a master secret in it, and the
-// approval channels. It returns the providers that have one.
+// doctorVault reports the default vault, which providers have a master secret in it, the
+// approval channels, and the semantic screen's key. It returns the providers that have one.
 func doctorVault(ctx context.Context, rt *core.Runtime, report reportFunc) map[string]bool {
 	stored := map[string]bool{}
 	v, err := rt.Registry.Vault(rt.DefaultVault)
@@ -269,11 +272,12 @@ func doctorVault(ctx context.Context, rt *core.Runtime, report reportFunc) map[s
 		report("ok", "approval: macOS dialog")
 	}
 	for _, c := range []struct {
-		key   string
-		parse func(string) error
+		what, key string
+		parse     func(string) error
 	}{
-		{builtin.TelegramApprovalKey, func(s string) error { _, _, err := builtin.ParseTelegramConfig(s); return err }},
-		{builtin.SlackApprovalKey, func(s string) error { _, _, err := builtin.ParseSlackConfig(s); return err }},
+		{"approval", builtin.TelegramApprovalKey, func(s string) error { _, _, err := builtin.ParseTelegramConfig(s); return err }},
+		{"approval", builtin.SlackApprovalKey, func(s string) error { _, _, err := builtin.ParseSlackConfig(s); return err }},
+		{"screen", builtin.JevKey, func(string) error { return nil }},
 	} {
 		cfg, err := kv.GetSecret(ctx, c.key)
 		if err == nil {
@@ -281,14 +285,29 @@ func doctorVault(ctx context.Context, rt *core.Runtime, report reportFunc) map[s
 		}
 		switch {
 		case err == nil:
-			report("ok", "approval: %s set", c.key)
+			report("ok", "%s: %s set", c.what, c.key)
 		case errors.Is(err, builtin.ErrSecretNotFound):
-			report("-", "approval: %s not set", c.key)
+			report("-", "%s: %s not set", c.what, c.key)
 		default:
-			report("FAIL", "approval: %v", err)
+			report("FAIL", "%s: %v", c.what, err)
 		}
 	}
 	return stored
+}
+
+// doctorScreen reports the semantic screen settings.json turned on, and warns on a model alias:
+// TypeSafe moves one without notice, so the screen's answers can change overnight.
+func doctorScreen(j *builtin.JevConfig, report reportFunc) {
+	if j == nil || j.Mode == "" || j.Mode == "off" {
+		report("-", "screen: off")
+		return
+	}
+	model, onError := cmp.Or(j.Model, builtin.JevModel), cmp.Or(j.OnError, "escalate")
+	if !jevVersionRe.MatchString(model) {
+		report("warn", "screen: %s with %s, an alias TypeSafe moves without notice: name a version such as %s", j.Mode, model, builtin.JevModel)
+		return
+	}
+	report("ok", "screen: %s with %s, on_error %s", j.Mode, model, onError)
 }
 
 // doctorPolicy reads policy.json as exec does, then strictly: exec ignores a field it does not
@@ -471,6 +490,7 @@ var initSteps = []struct {
 	{"cloudflare", "Cloudflare (an API token)", (*wizard).cloudflare},
 	{"telegram", "approval through Telegram", (*wizard).telegram},
 	{"slack", "approval through Slack", (*wizard).slack},
+	{"jev", "the semantic screen (a TypeSafe AI API key)", (*wizard).jev},
 	{"policy", "a policy for GitHub", (*wizard).policy},
 	{"mcp", "mintrun in your IDEs", (*wizard).mcp},
 }
@@ -512,6 +532,8 @@ var (
 	awsSecretRe    = regexp.MustCompile(`^[A-Za-z0-9/+]{40}$`)
 	awsTokenRe     = regexp.MustCompile(`^[A-Za-z0-9/+=]+$`)
 	cfTokenRe      = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+	jevKeyRe       = regexp.MustCompile(`^[!-~]+$`)
+	jevVersionRe   = regexp.MustCompile(`^jev-[0-9]+(\.[0-9]+)*$`)
 	githubRemoteRe = regexp.MustCompile(`github\.com[:/]([A-Za-z0-9-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$`)
 	githubScopeRe  = regexp.MustCompile(`^[A-Za-z0-9-]+/([A-Za-z0-9._-]+|\*)$`)
 )
@@ -640,6 +662,21 @@ func (w *wizard) slack() {
 		}
 		fatal("removed %s: that member ID is someone else's; run mintrun init slack again", builtin.SlackApprovalKey)
 	}
+}
+
+// jev stores the TypeSafe API key the semantic screen sends. It sends no test request, since every
+// call is billed.
+func (w *wizard) jev() {
+	if !w.begin(builtin.JevKey) {
+		return
+	}
+	fmt.Println("The semantic screen sends each request's fields (provider, scope, command, purpose), never a stored secret, to TypeSafe AI's Jev, which can ask you to approve a request. It stays off until settings.json turns it on.")
+	key := w.askHidden("TypeSafe API key")
+	if !jevKeyRe.MatchString(key) {
+		fatal("a TypeSafe API key is printable ASCII with no spaces")
+	}
+	w.store(builtin.JevKey, key)
+	fmt.Println(`Turn the screen on in settings.json: "jev": {"mode": "escalate"}`)
 }
 
 // testApproval sends one request through the channel just stored, the path exec takes, so a wrong

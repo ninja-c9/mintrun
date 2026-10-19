@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -294,6 +295,13 @@ func TestRelayEndToEnd(t *testing.T) {
 	}
 
 	serverRT := core.NewRuntime(serverHome, "keychain", serverReg)
+	// The server screens what it decides, with its own key; the client never screens, even with a
+	// Screen set, and shows the server's verdict.
+	var serverScreens, clientScreens atomic.Int32
+	serverRT.Screen = func(core.ExecRequest, core.PolicyRule) *core.JevVerdict {
+		serverScreens.Add(1)
+		return &core.JevVerdict{Risk: "low", Model: "jev-1.13.0"}
+	}
 	relaySrv := NewRelayServer(serverRT)
 	defer relaySrv.Close()
 
@@ -335,6 +343,10 @@ func TestRelayEndToEnd(t *testing.T) {
 	// Client runtime has NO vault secret and NO local policy: everything comes from the relay.
 	clientRT := core.NewRuntime(clientHome, "keychain", core.NewRegistry())
 	clientRT.Relay = aliceClient
+	clientRT.Screen = func(core.ExecRequest, core.PolicyRule) *core.JevVerdict {
+		clientScreens.Add(1)
+		return &core.JevVerdict{Risk: "high", Route: "deny", Reason: "policy denied: the client screened"}
+	}
 
 	// 1. SPKI pin mismatch must fail closed.
 	wrongPinClient, err := NewRelayClient(ts.URL+"#sha256="+strings.Repeat("00", 32), func(context.Context) (string, error) { return aliceToken, nil })
@@ -432,6 +444,7 @@ func TestRelayEndToEnd(t *testing.T) {
 
 	// 5. Full ExecBlind through relay: mints on server, injects CF_API_TOKEN on client, strips MINTRUN_RELAY_TOKEN, scrubs output, and revokes on server.
 	t.Setenv("MINTRUN_RELAY_TOKEN", aliceToken)
+	screensBefore := serverScreens.Load()
 	res, err := clientRT.ExecBlind(context.Background(), core.ExecRequest{
 		MintRequest: core.MintRequest{Provider: "cf-relay", Scope: "example.com", Permissions: []string{"dns:write"}},
 		Command:     []string{"sh", "-c", `printf "tok=%s relay=%s id=%s" "$CF_API_TOKEN" "$MINTRUN_RELAY_TOKEN" "lease-cf-12345"`},
@@ -462,6 +475,16 @@ func TestRelayEndToEnd(t *testing.T) {
 	}
 	if doneEntry.Outcome != "done" || doneEntry.Device != "laptop-alice" || !doneEntry.Revoked || doneEntry.Task != mintedEntry.Task {
 		t.Fatalf("unexpected server done entry: %+v", doneEntry)
+	}
+	// One screen for /v1/check and one for /v1/mint; both server entries and the client's carry it.
+	clientEntry := readAuditLines(t, clientHome)[len(readAuditLines(t, clientHome))-1]
+	for _, e := range []core.AuditEntry{mintedEntry, doneEntry, clientEntry} {
+		if e.JevRisk != "low" || e.JevModel != "jev-1.13.0" || e.JevError != "" {
+			t.Fatalf("entry %q: jev_risk %q, jev_model %q, jev_error %q", e.Outcome, e.JevRisk, e.JevModel, e.JevError)
+		}
+	}
+	if n := serverScreens.Load() - screensBefore; n != 2 {
+		t.Fatalf("server screened %d times for one relay exec, want 2", n)
 	}
 
 	// 6. Cross-device revoke isolation: bob cannot revoke alice's lease, and invalid outcome is rejected.
@@ -523,6 +546,7 @@ func TestRelayEndToEnd(t *testing.T) {
 		seenPrompt = core.ApprovalText("mintrun relay approval", req, 3500)
 		return allowApproval, nil
 	}
+	screensBefore = serverScreens.Load()
 	res, err = clientRT.ExecBlind(context.Background(), core.ExecRequest{
 		MintRequest: core.MintRequest{Provider: "cf-relay", Scope: "example.com", Permissions: []string{"dns:write"}},
 		Command:     []string{"true", strings.Repeat("x", 4000)},
@@ -533,8 +557,12 @@ func TestRelayEndToEnd(t *testing.T) {
 	if err != nil || res.ExitCode != 0 {
 		t.Fatalf("approved ExecBlind failed: res=%+v err=%v", res, err)
 	}
-	if !strings.Contains(seenPrompt, "\nSandbox: off\nNetwork: open\nDevice: \"laptop-alice\"\nHints: none\nProvider: \"cf-relay\"\n") || !strings.Contains(seenPrompt, "TRUNCATED") {
+	if !strings.Contains(seenPrompt, "\nSandbox: off\nNetwork: open\nDevice: \"laptop-alice\"\nHints: none\nRisk: low (jev-1.13.0)\nProvider: \"cf-relay\"\n") || !strings.Contains(seenPrompt, "TRUNCATED") {
 		t.Fatalf("ApprovalText missing quoted Device line right under Network on truncated request:\n%s", seenPrompt)
+	}
+	// The approval reuses the verdict: the second decide after it screens nothing.
+	if n := serverScreens.Load() - screensBefore; n != 2 {
+		t.Fatalf("server screened %d times for one approved relay exec, want 2", n)
 	}
 
 	allowApproval = false
@@ -562,6 +590,9 @@ func TestRelayEndToEnd(t *testing.T) {
 	serverEntries = readAuditLines(t, serverHome)
 	if lastClose := serverEntries[len(serverEntries)-1]; lastClose.Outcome != "unreported" || lastClose.ExitCode != -1 || !lastClose.Revoked {
 		t.Fatalf("expected Close() to record unreported/revoked entry, got: %+v", lastClose)
+	}
+	if n := clientScreens.Load(); n != 0 {
+		t.Fatalf("the relay client screened %d requests itself, want 0", n)
 	}
 }
 
