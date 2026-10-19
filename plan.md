@@ -987,13 +987,13 @@ New tests stay hermetic (rule 22): a plain `go test ./...` makes zero real `sand
 
 | # | Step | Mark | Status |
 | :-- | :--- | :--- | :--- |
-| 1 | **AJ-1** — core types and gate hook (`JevVerdict`, `JevThresholds`, `Runtime.Screen`, `decide`, `checkPolicy`, `ShortHomes`) | `[SERIAL]` | ⏳ |
-| 2 | **AJ-2** — `internal/builtin/jev.go` client, questions, routing | `[SERIAL]` after AJ-1 | ⏳ |
-| 3 | **AJ-3** — surfaces: `Risk:` line, app.sock `jev`, audit `jev_*`, `PolicyDecision.jev`, `mintrun_audit` | `[SERIAL]` after AJ-1 | ⏳ |
-| 4 | **AJ-4** — `settings.json` `jev`, `bootRuntime`, `mintrun init jev`, `setupHint`, `doctor` | `[SERIAL]` after AJ-2 | ⏳ |
-| 5 | **AJ-5** — relay: the server screens with its own key, the client never calls Jev | `[SERIAL]` after AJ-4 | ⏳ |
-| 6 | **AJ-6** — tests, hermetic proof, 17 mutants on a copy | `[SERIAL]` after AJ-5 | ⏳ |
-| 7 | **AJ-7** — README, AGENTS.md (rule 16 amendment, rule 49), checks, scans, commits | `[SERIAL]` last | ⏳ |
+| 1 | **AJ-1** — core types and gate hook (`JevVerdict`, `JevThresholds`, `Runtime.Screen`, `decide`, `checkPolicy`, `ShortHomes`) | `[SERIAL]` | ✅ |
+| 2 | **AJ-2** — `internal/builtin/jev.go` client, questions, routing | `[SERIAL]` after AJ-1 | ✅ |
+| 3 | **AJ-3** — surfaces: `Risk:` line, app.sock `jev`, audit `jev_*`, `PolicyDecision.jev`, `mintrun_audit` | `[SERIAL]` after AJ-1 | ✅ |
+| 4 | **AJ-4** — `settings.json` `jev`, `bootRuntime`, `mintrun init jev`, `setupHint`, `doctor` | `[SERIAL]` after AJ-2 | ✅ |
+| 5 | **AJ-5** — relay: the server screens with its own key, the client never calls Jev | `[SERIAL]` after AJ-4 | ✅ |
+| 6 | **AJ-6** — tests, hermetic proof, 23 mutants on a copy | `[SERIAL]` after AJ-5 | ✅ |
+| 7 | **AJ-7** — README, AGENTS.md (rule 16 amendment, rule 49), checks, scans, commits | `[SERIAL]` last | ✅ |
 
 All steps edit `internal/core/runner.go` or files that build against it, so none runs in parallel.
 
@@ -1058,7 +1058,7 @@ All steps edit `internal/core/runner.go` or files that build against it, so none
 - **Deliverables:**
   1. `[SERIAL]` `TestJevClient`, `TestJevStateNeverCarriesSecrets` (purpose canary as positive control), `TestCheckPolicyMatchesExecBlind/jev`, `TestExecBlindJevOnce`, `TestApprovalTextRisk`, `TestSecretNotFoundHint/jev`, `TestCLIInit/jev`, `TestCLIDoctor` (set, `-`, vault error, alias), `TestBootRuntimeSettings/jev`, `TestRelayEndToEnd` (server stub called, client stub never).
   2. `[SERIAL]` On a `git archive` copy, the default `jevAPI` repointed to a logging server: plain `go test ./...` logs 0 requests; a planted test logs at least 1 (positive control).
-  3. `[SERIAL]` 17 mutants on a copy, each compiled first (`go test -run '^$'`), each failing a test; the count goes in [checks.md](checks.md).
+  3. `[SERIAL]` 23 mutants on a copy, each compiled first (`go test -run '^$'`), each failing a test; the count goes in [checks.md](checks.md).
 - **Verification:**
   ```bash
   go test -count=1 -run 'Jev|CheckPolicyMatchesExecBlind|ApprovalText|OSApproval|AppApproval|GovernanceTools|BootRuntimeSettings' -v ./...
@@ -1069,7 +1069,7 @@ All steps edit `internal/core/runner.go` or files that build against it, so none
 - **Files:** `README.md`, `AGENTS.md`, `plan.md`, `progress.md`, `checks.md`.
 - **Deliverables:**
   1. `[SERIAL]` README "Semantic screen (optional, through TypeSafe AI)": the exact fields sent, no training on user data, ZDR only for enterprise customers, no published retention period, never a replacement for policy, the sandbox, or a human, off by default, cost, the `mintrun_policy_check` oracle warning, `on_error: pass` as the operator's choice, and with a relay only the server sends.
-  2. `[SERIAL]` AGENTS.md rule 16 amendment (the `jev` key is the one secret `CheckPolicy` may read) and rule 49.
+  2. `[SERIAL]` AGENTS.md rule 16 amendment (the `jev` key is the one secret `CheckPolicy` may read) and rules 49-50.
   3. `[SERIAL]` The three acceptance checks (`gofmt -s -l .` first, rule 17), bidi and local-path scans with planted positive controls, scoped commits.
 - **Verification:**
   ```bash

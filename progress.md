@@ -564,3 +564,26 @@
   - `git push -f` không có nhãn `force` (theo yêu cầu, vì `-f` của `gh api`).
   - Nhãn không có trong dòng `app.sock`, audit hay `PolicyDecision`.
 - **Next step:** Phiên cha xem 2 commit trên nhánh `claude/elated-dijkstra-77d761` và quyết định có merge vào `main` hay không.
+
+## Checkpoint — Workstream AJ-7: README, luật 49–50, scans và acceptance (2026-10-19)
+
+- **Plan:** AJ-1…AJ-7 chuyển ✅ trong `plan.md` (bảng và phần chi tiết); dòng "17 mutants" sửa thành **23** ở cả bảng và AJ-6; AJ-7 ghi rõ là **hai** luật mới (49–50), không phải một.
+- **Outputs:**
+  - `README.md`: mục mới `### 8. Semantic Screen (optional, through TypeSafe AI)` trong `## Defense-in-Depth Security Model`, sau `### 7. Team Relay` và trước `## Polyglot Plugin SDK`: snippet `settings.json`, 9 gạch đầu dòng, và một câu kết về chi phí.
+  - `AGENTS.md`: luật 16 thêm câu chốt (screen đọc khóa `jev` của vault mặc định — ngoại lệ duy nhất của "CheckPolicy không mở vault"), thêm luật 49 (screen: chạy cuối, chỉ ask/deny, state là dữ liệu không tin, ngưỡng, `on_error`, audit `jev_*`) và luật 50 (`settings.json` `jev`, `bootRuntime`, `init jev`, `doctor`).
+  - `checks.md`: mục `## Workstream AJ-7 — README, Rules and Scans (2026-10-19)`, 6 dòng (5 `pass`, 1 `unresolved`).
+- **Quyết định:**
+  - README nói đúng những gì rời máy (provider, scope, permissions, params, `argv`, cwd, purpose, client, device, sandbox, network; rule của provider; 7 câu hỏi) và đúng những gì không bao giờ rời máy (master, lease, output, audit line), đúng mẫu đã dùng cho Telegram/Slack (luật 31, 34).
+  - Nói thẳng giới hạn của nhà cung cấp: trang legal chỉ hứa không huấn luyện trên dữ liệu người dùng; ZDR chỉ cho doanh nghiệp qua sales; không công bố thời hạn lưu, SOC 2, GDPR; DPA/MCA/Privacy Policy chưa đọc. Vì vậy README khuyên đặt tên phiên bản model thay vì alias và xin ZDR bằng văn bản trước khi bật.
+  - `mintrun_policy_check` được ghi là **oracle có tính phí**: nó chạy đúng screen, nên agent có thể dò cách viết để điểm thấp; screen chỉ là một tín hiệu, không thay `require_approval`.
+  - Việc đánh số: nhánh này có 48 luật cũ, nên JEV thêm 49–50. Khi merge vào `main`, luật 49–51 của `main` (in version, `scripts/release.sh`, threat model) và 51–52 của nhánh watch sẽ buộc JEV thành **53–54**; chưa luật nào trích 49–50 nên đổi số an toàn.
+- **Kiểm chứng (trong worktree này):**
+  - `gofmt -s -l .` không in gì; `go vet ./...` rc=0.
+  - `go test -count=1 -coverprofile=coverage.out ./...` rc=0; tổng **94.9%** (`cmd/mintrun` 94.6%, `internal/builtin` 94.1%, `internal/core` 96.4%) — đo thật, không ước lượng.
+  - `go build -trimpath -o mintrun ./cmd/mintrun` rc=0; `./mintrun plugin list` liệt kê 7 built-in (mcp, aws, cloudflare, gcp, github, 1password, keychain).
+  - Scan 43 file (`README.md`, `AGENTS.md`, `plan.md`, `checks.md`, `progress.md`, toàn bộ `.go` trong `cmd/` và `internal/`): 0 ký tự bidi (U+202A–202E, U+2066–2069) với mẫu cấy `chr(0x202E)` bị bắt; 0 đường dẫn host (needle là gốc home macOS/Linux, thư mục temp theo user và thư mục ứng dụng) với mẫu cấy bị bắt. 6 chuỗi `/tmp/` trong `internal/core/core_test.go` là fixture lệnh/D-Bus (`rm -rf /tmp/x`, `unix:abstract=/tmp/dbus-123`), không phải đường dẫn của máy này.
+  - `docs citation check: PASS (89 test names in repo)`, `controls caught: 4/4`.
+- **Chưa kiểm chứng:**
+  - `scripts/verify.sh` và `./mintrun -version` **không có** trên base `7a4e17b` của nhánh này: `verify.sh` đến từ các commit sau của `main`, `-version` nằm ở commit chưa merge `9184e8e`. Cả hai chạy lại trong cây đã merge (dòng AJ-7.6 để `unresolved`).
+  - Chưa gọi TypeSafe thật: mọi call đều tính phí và máy này không có khóa; screen mặc định tắt nên không có call nào trong test. Runbook AJ live probe vẫn treo.
+- **Next step:** merge 5 nhánh vào `main` theo thứ tự, mỗi lần merge chạy lại acceptance; sau đó chạy `scripts/verify.sh`, `./mintrun -version`, cập nhật tài liệu hợp nhất, rồi mới tính chuyện tag `v0.14.0` và push.

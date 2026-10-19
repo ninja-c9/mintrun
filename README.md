@@ -564,6 +564,30 @@ export MINTRUN_RELAY="https://relay.internal:8443#sha256=<64-hex-spki-pin>"
   - The server sees only the command `argv`, `cwd`, and `purpose` the laptop claims it will run, so `blocked_commands` and the command shown in the approval prompt are only as honest as the client device. The boundaries a compromised laptop cannot bypass are the ones enforced at mint time on the server: provider, scope, permissions, TTL, installations, human approval per mint, and per-device token revocation (`mintrun relay device remove <name>`).
   - Active leases are held in server memory; if the relay server process crashes and restarts while a lease is in flight, its in-memory revoke handle is lost and that lease remains valid until its provider TTL expires.
 
+### 8. Semantic Screen (optional, through TypeSafe AI)
+
+Policy, `blocked_commands`, and the sandbox decide from deterministic rules. An optional semantic screen adds a second, probabilistic opinion: one call to TypeSafe AI's Jev `System One` model that reads the request and returns a risk verdict which can only ask a human or deny, never allow. It is **off by default** and stays off until `settings.json` names it:
+
+```json
+{
+  "jev": {
+    "mode": "escalate",
+    "model": "jev-1.13.0",
+    "on_error": "escalate"
+  }
+}
+```
+
+- **It can only add a check.** `mode: "escalate"` turns a high-risk verdict into a human approval; `mode: "deny"` lets it deny outright. It runs last in the policy gate, so a request a deterministic rule already denied costs no API call and keeps its reason, and nothing the screen returns can allow a request that policy, the sandbox, or a missing approval denied. An unset or `"off"` mode builds no screen at all; a `jev` block with an unknown `mode`, `on_error`, or a model that is not a `jev-...` ID stops every command with `settings.json: jev...` rather than being ignored, like any other known setting.
+- **What it is asked.** Seven calibrated yes/no questions (credential exfiltration, phrased twice so a denial needs both, destructive work, a command that does not match its stated purpose, an injected instruction, a vague request, scope creep) and one 0-3 severity score with its confidence. The provider's rule can move the thresholds: `jev.ask_above` (default `0.35`), `jev.deny_above` (default `0.85`), `jev.severity_deny` (default `3`). A denial needs both exfiltration questions at or above `deny_above`, or a severity at or above `severity_deny` with confidence of at least `0.6`; any other flagged label, or an unsure severity, asks a human. `vague` is shown to the approver but never asks on its own, because `mintrun` has no `require_purpose`.
+- **What leaves the machine.** One screening per request: an HTTPS `POST` to `api.typesafe.ai`, holding the same request fields the approval text shows (provider, scope, permissions, params, `argv`, working directory, purpose, client name, device name, and the sandbox and network flags), the provider's rule (`allowed_scopes`, `allowed_permissions`, `blocked_commands`, `require_approval`), and the questions. Never the master secret, a lease, a child's output, or an audit line, and a home path in those fields is shortened to `~` or `$MINTRUN_HOME`. The screen reads the default vault's `jev` key on first use and never the vault a request names. Store the key with `mintrun init jev`; `mintrun doctor` reports `screen: off`, or the mode with the model and `on_error`, and warns when the model is an alias rather than a version, since TypeSafe can move an alias without notice.
+- **What the vendor promises.** TypeSafe's legal page says it does not train on user data. Zero data retention is offered only to enterprise customers through sales, neither a retention period nor SOC 2 or GDPR is published, and we have not read their DPA, MCA, or privacy policy. Treat the screen as sending your command lines to a third party: name a model version instead of an alias, and an operator who needs zero retention should get it in writing before turning the screen on.
+- **A failed screen is a policy decision.** `on_error` says what a timeout (5 s per call, an 8 s budget across retries, with doubling backoff on `429` and `529`), an unreachable host, or a reply that does not match the schema means: `escalate` (the default) asks a human, `deny` denies, and `pass` drops the verdict. `pass` is an operator's explicit choice to keep running when TypeSafe is down; it weakens the screen and never the deterministic gate. Every failure is audited with `jev_error`, scrubbed.
+- **Where the verdict shows.** The approval prompt gains a `Risk:` line under `Network:`, in the macOS app, the dialog, Telegram, Slack, and `mintrun watch`, with a closed vocabulary (`not screened`, `low`, `medium`, `high`, `unknown`, plus the labels, severity, and model); a verdict that carries free text can write none of it there. `audit.jsonl` keeps `jev_risk`, `jev_labels`, `jev_severity`, `jev_model`, `jev_ms`, and `jev_error`, `mintrun_audit` shows them with `jev_error` redacted, and the app socket carries `"jev"` on the `approve` line.
+- **`mintrun_policy_check` is an oracle.** The tool runs the same gate, so it runs the screen, and an agent can call it repeatedly to learn which wording scores low. A probabilistic answer is not a policy: keep `require_approval` for anything that matters, keep `blocked_commands` narrow, and treat the screen as one more signal rather than the boundary.
+- **Behind the relay, only the server sends.** A relayed request skips the laptop's screen entirely and copies the server's verdict, so a laptop's `settings.json` cannot weaken the server's screening, and the server's `minted` audit entry carries the `jev_*` fields. The laptop never holds the key.
+- **Cost and latency.** Each screened request is a billed TypeSafe call and adds a round trip (typically a fraction of a second). A request that a deterministic rule denies costs nothing, and a request whose verdict nobody acts on still costs a call.
+
 ---
 
 ## Polyglot Plugin SDK
