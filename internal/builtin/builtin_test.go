@@ -133,6 +133,17 @@ func TestCloudflareProviderComprehensive(t *testing.T) {
 	if _, err := cf.Mint(ctx, "master_ok", core.MintRequest{Permissions: []string{"nonexistent:perm"}}); err == nil {
 		t.Fatal("expected unmatched perm error")
 	}
+	// A blank name matches every catalog entry by substring, so it is refused before any request.
+	blank := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("a blank permission reached Cloudflare: %s %s", r.Method, r.URL)
+	}))
+	defer blank.Close()
+	blankCF := &CloudflareProvider{BaseURL: blank.URL, Client: blank.Client()}
+	for _, perms := range [][]string{{""}, {" "}, {"zone:read", ":"}, {" : "}} {
+		if _, err := blankCF.Mint(ctx, "master_ok", core.MintRequest{Scope: "example.com", Permissions: perms}); err == nil || err.Error() != "cloudflare permissions cannot be blank" {
+			t.Fatalf("%q: expected the blank refusal, got %v", perms, err)
+		}
+	}
 	if _, err := cf.Mint(ctx, "reject_tok", core.MintRequest{Permissions: []string{hexPerm}}); err == nil {
 		t.Fatal("expected token mint rejected error")
 	}
@@ -250,6 +261,28 @@ func TestGitHubProviderAndJWTSigningComprehensive(t *testing.T) {
 	}
 	if err := gh.Revoke(ctx, "", &core.Lease{ID: dynLease.ID, Ephemeral: true}); err == nil {
 		t.Fatal("expected revoke error without RevokeSecret")
+	}
+
+	// A permission or scope GitHub could read as "everything the installation has" is refused
+	// before any request, never dropped from the body.
+	for _, c := range []struct {
+		scope string
+		perms []string
+		want  string
+	}{
+		{"org/repo", []string{"contents:"}, `github permission "contents:" is not <name>:<read|write|admin> (such as contents:read)`},
+		{"org/repo", []string{":read"}, `github permission ":read" is not <name>:<read|write|admin> (such as contents:read)`},
+		{"org/repo", []string{"contents"}, `github permission "contents" is not <name>:<read|write|admin> (such as contents:read)`},
+		{"org/repo", []string{"contents:write:read"}, `github permission "contents:write:read" is not <name>:<read|write|admin> (such as contents:read)`},
+		{"org/repo", []string{"Contents:Read"}, `github permission "Contents:Read" is not <name>:<read|write|admin> (such as contents:read)`},
+		{"org/repo", []string{"contents:read", " "}, `github permission "" is not <name>:<read|write|admin> (such as contents:read)`},
+		{"org/", []string{"contents:read"}, `github scope "org/" names no repository (use <owner>/<repo>)`},
+	} {
+		before := len(sent)
+		_, err := gh.Mint(ctx, compositeSecret, core.MintRequest{Scope: c.scope, Permissions: c.perms})
+		if err == nil || err.Error() != c.want || len(sent) != before {
+			t.Fatalf("%q %q: err=%v, %d requests sent, want %q and none sent", c.scope, c.perms, err, len(sent)-before, c.want)
+		}
 	}
 
 	// Static mode wraps a token only: a GitHub App private key never reaches the child, and a
@@ -2366,6 +2399,137 @@ func TestMCPExecSchema(t *testing.T) {
 	}
 	if checked != 2 {
 		t.Fatalf("checked %d tools, want mintrun_exec and mintrun_policy_check", checked)
+	}
+}
+
+// TestGitHubPermissionsFailClosed pins an agent's malformed permission through CheckPolicy,
+// ExecBlind, and MCP mintrun_exec against a mock GitHub API: a glob rule denies it at the gate,
+// with no rule the provider refuses it, and neither sends a token request, which without
+// "permissions" would get every permission the installation has.
+func TestGitHubPermissionsFailClosed(t *testing.T) {
+	t.Setenv("MINTRUN_APPROVE", "")
+	ctx := context.Background()
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/555/access_tokens":
+			b, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, string(b))
+			_, _ = w.Write([]byte(`{"token":"ghs_minted_555"}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/installation/token":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL)
+		}
+	}))
+	defer srv.Close()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}))
+	master := "12345:555:" + strings.ReplaceAll(keyPEM, "\n", `\n`)
+
+	const glob = `{"github":{"allowed_permissions":["contents:*","*:read"]}}`
+	refused := func(p string) string {
+		return `provider "github" mint failed: github permission "` + p + `" is not <name>:<read|write|admin> (such as contents:read)`
+	}
+	gated := func(p string) string {
+		return `policy denied: permission "` + p + `" is not in allowed_permissions for provider "github"`
+	}
+	for _, c := range []struct {
+		name, policy, perm, by, want string
+	}{
+		{"contents: under contents:*", glob, "contents:", "permission", gated("contents:")},
+		{":read under *:read", glob, ":read", "permission", gated(":read")},
+		{"contents: with no rule", "", "contents:", "", refused("contents:")},
+		{":read with no rule", "", ":read", "", refused(":read")},
+		{"contents with no rule", "", "contents", "", refused("contents")},
+		{"contents: under *", `{"github":{"allowed_permissions":["*"]}}`, "contents:", "", refused("contents:")},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			home := t.TempDir()
+			if c.policy != "" {
+				if err := os.WriteFile(filepath.Join(home, "policy.json"), []byte(c.policy), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			reg := core.NewRegistry()
+			vault := &KeychainVault{HomeDir: home, ForceFile: true}
+			gh := NewGitHubProvider()
+			gh.BaseURL, gh.Client = srv.URL, srv.Client()
+			_ = reg.Register(vault)
+			_ = reg.Register(gh)
+			if err := vault.SetSecret(ctx, "github", master); err != nil {
+				t.Fatal(err)
+			}
+			rt := core.NewRuntime(home, "keychain", reg)
+			rt.ApprovalFunc = func(context.Context, core.ExecRequest) (bool, error) {
+				t.Error("an exec without require_approval must never ask a human")
+				return false, nil
+			}
+			before := len(bodies)
+			req := core.ExecRequest{MintRequest: core.MintRequest{Provider: "github", Scope: "org/repo", Permissions: []string{c.perm}}, Command: []string{"true"}, FromAgent: true}
+			d := rt.CheckPolicy(req)
+			if c.by == "" && !d.Allowed || c.by != "" && (d.Allowed || d.BlockedBy != c.by || d.Reason != c.want) {
+				t.Fatalf("decision %+v, want blocked_by %q", d, c.by)
+			}
+			if _, err := rt.ExecBlind(ctx, req); err == nil || err.Error() != c.want {
+				t.Fatalf("exec error %v, want %q", err, c.want)
+			}
+			args, _ := json.Marshal(map[string]any{"provider": "github", "scope": "org/repo", "permissions": []string{c.perm}, "command": []string{"true"}})
+			var out bytes.Buffer
+			in := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mintrun_exec","arguments":` + string(args) + `}}` + "\n"
+			if err := NewMCPBridge().Serve(ctx, rt, strings.NewReader(in), &out); err != nil {
+				t.Fatal(err)
+			}
+			var resp struct {
+				Result struct {
+					IsError bool                    `json:"isError"`
+					Content []struct{ Text string } `json:"content"`
+				} `json:"result"`
+			}
+			if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+				t.Fatal(err)
+			}
+			if want := "mintrun execution error: " + c.want; !resp.Result.IsError || len(resp.Result.Content) != 1 || resp.Result.Content[0].Text != want {
+				t.Fatalf("got %s, want the tool error %q", out.String(), want)
+			}
+			audit, err := os.ReadFile(filepath.Join(home, "audit.jsonl"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			quoted, _ := json.Marshal(c.want)
+			if strings.Count(string(audit), `"error":`+string(quoted)) != 2 || strings.Contains(string(audit), "BEGIN RSA") {
+				t.Fatalf("want the error %s audited for both execs and no key, got:\n%s", quoted, audit)
+			}
+			if len(bodies) != before {
+				t.Fatalf("%d token requests reached GitHub, want none: %q", len(bodies)-before, bodies[before:])
+			}
+		})
+	}
+
+	// The positive control: a well-formed permission under the same glob mints with exactly that
+	// permission in the body.
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, "policy.json"), []byte(glob), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reg := core.NewRegistry()
+	vault := &KeychainVault{HomeDir: home, ForceFile: true}
+	gh := NewGitHubProvider()
+	gh.BaseURL, gh.Client = srv.URL, srv.Client()
+	_ = reg.Register(vault)
+	_ = reg.Register(gh)
+	if err := vault.SetSecret(ctx, "github", master); err != nil {
+		t.Fatal(err)
+	}
+	rt := core.NewRuntime(home, "keychain", reg)
+	before := len(bodies)
+	res, err := rt.ExecBlind(ctx, core.ExecRequest{MintRequest: core.MintRequest{Provider: "github", Scope: "org/repo", Permissions: []string{"contents:read"}}, Command: []string{"true"}, FromAgent: true})
+	if err != nil || res.ExitCode != 0 || len(bodies) != before+1 ||
+		bodies[before] != `{"permissions":{"contents":"read"},"repositories":["repo"]}` {
+		t.Fatalf("res=%+v err=%v bodies=%q, want one request carrying contents:read", res, err, bodies[before:])
 	}
 }
 

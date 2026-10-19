@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -28,6 +29,9 @@ import (
 )
 
 var hex32Re = regexp.MustCompile(`^[a-fA-F0-9]{32}$`)
+
+// githubPermRe is one GitHub App permission as the access-token API takes it, such as contents:read.
+var githubPermRe = regexp.MustCompile(`^[a-z0-9_]+:(read|write|admin)$`)
 
 // CloudflareProvider mints and revokes short-lived, zone-scoped Cloudflare API sub-tokens
 // from a master token (`POST /client/v4/user/tokens` and `DELETE /client/v4/user/tokens/{id}`).
@@ -79,6 +83,12 @@ func (c *CloudflareProvider) Mint(ctx context.Context, masterSecret string, req 
 			ExpiresAt: expiresAt,
 			Ephemeral: false,
 		}, nil
+	}
+
+	// A permission with nothing but colons and space would match the first group in the catalog
+	// whose name holds a space, or any group at all, since names match by substring.
+	if slices.ContainsFunc(req.Permissions, func(p string) bool { return strings.TrimSpace(strings.ReplaceAll(p, ":", " ")) == "" }) {
+		return nil, errors.New("cloudflare permissions cannot be blank")
 	}
 
 	// Step 1: Resolve Scope (domain name or Zone ID) into a Cloudflare resource map.
@@ -380,24 +390,30 @@ func (g *GitHubProvider) Mint(ctx context.Context, masterSecret string, req core
 		return nil, errors.New(`github JIT mode needs a GitHub App credential (<app_id>:<installation_id>:<private_key_pem> or <installation_id>:<app_jwt>); to inject a PAT, request the "static" permission and set "allow_static": true for github in policy.json`)
 	}
 
+	// A request GitHub could read as "every repository" or "every permission" is refused, never
+	// dropped: a token request without "permissions" gets all the installation has.
 	body := map[string]any{}
 	if req.Scope != "" && req.Scope != "*" {
 		repo := req.Scope
 		if _, after, ok := strings.Cut(repo, "/"); ok {
 			repo = after
 		}
+		if strings.TrimSpace(repo) == "" {
+			return nil, fmt.Errorf("github scope %q names no repository (use <owner>/<repo>)", req.Scope)
+		}
 		body["repositories"] = []string{repo}
 	}
 	if len(req.Permissions) > 0 {
 		perms := make(map[string]string)
 		for _, p := range req.Permissions {
-			if k, v, ok := strings.Cut(strings.TrimSpace(p), ":"); ok && k != "" && v != "" {
-				perms[k] = v
+			p = strings.TrimSpace(p)
+			if !githubPermRe.MatchString(p) {
+				return nil, fmt.Errorf("github permission %q is not <name>:<read|write|admin> (such as contents:read)", p)
 			}
+			k, v, _ := strings.Cut(p, ":")
+			perms[k] = v
 		}
-		if len(perms) > 0 {
-			body["permissions"] = perms
-		}
+		body["permissions"] = perms
 	}
 
 	var resp struct {

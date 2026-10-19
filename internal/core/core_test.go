@@ -1157,6 +1157,7 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 		{rt, probe("evil.com", []string{"dns:read"}, "true"), "scope"},
 		{rt, probe("ok.com", nil, "true"), "permission"},
 		{rt, probe("ok.com", []string{"workers:write"}, "true"), "permission"},
+		{rt, probe("ok.com", []string{"dns:"}, "true"), "permission"}, // "dns:*" needs a level after the colon
 		{rt, probe("ok.com", []string{"static"}, "true"), "static"},
 		{rt, probe("ok.com", []string{"dns:read"}, "sh", "-c", "RM -RF /tmp/x"), "command"},
 		{rt, inst(""), "installation"},
@@ -1279,6 +1280,38 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 	}
 	if cliNone := probe("ok.com", nil, "true"); !open.CheckPolicy(cliNone).Allowed {
 		t.Fatalf("a request that is not an agent's reaches the rest of the gate: %+v", open.CheckPolicy(cliNone))
+	}
+
+	// A wildcard stands for at least one character, on either side, so a glob never admits the
+	// empty name or level a provider could read as no limit at all.
+	globHome := t.TempDir()
+	if err := os.WriteFile(filepath.Join(globHome, "policy.json"), []byte(`{"probe":{"allowed_scopes":["o/*","*.ok.com"],"allowed_permissions":["dns:*","*:read"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	globRT := core.NewRuntime(globHome, "keychain", reg)
+	for _, c := range []struct {
+		scope, perm, by, reason string
+	}{
+		{"o/", "dns:read", "scope", `policy denied: scope "o/" is not in allowed_scopes for provider "probe"`},
+		{".ok.com", "dns:read", "scope", `policy denied: scope ".ok.com" is not in allowed_scopes for provider "probe"`},
+		{"o/r", "dns:", "permission", `policy denied: permission "dns:" is not in allowed_permissions for provider "probe"`},
+		{"o/r", ":read", "permission", `policy denied: permission ":read" is not in allowed_permissions for provider "probe"`},
+	} {
+		req := probe(c.scope, []string{c.perm}, "true")
+		d := globRT.CheckPolicy(req)
+		_, err := globRT.ExecBlind(ctx, req)
+		if d.Allowed || d.BlockedBy != c.by || d.Reason != c.reason || err == nil || err.Error() != c.reason {
+			t.Fatalf("%q %q: decision %+v, exec error %v, want both to deny with %q", c.scope, c.perm, d, err, c.reason)
+		}
+	}
+	for _, c := range []struct{ scope, perm string }{{"o/r", "dns:read"}, {"a.ok.com", "zone:read"}} {
+		req := probe(c.scope, []string{c.perm}, "true")
+		if d := globRT.CheckPolicy(req); !d.Allowed {
+			t.Fatalf("%q %q must pass the globs: %+v", c.scope, c.perm, d)
+		}
+		if res, err := globRT.ExecBlind(ctx, req); err != nil || res.ExitCode != 0 {
+			t.Fatalf("%q %q must pass the globs: res=%+v err=%v", c.scope, c.perm, res, err)
+		}
 	}
 
 	// Allowed: the listed installation mints, max_ttl_seconds caps the TTL (also an unset one),

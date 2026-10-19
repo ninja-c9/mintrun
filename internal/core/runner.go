@@ -151,16 +151,20 @@ type JevVerdict struct {
 // JevLabels is the closed set of labels the semantic screen can raise, in the order it lists them.
 var JevLabels = []string{"exfil", "destructive", "mismatch", "injected", "vague", "scope_creep"}
 
+// matchPattern reports whether value matches an allowlist pattern, ignoring case and surrounding
+// space: "*" matches anything, "x*" a value that starts with x, and "*x" one that ends with x. A
+// wildcard stands for at least one character, so "contents:*" never admits "contents:", which a
+// provider could read as no permission at all.
 func matchPattern(pattern, value string) bool {
 	p := strings.ToLower(strings.TrimSpace(pattern))
 	v := strings.ToLower(strings.TrimSpace(value))
 	if p == "*" || p == v {
 		return true
 	}
-	if strings.HasSuffix(p, "*") && strings.HasPrefix(v, strings.TrimSuffix(p, "*")) {
+	if pre, ok := strings.CutSuffix(p, "*"); ok && len(v) > len(pre) && strings.HasPrefix(v, pre) {
 		return true
 	}
-	if strings.HasPrefix(p, "*") && strings.HasSuffix(v, strings.TrimPrefix(p, "*")) {
+	if suf, ok := strings.CutPrefix(p, "*"); ok && len(v) > len(suf) && strings.HasSuffix(v, suf) {
 		return true
 	}
 	return false
