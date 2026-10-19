@@ -664,3 +664,13 @@
 - **Còn lại:**
   - Mục MCP/shim trong "Còn lại" của Workstream AL đã xong.
   - Commit chỉ nằm trên `claude/jovial-haslett-40d817`: chưa merge, chưa tag `v0.16.0`, chưa push.
+
+## Checkpoint — Chạy GitHub App JIT thật qua alias (tầng 3b, 2026-10-20)
+
+- **Hoàn thành:** chạy binary `v0.16.0` (build `-trimpath` từ `git archive` của tag) với API GitHub thật qua alias `github@e2e`: một GitHub App dùng một lần, chỉ có quyền Contents read trên một repo công khai, master ghim installation, file vault trong một home tạm; từ bước gate của CLI, `allowed_installations` liệt kê installation đó và một ID giả `1`. CLI và MCP đều mint, chạy, scrub (raw, base64, hex) và revoke (token cũ nhận 401 ngay request đầu). Repo ngoài installation bị GitHub trả 422 lúc mint (`failed`, exit 1); thiếu hoặc sai installation bị gate chặn (`blocked`, exit 126); ID giả `1` có trong danh sách nhưng master không ghim, nên provider từ chối trước mọi request.
+- **Kiểm chứng:** lần 1 đạt 40/45, cả 5 lỗi đều do harness: hex in bằng `xxd -p -c 256` bị tách hai dòng nên `Scrub` không khớp, và bảng kỳ vọng ghi `denied` cho ba lần gate chặn trong khi runner ghi `blocked`. Lần 2 (trong 3 lần cho phép) đạt 45/45. Quét rò rỉ có mẫu cài trước: 0 hit trong 31 file của lần chạy, rồi 0 hit trong 483 file (143.4 MB) sau khi dọn.
+- **Đã ghi:** mục GJ-1..GJ-14 trong `checks.md`, bốn chỗ trong `docs/threat-model.md` (provider GitHub, giới hạn của dòng Leases, revoke, chuỗi bị encoder tách dòng) và learned rule 60 trong `AGENTS.md`.
+- **Còn lại:**
+  - Chưa chạy thật: master `<app_id>::<pem>` không ghim và JWT trần, App có quyền rộng hơn (để thu hẹp quyền thật sự), relay, PAT qua static mode ở `v0.16.0`, Cloudflare, AWS và GCP.
+  - GitHub App và file khoá trên máy kia do người dùng tự xoá.
+  - Commit chỉ nằm trên `main` local: chưa push.
