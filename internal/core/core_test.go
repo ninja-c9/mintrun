@@ -2448,7 +2448,7 @@ func TestApprovalTextRisk(t *testing.T) {
 		{&core.JevVerdict{Risk: "Low", Severity: &minus, Model: "jev-" + strings.Repeat("a", 37)}, "unknown (no answer)"},
 	} {
 		req := core.ExecRequest{MintRequest: core.MintRequest{Provider: "p"}, Command: []string{"true"}, Jev: c.v}
-		if text := core.ApprovalText("h", req, 1000); !strings.Contains(text, "\nNetwork: open\nRisk: "+c.want+"\nProvider: \"p\"\n") {
+		if text := core.ApprovalText("h", req, 1000); !strings.Contains(text, "\nNetwork: open\nHints: none\nRisk: "+c.want+"\nProvider: \"p\"\n") {
 			t.Errorf("verdict %+v: %q", c.v, text)
 		}
 	}

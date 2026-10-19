@@ -993,7 +993,7 @@ New tests stay hermetic (rule 22): a plain `go test ./...` makes zero real `sand
 | 4 | **AJ-4** — `settings.json` `jev`, `bootRuntime`, `mintrun init jev`, `setupHint`, `doctor` | `[SERIAL]` after AJ-2 | ✅ |
 | 5 | **AJ-5** — relay: the server screens with its own key, the client never calls Jev | `[SERIAL]` after AJ-4 | ✅ |
 | 6 | **AJ-6** — tests, hermetic proof, 23 mutants on a copy | `[SERIAL]` after AJ-5 | ✅ |
-| 7 | **AJ-7** — README, AGENTS.md (rule 16 amendment, rule 49), checks, scans, commits | `[SERIAL]` last | ✅ |
+| 7 | **AJ-7** — README, AGENTS.md (rule 16 amendment, rules 53-54), checks, scans, commits | `[SERIAL]` last | ✅ |
 
 All steps edit `internal/core/runner.go` or files that build against it, so none runs in parallel.
 
@@ -1069,7 +1069,7 @@ All steps edit `internal/core/runner.go` or files that build against it, so none
 - **Files:** `README.md`, `AGENTS.md`, `plan.md`, `progress.md`, `checks.md`.
 - **Deliverables:**
   1. `[SERIAL]` README "Semantic screen (optional, through TypeSafe AI)": the exact fields sent, no training on user data, ZDR only for enterprise customers, no published retention period, never a replacement for policy, the sandbox, or a human, off by default, cost, the `mintrun_policy_check` oracle warning, `on_error: pass` as the operator's choice, and with a relay only the server sends.
-  2. `[SERIAL]` AGENTS.md rule 16 amendment (the `jev` key is the one secret `CheckPolicy` may read) and rules 49-50.
+  2. `[SERIAL]` AGENTS.md rule 16 amendment (the `jev` key is the one secret `CheckPolicy` may read) and rules 53-54 (49-50 before the watch rules were merged).
   3. `[SERIAL]` The three acceptance checks (`gofmt -s -l .` first, rule 17), bidi and local-path scans with planted positive controls, scoped commits.
 - **Verification:**
   ```bash
