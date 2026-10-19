@@ -85,10 +85,14 @@ func TestVersion(t *testing.T) {
 	origVersion, origRead := version, readBuildInfo
 	t.Cleanup(func() { version, readBuildInfo = origVersion, origRead })
 	tail := fmt.Sprintf(" (%s, %s/%s)", runtime.Version(), runtime.GOOS, runtime.GOARCH)
-	// A test binary carries no vcs.* settings, so each case hands versionString its own.
-	info := func(settings ...debug.BuildSetting) func() (*debug.BuildInfo, bool) {
-		return func() (*debug.BuildInfo, bool) { return &debug.BuildInfo{Settings: settings}, true }
+	// A test binary carries no vcs.* settings, so each case hands versionString its own; mod adds
+	// the Main.Version that go install <pkg>@<version> stamps.
+	mod := func(v string, settings ...debug.BuildSetting) func() (*debug.BuildInfo, bool) {
+		return func() (*debug.BuildInfo, bool) {
+			return &debug.BuildInfo{Main: debug.Module{Version: v}, Settings: settings}, true
+		}
 	}
+	info := func(settings ...debug.BuildSetting) func() (*debug.BuildInfo, bool) { return mod("", settings...) }
 	rev := debug.BuildSetting{Key: "vcs.revision", Value: "6fcd7f0a1b2c3d4e5f60718293a4b5c6d7e8f901"}
 	dirty := debug.BuildSetting{Key: "vcs.modified", Value: "true"}
 	clean := debug.BuildSetting{Key: "vcs.modified", Value: "false"}
@@ -97,10 +101,14 @@ func TestVersion(t *testing.T) {
 		read          func() (*debug.BuildInfo, bool)
 		want          string
 	}{
-		{"ldflags", "v1.2.3", info(rev, dirty), "v1.2.3"},
+		{"ldflags", "v1.2.3", mod("v0.13.1-0.20261019010203-6fcd7f0a1b2c+dirty", rev, dirty), "v1.2.3"},
 		{"revision", "", info(rev, clean), "6fcd7f0a1b2c"},
 		{"revision dirty", "", info(dirty, rev), "6fcd7f0a1b2c+dirty"},
 		{"short revision", "", info(debug.BuildSetting{Key: "vcs.revision", Value: "1234"}), "1234"},
+		{"revision over module version", "", mod("v0.13.1-0.20261019010203-6fcd7f0a1b2c+dirty", rev, dirty), "6fcd7f0a1b2c+dirty"},
+		{"module tag", "", mod("v0.14.0"), "v0.14.0"},
+		{"pseudo-version", "", mod("v0.0.0-20261019010203-abcdef123456"), "v0.0.0-20261019010203-abcdef123456"},
+		{"devel", "", mod("(devel)", dirty), "dev"},
 		{"no revision", "", info(dirty), "dev"},
 		{"no build info", "", func() (*debug.BuildInfo, bool) { return nil, false }, "dev"},
 	} {

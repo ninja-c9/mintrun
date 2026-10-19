@@ -38,7 +38,9 @@ var (
 )
 
 // versionString is the -X stamp, else the VCS revision go build embeds from a checkout (12
-// characters, +dirty when the tree had changes), else dev (rule 49).
+// characters, +dirty when the tree had changes), else the module version go install
+// …@<version> embeds, else dev (rule 49). The revision goes first because a checkout build
+// stamps a module version too.
 func versionString() string {
 	v := version
 	if v == "" {
@@ -57,6 +59,8 @@ func versionString() string {
 			}
 			if rev != "" {
 				v = rev + dirty
+			} else if info.Main.Version != "" && info.Main.Version != "(devel)" {
+				v = info.Main.Version
 			}
 		}
 	}
