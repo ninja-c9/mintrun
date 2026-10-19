@@ -145,7 +145,7 @@ func (m *MCPBridge) handleRequest(ctx context.Context, rt *core.Runtime, req jso
 				"permissions": map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
-					"description": "Scoped permissions to mint (e.g. ['dns:write', 'workers:write'])",
+					"description": "Scoped permissions to mint (e.g. ['dns:write', 'workers:write']): at least one, none blank, or ['static'] for static mode",
 				},
 				"command": map[string]any{
 					"type":        "array",
@@ -186,7 +186,7 @@ func (m *MCPBridge) handleRequest(ctx context.Context, rt *core.Runtime, req jso
 					"description": "Why you are running this command, in plain words for the human who approves it: one line, at most 300 bytes",
 				},
 			},
-			"required": []string{"provider", "command"},
+			"required": []string{"provider", "permissions", "command"},
 		}
 		return jsonRPCResponse{
 			JSONRPC: "2.0",

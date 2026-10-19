@@ -1103,7 +1103,7 @@ func TestCLIRelay(t *testing.T) {
 	}
 	for range 40 {
 		if d := probeClient.CheckPolicy(context.Background(), core.ExecRequest{
-			MintRequest: core.MintRequest{Provider: "cli-relay-prov", Scope: "zone1"},
+			MintRequest: core.MintRequest{Provider: "cli-relay-prov", Scope: "zone1", Permissions: []string{"dns:write"}},
 			Command:     []string{"true"},
 		}); d.Allowed {
 			break

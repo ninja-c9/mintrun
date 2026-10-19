@@ -1188,3 +1188,35 @@ All steps edit `internal/core/runner.go` or files that build against it, so none
   ```bash
   scripts/verify.sh
   ```
+
+## 11. Workstream AM — Agents, the Relay, and the Shims Must Name a Permission (`v0.16.0`, 2026-10-19)
+
+> **Breaking, under the same `v0.16.0` note as AK and AL:** an agent's `mintrun_exec` or `mintrun_policy_check` that omits `permissions`, and an `aws`, `vercel`, or `psql` shim in `auto` mode with no permissions configured, used to mint with an empty list.
+
+**Choice.** Refuse where each caller picks its list. The gate (`decide`) refuses an agent's or a relay request's empty or blank list as `invalid_request`, under the guard of the vault and timeout refusals, so `mintrun_policy_check` and `ExecBlind` agree (rule 16) and the denial is audited before the pause. The shim refuses its own list before it looks up the real binary, naming the `shims/config.json` key to set. A global check in `decide` would have refused every direct Go caller too, and `CheckPolicy` is not where the CLI refuses (rule 57). No built-in provider or example plugin needs an empty list.
+
+**Not changed (on purpose):** `GitHubProvider.Mint` (another session owns the malformed-permission fix), and Cloudflare's own fallback for an empty list, now reachable only from a Go caller of `ExecBlind`.
+
+### AM-1 — Gate and Schema
+- **Files:** `internal/core/runner.go`, `internal/core/core_test.go`, `internal/builtin/mcp.go`, `internal/builtin/builtin_test.go`, `cmd/mintrun/main_test.go`.
+- **Deliverables:** `[SERIAL]` `decide` denies a `FromAgent` or relay request whose list is empty or holds a blank entry, right after `ValidProvider`; the MCP schema marks `permissions` required; every agent or relay request in the tests names a permission.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCheckPolicyMatchesExecBlind|TestMintLeaseAndRelayClient' ./internal/core
+  go test -count=1 -v -run 'TestMCPBridgeRefusesEmptyPermissions|TestMCPExecSchema' ./internal/builtin
+  ```
+
+### AM-2 — Shim
+- **Files:** `cmd/mintrun/shim.go`, `cmd/mintrun/shim_test.go`.
+- **Deliverables:** `[SERIAL]` `runShim` in `auto` mode exits 126 with the config key to set when the inferred list is empty or holds a blank entry, before the binary lookup and `ExecBlind`.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCLIShim' ./cmd/mintrun
+  ```
+
+### AM-3 — Mutants, Docs, Acceptance
+- **Deliverables:** `[SERIAL]` mutants on a copy, each compiled first; rule 58 and the edits to rules 16, 39, and 57; the threat model's lease row and "Without a policy"; README's shim, MCP, and `v0.16.0` notes; the rule-52 citation check; bidi, conflict-marker, and leak scans with planted controls; `./mintrun` rebuilt; one commit on the session branch (no push, tag, or merge).
+- **Verification:**
+  ```bash
+  scripts/verify.sh
+  ```

@@ -3,10 +3,14 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
+	"fmt"
+	"io/fs"
 	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -465,6 +469,68 @@ func TestCLIShim(t *testing.T) {
 		}
 		if calls := takeCalls(t, home); strings.Contains(calls, "gh ") {
 			t.Errorf("gh executed when MINTRUN_SHIM_MODE=auto was set on a block shim: %q", calls)
+		}
+	})
+
+	t.Run("auto mode refuses an empty or blank permission list", func(t *testing.T) {
+		home, _ := setupEnv(t)
+		dir := filepath.Join(home, ".mintrun", "shims")
+		bin := filepath.Join(home, "bin")
+		policy := filepath.Join(home, ".mintrun", "policy.json")
+		for _, tool := range []string{"aws", "vercel", "psql"} {
+			writeFile(t, filepath.Join(bin, tool), stubLog+"echo SHOULD_NOT_RUN\n")
+			if err := os.Chmod(filepath.Join(bin, tool), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Setenv("PATH", dir+string(os.PathListSeparator)+bin)
+		if r := runCLI(t, "", nil, "shim", "install", "-mode", "auto", "aws", "vercel", "psql"); r.exited {
+			t.Fatalf("install: %s%s", r.out, r.err)
+		}
+		takeCalls(t, home)
+		// No real vercel is left on PATH: the refusal comes before the lookup, so it names the
+		// config key to set rather than a missing binary.
+		if err := os.Remove(filepath.Join(bin, "vercel")); err != nil {
+			t.Fatal(err)
+		}
+		// aws, vercel, and psql have no default permissions, and a wildcard rule names none, so the
+		// list is empty, which would mint the provider's widest credential. The shim stops before
+		// ExecBlind: nothing is minted or audited, and the real binary never runs.
+		writeFile(t, policy, `{"aws":{"allowed_permissions":["ec2:*"]}}`)
+		refused := func(tool, provider, got string) {
+			t.Helper()
+			r := runAsTool(t, filepath.Join(dir, tool), "x")
+			want := fmt.Sprintf(`mintrun shim %q in auto mode has no permissions to mint, or a blank one (got %s): set "permissions" for %q in shims/config.json (mintrun shim install -mode auto -perms <p1,p2> %s), or list concrete "allowed_permissions" for provider %q in policy.json`,
+				tool, got, tool, tool, provider)
+			if !r.exited || r.code != 126 || r.out != "" || r.err != want+"\n" {
+				t.Errorf("%s: code=%d exited=%v, want 126 and\n%s\ngot:\n%s%s", tool, r.code, r.exited, want, r.out, r.err)
+			}
+			if calls := takeCalls(t, home); calls != "" {
+				t.Errorf("%s ran with no permissions: %q", tool, calls)
+			}
+			if _, err := os.Stat(filepath.Join(home, ".mintrun", "audit.jsonl")); !errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("%s reached ExecBlind with no permissions (audit.jsonl: %v)", tool, err)
+			}
+		}
+		refused("aws", "aws", `[]`)
+		refused("vercel", "vercel", `[]`)
+		refused("psql", "postgres-jit", `[]`)
+		// A blank entry is refused too, from a hand-edited config.json or from policy.json.
+		writeFile(t, filepath.Join(dir, "config.json"), `{"aws":{"mode":"auto","permissions":["s3:ListBucket"," "]}}`)
+		refused("aws", "aws", `["s3:ListBucket" " "]`)
+		writeFile(t, filepath.Join(dir, "config.json"), `{"aws":{"mode":"auto"}}`)
+		writeFile(t, policy, `{"aws":{"allowed_permissions":[""]}}`)
+		refused("aws", "aws", `[""]`)
+
+		// The positive control: with a permission the shim reaches ExecBlind, which audits the run
+		// (a failed one, since no aws secret is stored) with that permission.
+		writeFile(t, policy, `{"aws":{"allowed_permissions":["s3:ListBucket"]}}`)
+		r := runAsTool(t, filepath.Join(dir, "aws"), "x")
+		if !r.exited || r.code != 1 || !strings.Contains(r.err, "run mintrun init aws") {
+			t.Errorf("aws with a permission: code=%d exited=%v:\n%s%s", r.code, r.exited, r.out, r.err)
+		}
+		if e := lastAudit(t, filepath.Join(home, ".mintrun")); e.Outcome != "failed" || !slices.Equal(e.Permissions, []string{"s3:ListBucket"}) {
+			t.Errorf("audit entry = %+v, want a failed run with s3:ListBucket", e)
 		}
 	})
 

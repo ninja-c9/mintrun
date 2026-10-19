@@ -588,6 +588,13 @@ func runShim(ctx context.Context, rt *core.Runtime, origPath, tool string, args 
 			tool, provider, provider, hintScope, hintPerms, cmdStr)
 		return
 	}
+	// An empty list mints the provider's widest credential, and aws, vercel, and psql have no
+	// default to fall back on. A blank entry is refused as the CLI's -perms refuses it (rule 57).
+	if len(perms) == 0 || slices.ContainsFunc(perms, func(p string) bool { return strings.TrimSpace(p) == "" }) {
+		fatalExit(126, "mintrun shim %q in auto mode has no permissions to mint, or a blank one (got %q): set \"permissions\" for %q in shims/config.json (mintrun shim install -mode auto -perms <p1,p2> %s), or list concrete \"allowed_permissions\" for provider %q in policy.json",
+			tool, perms, tool, tool, provider)
+		return
+	}
 
 	realBin, err := lookPathSkippingDir(tool, origPath, shimsDir(rt.HomeDir))
 	if err != nil {

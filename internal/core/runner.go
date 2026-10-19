@@ -318,6 +318,12 @@ func (rt *Runtime) decide(req ExecRequest) (PolicyDecision, []string, []string) 
 	if !ValidProvider(req.Provider) {
 		return deny("invalid_request", "exec requires a provider of the form "+ProviderForm+" (got %q)", req.Provider)
 	}
+	// An empty list mints the widest credential some providers have (a GitHub token with every
+	// permission of the installation, an AWS session with every permission of the role), and a
+	// blank entry is one a provider may drop. The CLI and the shims refuse one themselves.
+	if (req.FromAgent || rt.Relay != nil || rt.RelayServer) && (len(req.Permissions) == 0 || slices.ContainsFunc(req.Permissions, func(p string) bool { return strings.TrimSpace(p) == "" })) {
+		return deny("invalid_request", "policy denied: an agent must name at least one permission, and no blank one (got %q); name what the command needs, or [\"static\"] for static mode", req.Permissions)
+	}
 	// The vault is the operator's choice (MINTRUN_VAULT, or the CLI's -vault), never an agent's or a relay client's.
 	if (req.FromAgent || rt.Relay != nil || rt.RelayServer) && req.Vault != "" {
 		return deny("invalid_request", "policy denied: an agent cannot pick the vault (got %q); omit it to use the vault mintrun was started with (MINTRUN_VAULT)", req.Vault)

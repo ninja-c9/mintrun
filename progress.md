@@ -655,3 +655,12 @@
   - MCP `mintrun_exec` và shim `aws`, `vercel`, `psql` ở chế độ `auto` không cấu hình quyền vẫn có thể gửi danh sách rỗng (đã ghi vào giới hạn của threat model); với `aws` đó là mọi quyền của role.
   - Đã sửa (2026-10-19, nhánh `claude/optimistic-swartz-91670b`): panel context của agent trong `docs/video/mintrun-intro.html` giờ gõ thêm dòng `  -perms dns:write \`, gói thành 4 dòng cách 30 px để vừa khung, và `docs/video/mintrun-intro.mp4` đã render lại bằng cùng skill. Kiểm chứng: dòng V11 trong `checks.md`.
   - Commit chỉ nằm trên `claude/modest-greider-67684e`: chưa merge, chưa tag `v0.16.0`, chưa push.
+
+## Checkpoint — Agent, relay và shim cũng phải nêu quyền (Workstream AM, 2026-10-19)
+
+- **Hoàn thành:** đóng hai đường còn mint được với danh sách quyền rỗng. `decide` từ chối `mintrun_exec`/`mintrun_policy_check` của agent và request relay không nêu quyền nào hoặc có quyền rỗng (`invalid_request`, exit 126, có audit, trước pause), nên hai tool và `ExecBlind` khớp nhau (luật 16); schema MCP đánh dấu `permissions` là bắt buộc. Shim `auto` (`aws`, `vercel`, `psql` không có mặc định, hoặc một quyền rỗng từ `shims/config.json` hay `allowed_permissions`) thoát 126, nêu đúng khóa cần đặt, trước khi tìm binary hay mở vault.
+- **Đã kiểm tra trước:** không provider hay plugin nào dựa vào danh sách rỗng (Cloudflare tự điền mặc định, GCP đã báo lỗi). `GitHubProvider.Mint` không đổi (phiên khác sở hữu).
+- **Kiểm chứng:** `scripts/verify.sh` 5/5 pass, coverage 95.1%; 17/17 mutant trên bản copy bị giết (mutant "kiểm tra sau lookPath" sống ở lần đầu vì stub `vercel` nằm trên `PATH`, test đã gỡ nó); chạy tay trong home tạm với `MINTRUN_FILE_VAULT=1` đúng như tài liệu. Luật 58 mới; luật 16, 39, 57 cập nhật; threat model bỏ giới hạn "vẫn gửi được danh sách rỗng".
+- **Còn lại:**
+  - Mục MCP/shim trong "Còn lại" của Workstream AL đã xong.
+  - Commit chỉ nằm trên `claude/jovial-haslett-40d817`: chưa merge, chưa tag `v0.16.0`, chưa push.

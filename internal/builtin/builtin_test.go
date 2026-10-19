@@ -605,7 +605,7 @@ func TestMCPBridgeComprehensive(t *testing.T) {
 		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":"not-an-object"}`,
 		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"mintrun_plugins"}}`,
 		`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"mintrun_exec","arguments":"bad"}}`,
-		`{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"mintrun_exec","arguments":{"provider":"missing","command":["echo"]}}}`,
+		`{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"mintrun_exec","arguments":{"provider":"missing","permissions":["read"],"command":["echo"]}}}`,
 		`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"mintrun_exec","arguments":{"provider":"cloudflare","permissions":["static"],"command":["echo","ok"]}}}`,
 		`{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"unknown_tool"}}`,
 		`{"jsonrpc":"2.0","id":9,"method":"unknown_method"}`,
@@ -1574,7 +1574,7 @@ func TestMCPBridgeGovernanceTools(t *testing.T) {
 		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`,
 		call("mintrun_policy_check", `{"provider":"cloudflare","scope":"ok.com","permissions":["dns:read"],"command":["wrangler","deploy"],"ttl_seconds":300}`),
 		call("mintrun_policy_check", `{"provider":"cloudflare","scope":"ok.com","permissions":["dns:read"],"command":["wrangler","deploy"],"clean_env":true}`),
-		call("mintrun_policy_check", `{"provider":"gated","command":["true"]}`),
+		call("mintrun_policy_check", `{"provider":"gated","permissions":["read"],"command":["true"]}`),
 		call("mintrun_policy_check", leaky),
 		call("mintrun_policy_check", `{"provider":"cloudflare","scope":"ok.com","permissions":["dns:read"],"command":["printenv"]}`),
 		call("mintrun_policy_check", `"bad"`),
@@ -1847,7 +1847,7 @@ func TestMCPBridgeExecUnreadable(t *testing.T) {
 			return os.Chmod(filepath.Join(home, "plugins", "canary", "run"), 0o600)
 		}, `vault "canary" could not load master secret for "canary": plugin "canary" failed: permission denied ()`},
 	}
-	req := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mintrun_exec","arguments":{"provider":"canary","command":["echo"]}}}` + "\n"
+	req := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mintrun_exec","arguments":{"provider":"canary","permissions":["read"],"command":["echo"]}}}` + "\n"
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			if c.noRead && os.Geteuid() <= 0 {
@@ -1936,7 +1936,7 @@ func TestMCPBridgeExecPluginHomes(t *testing.T) {
 		{"root user home", "canary", "/", crash, false, vaultFailed +
 			`File "$MINTRUN_HOME/plugins/canary/run", line 2` + "\n" + `File "//lib/site.py", line 9)`},
 	}
-	req := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mintrun_exec","arguments":{"provider":"canary","command":["echo"]}}}` + "\n"
+	req := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mintrun_exec","arguments":{"provider":"canary","permissions":["read"],"command":["echo"]}}}` + "\n"
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -2211,6 +2211,24 @@ func TestMCPBridgeRefusesTimeout(t *testing.T) {
 	mcpRefusal(t, `,"timeout_seconds":3600`, `policy denied: an agent cannot set timeout_seconds (got 3600); omit it to run with the 5-minute limit`)
 }
 
+// TestMCPBridgeRefusesEmptyPermissions pins that an agent must name what it mints: an omitted
+// (null), empty, or blank permission list would mint some providers' widest credential (a GitHub
+// token with every permission of the installation, an AWS session with every permission of the
+// role), so both tools refuse it with the same reason, and the exec is audited with exit 126 and
+// no lease. The same exec with ["static"] runs.
+func TestMCPBridgeRefusesEmptyPermissions(t *testing.T) {
+	for _, c := range []struct{ args, got string }{
+		{`,"permissions":null`, `[]`},
+		{`,"permissions":[]`, `[]`},
+		{`,"permissions":[" "]`, `[" "]`},
+		{`,"permissions":["static",""]`, `["static" ""]`},
+	} {
+		t.Run(c.args, func(t *testing.T) {
+			mcpRefusal(t, c.args, `policy denied: an agent must name at least one permission, and no blank one (got `+c.got+`); name what the command needs, or ["static"] for static mode`)
+		})
+	}
+}
+
 // mcpRefusal sends mintrun_policy_check and mintrun_exec with the extra arguments args (the exec
 // adds a FromAgent argument, which must not clear the flag the bridge sets), then the same exec
 // without them. Both tools must deny with reason, and audit.jsonl must hold the exec's exit-126
@@ -2288,14 +2306,15 @@ func mcpRefusal(t *testing.T, args, reason string) {
 		}
 		es = append(es, e)
 	}
-	if len(es) != 2 || es[0].ExitCode != 126 || es[0].Error != reason || es[1].ExitCode != 0 || es[1].Error != "" {
+	if len(es) != 2 || es[0].ExitCode != 126 || es[0].Error != reason || es[0].LeaseID != "" || es[1].ExitCode != 0 || es[1].Error != "" || es[1].LeaseID == "" {
 		t.Fatalf("audit: got %+v, want the refusal (exit 126) then the run (exit 0)", es)
 	}
 }
 
 // TestMCPExecSchema pins that the input schema of mintrun_exec and mintrun_policy_check lists
 // every argument core.ExecRequest decodes, approve included, except vault and timeout_seconds,
-// which CheckPolicy refuses from an agent. A field added to ExecRequest must be listed or refused.
+// which CheckPolicy refuses from an agent, and requires provider, permissions, and command. A
+// field added to ExecRequest must be listed or refused.
 func TestMCPExecSchema(t *testing.T) {
 	var want []string
 	var walk func(reflect.Type)
@@ -2322,7 +2341,10 @@ func TestMCPExecSchema(t *testing.T) {
 		Result struct {
 			Tools []struct {
 				Name        string
-				InputSchema struct{ Properties map[string]any } `json:"inputSchema"`
+				InputSchema struct {
+					Properties map[string]any
+					Required   []string
+				} `json:"inputSchema"`
 			}
 		}
 	}
@@ -2335,6 +2357,10 @@ func TestMCPExecSchema(t *testing.T) {
 			checked++
 			if got := slices.Sorted(maps.Keys(tool.InputSchema.Properties)); !slices.Equal(got, want) {
 				t.Errorf("%s lists %v, want %v", tool.Name, got, want)
+			}
+			// CheckPolicy refuses an agent's request with no permission, so the schema says so.
+			if got := tool.InputSchema.Required; !slices.Equal(got, []string{"provider", "permissions", "command"}) {
+				t.Errorf("%s requires %v, want provider, permissions, and command", tool.Name, got)
 			}
 		}
 	}

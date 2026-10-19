@@ -172,7 +172,7 @@ esac
 	if err != nil {
 		t.Fatal(err)
 	}
-	mcpInput := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mintrun_exec","arguments":{"provider":"github","scope":"ninja-c9/mintrun","command":["sh","-c","echo token=$GITHUB_TOKEN"]}}}` + "\n"
+	mcpInput := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mintrun_exec","arguments":{"provider":"github","scope":"ninja-c9/mintrun","permissions":["contents:read"],"command":["sh","-c","echo token=$GITHUB_TOKEN"]}}}` + "\n"
 	var mcpOutput bytes.Buffer
 	if err := mcpBridge.Serve(ctx, rt, strings.NewReader(mcpInput), &mcpOutput); err != nil {
 		t.Fatalf("MCP Serve failed: %v", err)
@@ -494,7 +494,7 @@ esac
 	if err != nil {
 		t.Fatal(err)
 	}
-	mcpInput := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mintrun_exec","arguments":{"provider":"leaky","scope":"crash","command":["echo","x"]}}}` + "\n"
+	mcpInput := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mintrun_exec","arguments":{"provider":"leaky","scope":"crash","permissions":["read"],"command":["echo","x"]}}}` + "\n"
 	var mcpOutput bytes.Buffer
 	if err := bridge.Serve(ctx, rt, strings.NewReader(mcpInput), &mcpOutput); err != nil {
 		t.Fatal(err)
@@ -1237,12 +1237,48 @@ func TestCheckPolicyMatchesExecBlind(t *testing.T) {
 			t.Fatalf("%s: decision %+v, exec error %v, want both to deny with %q", cause, d, err, want)
 		}
 	}
-	open := core.NewRuntime(t.TempDir(), "keychain", reg)
+	openHome := t.TempDir()
+	open := core.NewRuntime(openHome, "keychain", reg)
 	if d := open.CheckPolicy(dnsRead); !d.Allowed {
 		t.Fatalf("a missing policy.json must allow: %+v", d)
 	}
 	if res, err := open.ExecBlind(ctx, dnsRead); err != nil || res.ExitCode != 0 {
 		t.Fatalf("a missing policy.json must allow: res=%+v err=%v", res, err)
+	}
+
+	// An agent names at least one permission and no blank one: with none, GitHub and AWS mint all
+	// the installation or role holds. Request validation, so no rule, a rule that would deny it as
+	// "permission", and a paused home all deny it the same way, audited with exit 126, and nothing
+	// is minted. The CLI and the shims refuse an empty list themselves, so theirs reaches the gate.
+	agentPerms := func(perms []string) core.ExecRequest {
+		req := agentVault("")
+		req.Permissions = perms
+		return req
+	}
+	for _, c := range []struct {
+		rt   *core.Runtime
+		home string
+		req  core.ExecRequest
+		got  string
+	}{
+		{open, openHome, agentPerms(nil), `[]`},
+		{open, openHome, agentPerms([]string{}), `[]`},
+		{open, openHome, agentPerms([]string{" "}), `[" "]`},
+		{open, openHome, agentPerms([]string{"dns:read", ""}), `["dns:read" ""]`},
+		{rt, home, agentPerms(nil), `[]`},
+		{pausedRT, pausedHome, agentPerms(nil), `[]`},
+	} {
+		minted = -1
+		want := "policy denied: an agent must name at least one permission, and no blank one (got " + c.got + `); name what the command needs, or ["static"] for static mode`
+		d := c.rt.CheckPolicy(c.req)
+		_, err := c.rt.ExecBlind(ctx, c.req)
+		if e := lastAudit(t, c.home); d.Allowed || d.BlockedBy != "invalid_request" || d.Reason != want || err == nil || err.Error() != want ||
+			e.BlockedBy != "invalid_request" || e.ExitCode != 126 || e.Error != want || minted != -1 {
+			t.Fatalf("%+v: decision %+v, exec error %v, audit %+v, minted %d", c.req, d, err, e, minted)
+		}
+	}
+	if cliNone := probe("ok.com", nil, "true"); !open.CheckPolicy(cliNone).Allowed {
+		t.Fatalf("a request that is not an agent's reaches the rest of the gate: %+v", open.CheckPolicy(cliNone))
 	}
 
 	// Allowed: the listed installation mints, max_ttl_seconds caps the TTL (also an unset one),
@@ -3115,12 +3151,13 @@ func TestMintLeaseAndRelayClient(t *testing.T) {
 		},
 	}
 
-	// Static mode (even with allow_static:true in policy.json), vault override, and timeout override
-	// are denied locally on clientRT before calling checkFn, and on serverRT even when FromAgent is false.
+	// Static mode (even with allow_static:true in policy.json), vault override, timeout override,
+	// and an empty permission list are denied locally on clientRT before calling checkFn, and on serverRT even when FromAgent is false.
 	for _, bad := range []core.ExecRequest{
 		{MintRequest: core.MintRequest{Provider: "leased", Permissions: []string{"static"}}, Command: []string{"true"}},
-		{MintRequest: core.MintRequest{Provider: "leased"}, Vault: "other", Command: []string{"true"}},
-		{MintRequest: core.MintRequest{Provider: "leased"}, TimeoutSec: 15, Command: []string{"true"}},
+		{MintRequest: core.MintRequest{Provider: "leased", Permissions: []string{"read"}}, Vault: "other", Command: []string{"true"}},
+		{MintRequest: core.MintRequest{Provider: "leased", Permissions: []string{"read"}}, TimeoutSec: 15, Command: []string{"true"}},
+		{MintRequest: core.MintRequest{Provider: "leased"}, Command: []string{"true"}},
 	} {
 		before := checkCalls
 		if d := clientRT.CheckPolicy(bad); d.Allowed || checkCalls != before {
@@ -3137,7 +3174,7 @@ func TestMintLeaseAndRelayClient(t *testing.T) {
 	// Successful relay ExecBlind: strips MINTRUN_RELAY_TOKEN, scrubs lease secret, writes minted + done on server.
 	t.Setenv("MINTRUN_RELAY_TOKEN", "mr_dev_secret_token_value")
 	res, err := clientRT.ExecBlind(context.Background(), core.ExecRequest{
-		MintRequest: core.MintRequest{Provider: "leased", TTLSeconds: 300},
+		MintRequest: core.MintRequest{Provider: "leased", Permissions: []string{"read"}, TTLSeconds: 300},
 		Command:     []string{"sh", "-c", `printf "tok=%s" "$MINTRUN_RELAY_TOKEN"`},
 	})
 	if err != nil || res.ExitCode != 0 || !res.Revoked || revokes.Load() != 1 || res.Stdout != "tok=" {
@@ -3150,7 +3187,7 @@ func TestMintLeaseAndRelayClient(t *testing.T) {
 	// Denied human approval on server returns *RelayDenyError (exit 126 on client).
 	serverRT.ApprovalFunc = func(context.Context, core.ExecRequest) (bool, error) { return false, nil }
 	if _, err := clientRT.ExecBlind(context.Background(), core.ExecRequest{
-		MintRequest: core.MintRequest{Provider: "leased"},
+		MintRequest: core.MintRequest{Provider: "leased", Permissions: []string{"read"}},
 		Command:     []string{"true"},
 		Approve:     true,
 	}); err == nil || !strings.Contains(err.Error(), "denied") {
@@ -3162,7 +3199,7 @@ func TestMintLeaseAndRelayClient(t *testing.T) {
 
 	// Non-ephemeral lease ("probe" provider from probeRuntime) on RelayServer is refused and never returned.
 	if _, err := clientRT.ExecBlind(context.Background(), core.ExecRequest{
-		MintRequest: core.MintRequest{Provider: "probe"},
+		MintRequest: core.MintRequest{Provider: "probe", Permissions: []string{"read"}},
 		Command:     []string{"true"},
 	}); err == nil || strings.Contains(err.Error(), master) || !strings.Contains(err.Error(), "non-ephemeral or master-secret lease") {
 		t.Fatalf("expected non-ephemeral/master-leaking lease to be refused, got: %v", err)
