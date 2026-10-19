@@ -708,3 +708,39 @@ One background script ran both commands, one after the other, in a clean `git ar
 | Mutants | Each mutant compiles and fails a test on a copy | pass | **24/24 killed** after the unchanged copy passed (`line after Command:`, `line quoted`, `labels sorted`, `substring match for every word`, `substring match for rm`, `own URL flagged external`, `line dropped when none`, `none left out`, `bare -f flagged`, `no lowercasing`, `strings.ToLower`, `HasSuffix without the dot`, `parse error counts as own`, `purpose read too`, `first URL per field only`, `drop prefix removed`, `$( part removed`, `no split at spaces`, `u.Host for u.Hostname()`, `drop prefix without its space`, `github hosts for every provider`, `Hints above Device`, `delete and force rules swapped`, `parts as prefixes`) |
 | Coverage & Pipeline | `gofmt`, `go vet`, `> 90%` statement coverage, the build and smoke test, and the bidi and leak scans | pass | **94.7%** total (`cmd/mintrun` 94.5%, `internal/builtin` 93.7%, `internal/core` 96.4%; `ApprovalText`, `approvalHints`, and `externalURL` 100%); `gofmt -s -l .` empty; `go vet ./...` clean; `go build -trimpath -o mintrun ./cmd/mintrun && ./mintrun plugin list` lists all 7 built-ins; the bidi and control-character scan of the changed files (planted `chr(0x202E)` and ESC found) and the absolute-path and whole-word host-name scan of the added lines and both commit messages (planted controls found) report 0 hits, and no Go file gained a non-ASCII line |
 
+## Workstream AJ-6 — JEV Tests, Hermetic Proof and Mutants (2026-10-19)
+
+| step | requirement | verdict | evidence |
+|------|-------------|---------|----------|
+| AJ-6.1 | A test list that pins the client and the state builder | pass | `go test -count=1 -v -run 'TestJevClient|TestJevStateNeverCarriesSecrets' ./internal/builtin/` → `--- PASS: TestJevClient (0.72s)` with all 10 subtests `off`, `request`, `key`, `final`, `backoff`, `network`, `send_cap`, `malformed`, `on_error`, `route`, then `--- PASS: TestJevStateNeverCarriesSecrets (0.12s)`, `ok github.com/ninja-c9/mintrun/internal/builtin 1.323s`; the `malformed` subtest holds two replies that drop an answer id as well as truncated JSON, a wrong type, and a wrong range |
+| AJ-6.2 | Hermetic proof: a plain `go test ./...` sends no request, and a planted request is logged (rule 22) | pass | `git archive` copy in a temporary directory outside the checkout, its `jevAPI` repointed to a logging server on `127.0.0.1`: log cleared, then `go test -count=1 ./...` printed `ok cmd/mintrun 13.017s`, `ok internal/builtin 11.131s`, `ok internal/core 12.236s` and the log kept **0** lines; the planted `TestHermeticProbePositiveControl` (key `tsk_hermetic_probe_control_key_4a71`) passed and logged exactly **1** `POST /v1/systemone`; with the probe removed and the log cleared, a second plain run passed and logged **0** lines |
+| AJ-6.3 | Close the gap the mutant run exposed: no test sent a reply missing an answer id, so `valid` could stop checking the ids the questions name | pass | `jevReply.valid()` walks `jevQuestions`, so a reply lacking one of them must be `malformed`: the `malformed` table now starts with `missing("injected")` and `missing("severity")`, which unmarshal the good reply, delete one answer, and re-marshal it. Before the case, the mutant `valid: only check the answers the reply carries` survived; after it, the same mutant fails `TestJevClient` |
+| AJ-6.4 | Mutants on a copy, each compiled first, each killed, and the restored tree passing | pass | 23/23 killed, 0 survivors, 0 stale patterns; every mutant ran `go test -run '^$' ./internal/builtin/` before its test run, and the restored copy passed `go test -run TestJev` with rc=0 (`mutants=23 killed=23 survivors=0 bad=0`) |
+
+Every mutant compiled before it was judged, then failed one of the two tests:
+
+| mutant | verdict | evidence |
+|--------|---------|----------|
+| valid: accept any model name | killed | --- FAIL: TestJevClient (0.72s) |
+| valid: stop checking the score's confidence | killed | --- FAIL: TestJevClient (0.73s) |
+| valid: accept a score past the last criterion | killed | --- FAIL: TestJevClient (0.74s) |
+| valid: drop the upper bound on every number | killed | --- FAIL: TestJevClient (0.74s) |
+| valid: only check the answers the reply carries | killed | --- FAIL: TestJevClient (0.72s) |
+| route: max instead of min on the exfil pair | killed | --- FAIL: TestJevClient (0.74s) |
+| route: a label must be over ask_above, not at it | killed | --- FAIL: TestJevClient (0.74s) |
+| route: the exfil pair must be over deny_above, not at it | killed | --- FAIL: TestJevClient (0.73s) |
+| route: vague asks like every other label | killed | --- FAIL: TestJevClient (0.73s) |
+| route: the verdict carries no severity | killed | --- FAIL: TestJevClient (0.72s) |
+| route: a high verdict passes in mode deny | killed | --- FAIL: TestJevClient (0.73s) |
+| screen: no on_error deny branch | killed | --- FAIL: TestJevClient (0.72s) |
+| screen: no on_error pass branch | killed | --- FAIL: TestJevClient (0.71s) |
+| screen: the error is not wrapped in jev systemone: | killed | --- FAIL: TestJevClient (0.66s) |
+| screen: a body at the cap is refused | killed | --- FAIL: TestJevClient (0.73s) |
+| screen: the body cap is dropped | killed | --- FAIL: TestJevClient (0.74s) |
+| screen: the key is read on every request | killed | --- FAIL: TestJevClient (1.40s) |
+| screen: the error is scrubbed without the key | killed | --- FAIL: TestJevClient (0.74s) |
+| post: 529 is not retried | killed | --- FAIL: TestJevClient (0.53s) |
+| post: the backoff never doubles | killed | --- FAIL: TestJevClient (0.86s) |
+| post: the reply is read past 1 MiB | killed | --- FAIL: TestJevClient (0.73s) |
+| state: the purpose is sent unshortened | killed | --- FAIL: TestJevStateNeverCarriesSecrets (0.11s) |
+| state: argv is sent unshortened | killed | --- FAIL: TestJevStateNeverCarriesSecrets (0.11s) |

@@ -286,7 +286,22 @@ func TestJevClient(t *testing.T) {
 	t.Run("malformed", func(t *testing.T) {
 		screen := JevScreen(rt, JevConfig{Mode: "deny"})
 		ok := jevAnswer(nil, 0, 0.9)
+		// A reply that leaves out an answer the questions asked for is malformed, not a low risk.
+		missing := func(answer string) string {
+			var m map[string]any
+			if err := json.Unmarshal([]byte(ok), &m); err != nil {
+				t.Fatal(err)
+			}
+			delete(m["answers"].(map[string]any), answer)
+			b, err := json.Marshal(m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return string(b)
+		}
 		for _, reply := range []string{
+			missing("injected"),
+			missing("severity"),
 			strings.Replace(ok, `"model":"jev-1.13.0"`, `"model":"gpt-4"`, 1),
 			strings.Replace(ok, `"vague":`, `"vague2":`, 1),
 			strings.Replace(ok, `{"noul":0,`, `{"nul":0,`, 1),
