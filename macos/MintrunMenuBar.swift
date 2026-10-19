@@ -33,6 +33,9 @@ final class MintrunMenuBarDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var watchProcess: Process?
     private var baseURL: URL?
+    // dashboardURL is the URL mintrun watch printed, #token included; token goes on every request.
+    private var dashboardURL: URL?
+    private var token = ""
     private var pollTimer: Timer?
     private var lastState = WatchState(paused: false, approvals: [], active: [], audit: [])
     private var promptedTasks = Set<String>()
@@ -43,10 +46,8 @@ final class MintrunMenuBarDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.title = "🔒 mintrun"
         rebuildMenu()
 
-        if let envURL = ProcessInfo.processInfo.environment["MINTRUN_WATCH_URL"],
-           let url = URL(string: envURL) {
-            baseURL = url
-            startPolling()
+        if let envURL = ProcessInfo.processInfo.environment["MINTRUN_WATCH_URL"], !envURL.isEmpty {
+            connect(envURL)
         } else {
             startWatchSubprocess()
         }
@@ -89,15 +90,12 @@ final class MintrunMenuBarDelegate: NSObject, NSApplicationDelegate {
         outPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let line = String(data: data, encoding: .utf8) else { return }
-            if let range = line.range(of: "http://127.0.0.1:[0-9]+", options: .regularExpression) {
+            if let range = line.range(of: "http://127\\.0\\.0\\.1:[0-9]+/#[A-Z2-7]+", options: .regularExpression) {
                 let urlStr = String(line[range])
-                if let url = URL(string: urlStr) {
-                    DispatchQueue.main.async {
-                        self?.baseURL = url
-                        self?.startPolling()
-                    }
-                    handle.readabilityHandler = nil
+                DispatchQueue.main.async {
+                    self?.connect(urlStr)
                 }
+                handle.readabilityHandler = nil
             }
         }
 
@@ -109,6 +107,22 @@ final class MintrunMenuBarDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // connect takes http://127.0.0.1:<port>/#<token>. The token stays out of every request URL and
+    // goes in the X-Mintrun-Token header, which every /api/ route requires.
+    private func connect(_ raw: String) {
+        guard var parts = URLComponents(string: raw), let frag = parts.fragment, !frag.isEmpty,
+              let page = parts.url else {
+            FileHandle.standardError.write(Data("mintrun menu bar: the dashboard URL must end in the #token that mintrun watch prints\n".utf8))
+            statusItem.button?.title = "⚠️ mintrun"
+            return
+        }
+        parts.fragment = nil
+        token = frag
+        dashboardURL = page
+        baseURL = parts.url
+        startPolling()
+    }
+
     private func startPolling() {
         pollState()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.75, repeats: true) { [weak self] _ in
@@ -118,8 +132,9 @@ final class MintrunMenuBarDelegate: NSObject, NSApplicationDelegate {
 
     private func pollState() {
         guard let base = baseURL else { return }
-        let url = base.appendingPathComponent("api/state")
-        URLSession.shared.dataTask(with: url) { [weak self] data, _, err in
+        var req = URLRequest(url: base.appendingPathComponent("api/state"))
+        req.setValue(token, forHTTPHeaderField: "X-Mintrun-Token")
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, err in
             guard let self = self, err == nil, let data = data,
                   let state = try? JSONDecoder().decode(WatchState.self, from: data) else {
                 return
@@ -137,6 +152,7 @@ final class MintrunMenuBarDelegate: NSObject, NSApplicationDelegate {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("1", forHTTPHeaderField: "X-Mintrun-Watch")
+        req.setValue(token, forHTTPHeaderField: "X-Mintrun-Token")
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         URLSession.shared.dataTask(with: req) { [weak self] _, _, _ in
             DispatchQueue.main.async {
@@ -225,7 +241,7 @@ final class MintrunMenuBarDelegate: NSObject, NSApplicationDelegate {
         }
         menu.addItem(NSMenuItem.separator())
 
-        if baseURL != nil {
+        if dashboardURL != nil {
             let openItem = NSMenuItem(title: "Open Web Dashboard…", action: #selector(openDashboard), keyEquivalent: "d")
             openItem.target = self
             menu.addItem(openItem)
@@ -253,7 +269,7 @@ final class MintrunMenuBarDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openDashboard() {
-        guard let url = baseURL else { return }
+        guard let url = dashboardURL else { return }
         NSWorkspace.shared.open(url)
     }
 

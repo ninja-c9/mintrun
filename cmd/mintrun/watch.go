@@ -64,7 +64,8 @@ func cmdWatch(ctx context.Context, rt *core.Runtime, args []string) {
 		go func() {
 			_ = httpSrv.Serve(httpLn)
 		}()
-		fmt.Printf("mintrun watch listening on app.sock (dashboard: http://%s)\n", httpLn.Addr().String())
+		// The token rides in the #fragment, which a browser never sends to a server.
+		fmt.Printf("mintrun watch listening on app.sock (dashboard: %s)\n", srv.DashboardURL(httpLn.Addr().String()))
 	} else {
 		fmt.Println("mintrun watch listening on app.sock")
 	}

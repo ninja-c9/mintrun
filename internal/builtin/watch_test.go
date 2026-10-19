@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -62,7 +63,39 @@ func TestWatchServer(t *testing.T) {
 	httpSrv := httptest.NewServer(srv)
 	defer httpSrv.Close()
 
-	// 1. GET / serves dashboard HTML with security headers.
+	// The dashboard token is a secret only the printed URL carries, and every
+	// request must name the loopback address it arrived on in Host.
+	token := srv.Token
+	host := strings.TrimPrefix(httpSrv.URL, "http://")
+
+	// watchErr builds a request that would pass every guard, so a case can
+	// drop or change exactly one of them.
+	watchErr := func(method, path, body string) *http.Response {
+		t.Helper()
+		var rdr io.Reader
+		if body != "" {
+			rdr = strings.NewReader(body)
+		}
+		req, err := http.NewRequest(method, httpSrv.URL+path, rdr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = host
+		req.Header.Set("X-Mintrun-Token", token)
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Mintrun-Watch", "1")
+		}
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+
+	// 1. GET / serves dashboard HTML with security headers, without a token:
+	// a browser page load cannot send a custom header, and the page only holds
+	// the fragment the printed URL carries.
 	resp, err := http.Get(httpSrv.URL + "/")
 	if err != nil {
 		t.Fatal(err)
@@ -78,7 +111,9 @@ func TestWatchServer(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		req.Host = host
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Mintrun-Token", token)
 		if withHeader {
 			req.Header.Set("X-Mintrun-Watch", "1")
 		}
@@ -91,10 +126,7 @@ func TestWatchServer(t *testing.T) {
 
 	getState := func() WatchState {
 		t.Helper()
-		r, err := http.Get(httpSrv.URL + "/api/state")
-		if err != nil {
-			t.Fatal(err)
-		}
+		r := watchErr(http.MethodGet, "/api/state", "")
 		defer r.Body.Close()
 		var st WatchState
 		if err := json.NewDecoder(r.Body).Decode(&st); err != nil {
@@ -103,12 +135,118 @@ func TestWatchServer(t *testing.T) {
 		return st
 	}
 
+	// wantRefusal drains a response and pins its exact 403 body.
+	wantRefusal := func(what string, r *http.Response, want string) {
+		t.Helper()
+		body, err := io.ReadAll(r.Body)
+		r.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.StatusCode != http.StatusForbidden || string(body) != want+"\n" {
+			t.Fatalf("%s: status=%d body=%q, want 403 %q", what, r.StatusCode, body, want+"\n")
+		}
+	}
+
+	// 1b. The guards refuse in order: a Host that is not the loopback address
+	// this request arrived on is refused before the token is even read.
+	rebound, err := http.NewRequest(http.MethodGet, httpSrv.URL+"/api/state", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebound.Host = "dashboard.example.com"
+	rebound.Header.Set("X-Mintrun-Token", token)
+	reboundResp, err := http.DefaultClient.Do(rebound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRefusal("rebound Host", reboundResp, `{"error":"forbidden Host header"}`)
+
+	// A client fills an empty Host from the URL, so the forms a served request
+	// can never take are pinned against loopbackHost itself.
+	local := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080}
+	for _, c := range []struct {
+		host string
+		want bool
+	}{
+		{"127.0.0.1:8080", true},
+		{"[::1]:8080", true},
+		{"localhost:8080", true},
+		{"", false},
+		{"127.0.0.1", false},
+		{"127.0.0.1:1", false},
+		{"dashboard.example.com:8080", false},
+		{"localhost.evil.example:8080", false},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
+		req.Host = c.host
+		req = req.WithContext(context.WithValue(req.Context(), http.LocalAddrContextKey, local))
+		if got := loopbackHost(req); got != c.want {
+			t.Fatalf("loopbackHost(%q)=%v, want %v", c.host, got, c.want)
+		}
+	}
+
+	// 1c. Every /api/ request must carry the token, and a wrong one is refused
+	// exactly like a missing one.
+	noToken, err := http.NewRequest(http.MethodGet, httpSrv.URL+"/api/state", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noToken.Host = host
+	noTokenResp, err := http.DefaultClient.Do(noToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRefusal("missing token", noTokenResp, `{"error":"missing or wrong X-Mintrun-Token header"}`)
+
+	wrongToken, err := http.NewRequest(http.MethodGet, httpSrv.URL+"/api/state", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongToken.Host = host
+	wrongToken.Header.Set("X-Mintrun-Token", token+"x")
+	wrongTokenResp, err := http.DefaultClient.Do(wrongToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRefusal("wrong token", wrongTokenResp, `{"error":"missing or wrong X-Mintrun-Token header"}`)
+
+	// A token alone does not lift the CSRF guard: a GET needs none, but a POST
+	// still needs X-Mintrun-Watch: 1.
+	if r := watchErr(http.MethodGet, "/api/state", ""); r.StatusCode != http.StatusOK {
+		r.Body.Close()
+		t.Fatalf("GET /api/state with token: got %d, want 200", r.StatusCode)
+	} else {
+		r.Body.Close()
+	}
+
+	// An empty Token refuses every /api/ request, so a server built without
+	// NewWatchServer's secret never exposes the API.
+	{
+		bare := &WatchServer{rt: rt, Out: &logBuf}
+		bareSrv := httptest.NewServer(bare)
+		bareURL := bareSrv.URL
+		req, err := http.NewRequest(http.MethodGet, bareURL+"/api/state", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = strings.TrimPrefix(bareURL, "http://")
+		req.Header.Set("X-Mintrun-Token", "")
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			bareSrv.Close()
+			t.Fatal(err)
+		}
+		wantRefusal("empty Token", r, `{"error":"missing or wrong X-Mintrun-Token header"}`)
+		bareSrv.Close()
+	}
+
 	// 2. CSRF protection: POST without X-Mintrun-Watch: 1 returns 403 Forbidden.
 	if r := postWatch("/api/pause", `{"paused":true}`, false); r.StatusCode != http.StatusForbidden {
 		r.Body.Close()
 		t.Fatalf("expected 403 without X-Mintrun-Watch header, got %d", r.StatusCode)
 	} else {
-		r.Body.Close()
+		wantRefusal("POST without X-Mintrun-Watch", r, `{"error":"missing X-Mintrun-Watch header"}`)
 	}
 
 	// 3. Pause / Resume toggle via POST /api/pause.
@@ -249,13 +387,20 @@ func TestWatchServer(t *testing.T) {
 			t.Fatalf("POST %s (%s): status=%d, want %d", c.path, c.body, r.StatusCode, c.code)
 		}
 	}
-	if r, err := http.Get(httpSrv.URL + "/unknown"); err != nil {
+	// A GET is not token-checked, but the Host header still has to name the
+	// loopback address the request arrived on, so this one carries it too.
+	unknownReq, err := http.NewRequest(http.MethodGet, httpSrv.URL+"/unknown", nil)
+	if err != nil {
 		t.Fatal(err)
-	} else {
-		r.Body.Close()
-		if r.StatusCode != http.StatusNotFound {
-			t.Fatalf("GET /unknown status=%d", r.StatusCode)
-		}
+	}
+	unknownReq.Host = host
+	unknownRes, err := http.DefaultClient.Do(unknownReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknownRes.Body.Close()
+	if unknownRes.StatusCode != http.StatusNotFound {
+		t.Fatalf("GET /unknown status=%d", unknownRes.StatusCode)
 	}
 
 	// Send malformed / unsupported lines over app.sock to verify handleConn ignores them cleanly.

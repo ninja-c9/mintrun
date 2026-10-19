@@ -882,6 +882,7 @@ New tests stay hermetic (rule 22): a plain `go test ./...` makes zero real `sand
 | 3 | **AG** — Per-device rate limiting & concurrent lease cap on `mintrun relay serve` | `[SERIAL]` | ✅ Done (`v0.14.0`) |
 | 4 | **AH** — `app.sock` Menu Bar (`macos/MintrunMenuBar.swift`) & `mintrun watch` controller | `[SERIAL]` | ✅ Done (`v0.14.0`) |
 | 5 | **AI** — Live-check runbook execution (`gh` in sandbox, real Keychain / IDE / Linux amd64 checks) | `[SERIAL]` | ✅ Done (`v0.14.0`) |
+| 6 | **AH-2** — `mintrun watch` dashboard token guard (loopback `Host` check + token in the URL `#fragment`) | `[SERIAL]`, after AH | ✅ Done (`v0.14.0`) |
 
 ### AF-1 — `TailAudit` Reverse-Chunk Seeker
 
@@ -944,4 +945,16 @@ New tests stay hermetic (rule 22): a plain `go test ./...` makes zero real `sand
      - Probe 2: `go test -tags integration -count=1 -v ./internal/core ./internal/builtin` on macOS 27.0 (`TestSandboxHidesHome`, `TestSandboxHidesKeychainItem`, `TestSandboxBlocksNetwork`, `TestKeychainVaultRealKeychain`).
      - Probe 3: `gh auth status` inside the `mintrun` macOS sandbox (`sandbox-exec`) confirming `~/Library/Keychains` and Security Mach services are blocked (`open ~/.config/gh/hosts.yml` works while Keychain token lookup fails unless `GH_TOKEN` is injected via `Lease.Env`).
      - Probe 4: `GOOS=linux GOARCH=amd64` and `GOOS=linux GOARCH=arm64` integration tests (`TestSandboxHidesHome`, `TestSandboxBlocksNetwork`) inside privileged Linux containers (`golang:1.24-bookworm`).
+
+### AH-2 — `mintrun watch` Dashboard Token Guard
+
+- **Files:** `internal/builtin/watch.go`, `internal/builtin/watch_test.go`, `cmd/mintrun/watch.go`, `cmd/mintrun/watch_test.go`, `macos/MintrunMenuBar.swift`, `macos/README.md`, `README.md`, `docs/threat-model.md`, `AGENTS.md` (rule 48 and the new rule 51), `checks.md`, `progress.md`.
+- **Deliverables:**
+  1. `[SERIAL]` `(*WatchServer).DashboardURL(addr string) string` (`internal/builtin/watch.go`) is the only place the dashboard URL is built: it returns `http://<addr>/#<token>`, so the banner `cmd/mintrun/watch.go` prints, the macOS menu bar's parser, and `TestWatchDashboardBanner` cannot drift. `ServeHTTP` refuses any `Host` that is not the loopback address and port it listens on, before the `/api/` token check (`X-Mintrun-Token`, `subtle.ConstantTimeCompare`) and the `X-Mintrun-Watch: 1` check on every mutating `POST`; `GET /` stays tokenless because a page load cannot set a header, and the page it serves reads the token from `location.hash`.
+  2. `[SERIAL]` `TestWatchDashboardBanner` (`cmd/mintrun/watch_test.go`) runs the real `cmdWatch` through `capture`, matches the printed banner against `^http://127\.0\.0\.1:[0-9]+/#([A-Z2-7]+)$`, then sends the captured token to the live `/api/state` (`200`) and none and `<token>x` (`403`). `TestWatchServer` pins the `loopbackHost` table and both header refusals; `TestCLIWatch` still pins the usage text and the non-loopback `-http` refusal.
+  3. `[SERIAL]` `docs/threat-model.md` §Approval, `AGENTS.md` rules 48 and 51, `README.md`, and `macos/README.md` describe this guard and its limits (a local user who reads the terminal or `mintrun`'s memory still has the token; the menu bar's "open dashboard" opens the fragment-less URL, so it shows the refusal).
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestWatchServer|TestWatchDashboardBanner|TestCLIWatch' ./internal/builtin ./cmd/mintrun
+  ```
 

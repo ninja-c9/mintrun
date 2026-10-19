@@ -525,3 +525,20 @@
   - Luật 47 ghi tên thiết bị là `^[a-z0-9][a-z0-9._-]{0,62}$`, nhưng `validDeviceName` nhận 1 đến 64 chữ cái (cả chữ hoa), chữ số, `.`, `_` và `-`, trừ `.` và `..`.
   - `TestCLIApps` chỉ kiểm `CLAUDE_CONFIG_DIR` với `status`, dù comment phía trên nhắc cả `connect` và `disconnect`.
 - **Next step:** Người dùng quyết định push `main` và tag `v0.14.0`.
+
+## Checkpoint — AH-2: token trong `#fragment` và kiểm tra `Host` loopback (2026-10-19)
+
+- **Hoàn thành:** Gia cố bảng điều khiển của `mintrun watch` (nhánh `claude/watch-token-guard`) theo mục AH-2 trong [plan.md](plan.md) §6:
+  - **Token rời khỏi header, vào `#fragment`:** `(*WatchServer).DashboardURL` là nơi duy nhất dựng `http://<addr>/#<token>`; `cmd/mintrun/watch.go` chỉ in đúng dòng đó, và token nằm sau `#` nên trình duyệt không bao giờ gửi nó tới server (không lộ qua request line, `Referer`, hay log). Trang dashboard đọc token bằng `location.hash.slice(1)` và gửi `X-Mintrun-Token` trên mọi request `/api/`; POST vẫn giữ thêm `X-Mintrun-Watch: 1`. Trang không dùng `localStorage`, `sessionStorage`, hay `document.cookie`.
+  - **Chặn `Host` không phải loopback:** `ServeHTTP` từ chối trước cả hai phép kiểm kia khi `Host` không đúng địa chỉ và cổng server đang lắng nghe (`127.0.0.1:<port>`, `[::1]:<port>`, `localhost:<port>`, cổng lấy từ `http.LocalAddrContextKey`), trả HTTP 403 `{"error":"forbidden Host header"}`. Đây là thứ chặn một trang bị DNS-rebinding trỏ về `127.0.0.1` nhưng mang `Host` lạ.
+  - **Kiểm token hằng thời gian:** mọi request `/api/` phải mang `X-Mintrun-Token` khớp (so sánh `crypto/subtle`); server không có token thì từ chối tất cả. `GET /` vẫn không cần token vì một lần mở trang của trình duyệt không gửi được header tùy biến, và trang tự chứng minh token bằng `GET /api/state` đầu tiên.
+  - **Ứng dụng thanh menu:** `connect` đòi URL phải có `#fragment` không rỗng (nếu không in `mintrun menu bar: the dashboard URL must end in the #token that mintrun watch prints`), tách token khỏi URL, gửi nó qua header, và `openDashboard()` mở URL đã bỏ fragment nên thanh menu không bao giờ mang token đi như banner in ra.
+  - **Tài liệu:** `docs/threat-model.md` dòng 111 viết lại (bỏ hẳn khẳng định cũ "không kiểm `Host` … chưa được test"), `README.md`, `macos/README.md`, `AGENTS.md` (luật 48 viết lại, thêm luật 51, luật 51 cũ thành 52), `plan.md` (hàng AH-2 ở §6 và mục `### AH-2`).
+- **Outputs:** `internal/builtin/watch.go`, `internal/builtin/watch_test.go`, `cmd/mintrun/watch.go`, `cmd/mintrun/watch_test.go` (mới), `macos/MintrunMenuBar.swift`, `macos/README.md`, `README.md`, `docs/threat-model.md`, `AGENTS.md`, `plan.md`, `checks.md`, `progress.md`.
+- **Kiểm chứng:** `scripts/verify.sh` toàn bộ `pass`, coverage tổng `94.7% > 90%` (`cmd/mintrun` 94.6%, `internal/builtin` 93.8%, `internal/core` 96.3%), binary `5a0e4579e2c8+dirty (go1.26.2, darwin/arm64)`; bước kiểm tra chạy đúng nguyên văn với `-v` cho `--- PASS: TestWatchServer (0.02s)`, `--- PASS: TestCLIWatch (0.02s)`, `--- PASS: TestWatchDashboardBanner (0.00s)`; **6/6 mutant** của `internal/builtin/watch.go` và **3/3 mutant** của banner `cmd/mintrun/watch.go` bị giết trên bản sao (mutant bỏ banner chỉ bị giết nhờ timeout 600 s của package); script kiểm chứng trích dẫn tài liệu bắt 4/4 mẫu cài sẵn rồi `PASS` cả bốn tệp.
+- **Chưa kiểm chứng:** Chưa mở bảng điều khiển bằng trình duyệt thật và chưa chạy ứng dụng thanh menu trên máy thật với URL do `watch` in ra; mới chỉ có test HTTP trong Go và đọc mã Swift.
+- **Vấn đề mở:**
+  - Bất kỳ người dùng hay chương trình cục bộ nào đọc được URL in ra, terminal, hoặc bộ nhớ của `mintrun` đều có token; thứ duy nhất chặn trang bị rebinding là phép kiểm `Host` loopback.
+  - Chạy `mintrun watch` trên máy dùng chung vẫn không an toàn; `-http ''` tắt hẳn bảng điều khiển.
+  - "Open dashboard" trên thanh menu mở trang không có fragment nên trang hiện thông báo từ chối, đúng như thiết kế nhưng dễ gây hiểu lầm.
+- **Next step:** Commit nhánh `claude/watch-token-guard`, rồi hợp nhất vào `main` (sau khi hoàn tất nhánh JEV và các nhánh còn lại), chạy lại toàn bộ acceptance trên `main`.

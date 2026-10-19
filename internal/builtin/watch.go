@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"cmp"
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,11 +49,15 @@ type WatchState struct {
 }
 
 // WatchServer listens on <home>/app.sock and serves the local HTTP control plane and web UI.
-// All POST /api/* endpoints require the X-Mintrun-Watch: 1 header so cross-origin browser pages
-// cannot forge requests via simple no-cors POSTs.
+// Every HTTP request must name the loopback address it arrived on in Host, so a page that
+// rebinds its DNS name to 127.0.0.1 is refused. Every /api/ request must carry Token in
+// X-Mintrun-Token, so another user on the machine, who can reach the port but cannot read the
+// URL watch prints, is refused. Every POST also needs X-Mintrun-Watch: 1.
 type WatchServer struct {
-	rt        *core.Runtime
-	Out       io.Writer
+	rt  *core.Runtime
+	Out io.Writer
+	// Token is this run's secret, set by NewWatchServer. An empty Token refuses every /api/ request.
+	Token     string
 	mu        sync.Mutex
 	ln        net.Listener
 	sockPath  string
@@ -63,9 +70,17 @@ func NewWatchServer(rt *core.Runtime) *WatchServer {
 	return &WatchServer{
 		rt:        rt,
 		Out:       io.Discard,
+		Token:     rand.Text(),
 		approvals: make(map[string]*WatchApproval),
 		active:    make(map[string]*WatchActiveTask),
 	}
+}
+
+// DashboardURL is the exact URL the operator must open: the dashboard on addr with this run's
+// token in the #fragment, which a browser never sends to a server. Anything that reads the URL
+// (the `mintrun watch` banner, the macOS menu bar app) must use this shape, and nothing else.
+func (s *WatchServer) DashboardURL(addr string) string {
+	return fmt.Sprintf("http://%s/#%s", addr, s.Token)
 }
 
 func watchCause(err error) error {
@@ -344,9 +359,34 @@ func (s *WatchServer) State() WatchState {
 	}
 }
 
+// loopbackHost reports whether r's Host is 127.0.0.1, [::1], or localhost with the port r arrived on.
+func loopbackHost(r *http.Request) bool {
+	addr, ok := r.Context().Value(http.LocalAddrContextKey).(*net.TCPAddr)
+	if !ok {
+		return false
+	}
+	port := strconv.Itoa(addr.Port)
+	switch r.Host {
+	case "127.0.0.1:" + port, "[::1]:" + port, "localhost:" + port:
+		return true
+	}
+	return false
+}
+
 func (s *WatchServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'")
+	if !loopbackHost(r) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden Host header"})
+		return
+	}
+	// GET / serves only the static page, which a browser loads before it can send a header; the
+	// page reads the token from the URL's #fragment, which never reaches the server.
+	if strings.HasPrefix(r.URL.Path, "/api/") &&
+		(s.Token == "" || subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Mintrun-Token")), []byte(s.Token)) != 1) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "missing or wrong X-Mintrun-Token header"})
+		return
+	}
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/":
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -433,15 +473,20 @@ const watchDashboardHTML = `<!doctype html>
 <h2>Recent Audit Log</h2>
 <div id="audit"></div>
 <script>
+const token = location.hash.slice(1);
 async function post(path, body) {
-  await fetch(path, {method:'POST', headers:{'Content-Type':'application/json','X-Mintrun-Watch':'1'}, body:JSON.stringify(body)});
+  await fetch(path, {method:'POST', headers:{'Content-Type':'application/json','X-Mintrun-Watch':'1','X-Mintrun-Token':token}, body:JSON.stringify(body)});
   await refresh();
 }
 function esc(s) {
   return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 async function refresh() {
-  const r = await fetch('/api/state');
+  const r = await fetch('/api/state', {headers:{'X-Mintrun-Token':token}});
+  if (!r.ok) {
+    document.getElementById('pause-box').textContent = 'Refused: open the whole URL mintrun watch printed, #token included.';
+    return;
+  }
   const s = await r.json();
   document.getElementById('pause-box').innerHTML = s.paused
     ? '<span class="badge badge-paused">PAUSED</span> <button class="btn-allow" onclick="post(\'/api/pause\',{paused:false})">Resume</button>'
