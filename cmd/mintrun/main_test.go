@@ -245,7 +245,7 @@ func TestCLISubcommandsEndToEnd(t *testing.T) {
 	if code, exited := runMainWithArgs(t, "", "run", "-provider", "cloudflare", "-perms", "static", "echo", "no-dash-sep"); !exited || code != 0 {
 		t.Fatalf("expected exit 0 on run without --, got code=%d exited=%v", code, exited)
 	}
-	if code, exited := runMainWithArgs(t, "", "exec", "-provider", "unknown_prov", "--", "echo", "fail"); !exited || code != 1 {
+	if code, exited := runMainWithArgs(t, "", "exec", "-provider", "unknown_prov", "-perms", "static", "--", "echo", "fail"); !exited || code != 1 {
 		t.Fatal("expected exit 1 on unknown provider")
 	}
 	// -clean-env strips ambient host variables but keeps PATH and the lease credential.
@@ -975,7 +975,7 @@ func TestCLIExecRequiresProvider(t *testing.T) {
 		{"exec", "-provider", "", "-perms", "static", "--", "touch", ran},
 	} {
 		r := runCLI(t, "", nil, args...)
-		if !r.exited || r.code != 1 || r.err != "usage: mintrun exec -provider <type>[@<account>] -scope <scope> -- <command> [args...]\n" {
+		if !r.exited || r.code != 1 || r.err != execUsage {
 			t.Errorf("%q: code %d, exited %v, err %q", args, r.code, r.exited, r.err)
 		}
 	}
@@ -983,6 +983,45 @@ func TestCLIExecRequiresProvider(t *testing.T) {
 		if _, err := os.Stat(p); !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("a usage error left %s behind: %v", filepath.Base(p), err)
 		}
+	}
+}
+
+const execUsage = "usage: mintrun exec -provider <type>[@<account>] -scope <scope> -perms <perm,...|static> -- <command> [args...]\n"
+
+// TestCLIExecRequiresPerms: exec has no default permissions since v0.16.0, because an empty list
+// mints GitHub and AWS credentials with everything the installation or role holds. A run whose
+// -perms is missing or holds no permission is a usage error that runs nothing and writes no audit entry.
+func TestCLIExecRequiresPerms(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MINTRUN_HOME", home)
+	t.Setenv("MINTRUN_FILE_VAULT", "1")
+	t.Setenv("MINTRUN_VAULT", "keychain")
+	writeFile(t, filepath.Join(home, "policy.json"), `{"cloudflare":{"allow_static":true}}`)
+	setSecret(t, "cloudflare", "cf_default_secret")
+	ran := filepath.Join(home, "ran")
+	for _, args := range [][]string{
+		{"exec", "-provider", "github", "--", "touch", ran},
+		{"run", "-provider", "github", "touch", ran},
+		{"exec", "-provider", "github", "-perms", "", "--", "touch", ran},
+		{"exec", "-provider", "github", "-perms", " , ,", "--", "touch", ran},
+		{"exec", "-provider", "cloudflare", "-scope", "example.com", "--", "touch", ran},
+	} {
+		r := runCLI(t, "", nil, args...)
+		if !r.exited || r.code != 1 || r.err != execUsage {
+			t.Errorf("%q: code %d, exited %v, err %q", args, r.code, r.exited, r.err)
+		}
+	}
+	for _, p := range []string{ran, filepath.Join(home, "audit.jsonl")} {
+		if _, err := os.Stat(p); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("a usage error left %s behind: %v", filepath.Base(p), err)
+		}
+	}
+	// Positive control: the same run with a permission, padded by empty entries, runs.
+	if r := runCLI(t, "", nil, "exec", "-provider", "cloudflare", "-perms", " static ,", "--", "touch", ran); !r.exited || r.code != 0 {
+		t.Fatalf("exec -perms static: %+v", r)
+	}
+	if _, err := os.Stat(ran); err != nil {
+		t.Fatalf("exec -perms static ran nothing: %v", err)
 	}
 }
 
@@ -1073,7 +1112,7 @@ func TestCLIRelay(t *testing.T) {
 	}
 	t.Setenv("MINTRUN_HOME", clientHome)
 	setSecret(t, "relay", devToken) // store device token in client's default vault under key "relay"
-	execOut := runCLI(t, "", nil, "exec", "-relay", relayURL, "-provider", "cli-relay-prov", "-scope", "zone1", "--", "sh", "-c", `printf "val=%s" "$CLI_RELAY_TOKEN"`)
+	execOut := runCLI(t, "", nil, "exec", "-relay", relayURL, "-provider", "cli-relay-prov", "-scope", "zone1", "-perms", "dns:write", "--", "sh", "-c", `printf "val=%s" "$CLI_RELAY_TOKEN"`)
 	if !execOut.exited || execOut.code != 0 || execOut.out != "val=[MINTRUN:REDACTED]" {
 		srvCancel()
 		t.Fatalf("exec -relay failed: %+v", execOut)
@@ -1082,7 +1121,7 @@ func TestCLIRelay(t *testing.T) {
 	// Also verify MINTRUN_RELAY + MINTRUN_RELAY_TOKEN env wiring through bootRuntime.
 	t.Setenv("MINTRUN_RELAY", relayURL)
 	t.Setenv("MINTRUN_RELAY_TOKEN", devToken)
-	if r := runCLI(t, "", nil, "exec", "-provider", "cli-relay-prov", "-scope", "zone1", "--", "true"); !r.exited || r.code != 0 {
+	if r := runCLI(t, "", nil, "exec", "-provider", "cli-relay-prov", "-scope", "zone1", "-perms", "dns:write", "--", "true"); !r.exited || r.code != 0 {
 		srvCancel()
 		t.Fatalf("exec with MINTRUN_RELAY failed: %+v", r)
 	}

@@ -26,7 +26,7 @@ Stores each master secret as a secure note named `mintrun/<key>` in your persona
 ```bash
 export BW_SESSION="$(bw unlock --raw)"     # after bw login
 MINTRUN_VAULT=bitwarden mintrun secret set cloudflare
-mintrun exec -vault bitwarden -provider cloudflare -scope example.com -clean-env -- npx wrangler deploy
+mintrun exec -vault bitwarden -provider cloudflare -scope example.com -perms dns:write,workers:write -clean-env -- npx wrangler deploy
 ```
 
 - `MINTRUN_VAULT=bitwarden` makes it the default vault for `secret` and `exec`; `-vault bitwarden` picks it for one `exec`.
@@ -41,11 +41,11 @@ The master secret is a Vercel access token. Each `exec` creates a token that exp
 
 ```bash
 mintrun secret set vercel
-mintrun exec -provider vercel -scope team_abc/prj_def -ttl 900 -- npx vercel deploy --prod
+mintrun exec -provider vercel -scope team_abc/prj_def -perms deploy -ttl 900 -- npx vercel deploy --prod
 ```
 
 - `-scope` is empty, `<project_id>`, or `<team_id>/<project_id>`. A project ID limits the new token to that project; a team ID creates it in that team.
-- `-perms` is ignored.
+- The plugin ignores permissions, but `mintrun exec` requires `-perms`: name what the command does (`deploy`), and pin it with `allowed_permissions` in `policy.json`.
 - The lease ID is the new token's ID. Revoke refuses the ID `current`, which would delete the master token.
 - `VERCEL_API_BASE` exists for the tests and accepts only `http://127.0.0.1:<port>`.
 
@@ -66,7 +66,7 @@ Store the minting role's URL, `postgres://mintrun_minter:<password>@<host>:5432/
 
 ```bash
 mintrun secret set postgres-jit
-mintrun exec -provider postgres-jit -scope app_readonly -ttl 300 -- sh -c 'psql "$DATABASE_URL" -c "select count(*) from orders"'
+mintrun exec -provider postgres-jit -scope app_readonly -perms login -ttl 300 -- sh -c 'psql "$DATABASE_URL" -c "select count(*) from orders"'
 ```
 
 Pin the groups in `~/.mintrun/policy.json`, because an agent picks `-scope` over MCP:
@@ -77,6 +77,7 @@ Pin the groups in `~/.mintrun/policy.json`, because an agent picks `-scope` over
 
 - **The minting role:** it needs `CREATEROLE` and `ADMIN OPTION` on each group agents may join. The plugin refuses a superuser, and any group the minting role holds no `ADMIN OPTION` on. PostgreSQL 15 and older let a `CREATEROLE` role grant any role but a superuser, so there this check is the only limit besides the policy.
 - **Group names** are lowercase, cannot start with `pg_`, and cannot hold `$`.
+- **Permissions:** the plugin ignores them, but `mintrun exec` requires `-perms`: `login` names what the role does, and `allowed_permissions` in `policy.json` can pin it.
 - **The command gets only `DATABASE_URL`.** `mintrun` removes every lease env value and the lease ID from the command's output. A separate `PGPORT=5432` would turn every `5432` in query results into `[MINTRUN:REDACTED]`. The role name is the lease ID: the audit log and the MCP result show it, and the command's output shows `[MINTRUN:REDACTED]` in its place.
 - **The password** reaches the server only as a SCRAM-SHA-256 verifier, so no statement log holds it.
 - **Revoke** stops the role from logging in, ends its open sessions, gives what it created to the minting role, and drops it. `VALID UNTIL` alone would only block new logins. Objects the role created in another database stay, so `DROP ROLE` fails and the role remains, unable to log in; the lease then reports `revoked: false`.

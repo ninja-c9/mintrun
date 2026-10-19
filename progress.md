@@ -642,5 +642,16 @@
 - **Phát hiện khi chạy tay (đã sửa):** `doctor` in `no provider has a master secret yet` dù `github@work` đã được lưu, vì `doctor` chỉ kiểm một tài khoản khi `policy.json` hoặc shim config nhắc tới nó. Câu cảnh báo giờ nói đúng điều đó, `TestCLIDoctor` pin nó, và 11 mutant `doctor` chạy lại đều bị giết.
 - **Còn lại:**
   - `docs/video/mintrun-intro.html` vẫn in `mintrun exec -- wrangler deploy` và `mintrun exec -- printenv`, giờ sẽ dừng vì thiếu `-provider`; video mp4 không dựng lại được ở đây.
-  - Mặc định `-perms dns:write,workers:write` là của Cloudflare nhưng áp cho mọi provider được gọi; đổi nó là một thay đổi phá vỡ nữa, cần người dùng quyết.
+  - Mặc định `-perms dns:write,workers:write` là của Cloudflare nhưng áp cho mọi provider được gọi; đổi nó là một thay đổi phá vỡ nữa, cần người dùng quyết. (Đã làm ở Workstream AL bên dưới: `-perms` giờ bắt buộc.)
   - Commit chỉ nằm trên nhánh `claude/trusting-jackson-813706`: chưa merge, chưa tag `v0.16.0`, chưa push.
+
+## Checkpoint — `mintrun exec` bắt buộc `-perms` (Workstream AL, 2026-10-19)
+
+- **Hoàn thành:** `mintrun exec` không còn mặc định `-perms dns:write,workers:write` (vốn là quyền của Cloudflare nhưng áp cho mọi provider). Thiếu `-perms`, hoặc `-perms` không nêu quyền nào (`""`, `" , ,"`, một `"$PERMS"` chưa đặt), là lỗi usage, exit 1, không mint, không chạy, không ghi audit. `-perms static` vẫn là cách xin static mode.
+- **Lý do chọn bắt buộc thay vì mặc định theo provider:** danh sách rỗng mở rộng quyền (GitHub cấp mọi quyền của installation, AWS mọi quyền của role), nên không có mặc định nào an toàn cho mọi provider, và một bảng mặc định theo provider phải theo kịp từng plugin.
+- **Thay đổi phá vỡ (`v0.16.0`):** ghi chung vào ghi chú `Breaking changes in v0.16.0` của README cùng `-provider`; luật 56 cập nhật dòng usage, luật 57 mới.
+- **Kiểm chứng:** `scripts/verify.sh` 5/5 pass, coverage 95.1%; 6/6 mutant trên bản copy bị giết; chạy tay trong home tạm với `MINTRUN_FILE_VAULT=1` đúng như tài liệu.
+- **Còn lại:**
+  - MCP `mintrun_exec` và shim `aws`, `vercel`, `psql` ở chế độ `auto` không cấu hình quyền vẫn có thể gửi danh sách rỗng (đã ghi vào giới hạn của threat model); với `aws` đó là mọi quyền của role.
+  - `docs/video/mintrun-intro.html` vẫn in `mintrun exec` không có `-perms` (phiên video sở hữu file này).
+  - Commit chỉ nằm trên `claude/modest-greider-67684e`: chưa merge, chưa tag `v0.16.0`, chưa push.

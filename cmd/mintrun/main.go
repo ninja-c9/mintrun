@@ -251,7 +251,7 @@ func cmdExec(ctx context.Context, rt *core.Runtime, args []string) {
 	fs := flag.NewFlagSet("exec", flag.ExitOnError)
 	provider := fs.String("provider", "", "Provider as type[@account] (e.g. github or github@work), required")
 	scope := fs.String("scope", "", "Target resource scope (e.g. domain 'example.com' or repo 'owner/repo')")
-	perms := fs.String("perms", "dns:write,workers:write", "Comma-separated permissions (or 'static')")
+	perms := fs.String("perms", "", "Comma-separated permissions (or 'static'), required")
 	vault := fs.String("vault", "", "Vault plugin override (default: keychain, or 1password)")
 	ttl := fs.Int("ttl", 600, "Ephemeral token TTL in seconds")
 	cwd := fs.String("cwd", "", "Working directory for command")
@@ -278,19 +278,20 @@ func cmdExec(ctx context.Context, rt *core.Runtime, args []string) {
 		_ = fs.Parse(flagArgs)
 	}
 
-	if *provider == "" || len(cmdArgs) == 0 {
-		fatal("usage: mintrun exec -provider <type>[@<account>] -scope <scope> -- <command> [args...]")
-	}
-	if *relayURL != "" {
-		if err := configureRelay(rt, *relayURL); err != nil {
-			fatal("%v", err)
-		}
-	}
-
 	var permList []string
 	for _, p := range strings.Split(*perms, ",") {
 		if trimmed := strings.TrimSpace(p); trimmed != "" {
 			permList = append(permList, trimmed)
+		}
+	}
+	// No default permissions: an empty list asks GitHub and AWS for everything the
+	// installation or role holds, so leaving out -perms is a usage error, not a widening.
+	if *provider == "" || len(permList) == 0 || len(cmdArgs) == 0 {
+		fatal("usage: mintrun exec -provider <type>[@<account>] -scope <scope> -perms <perm,...|static> -- <command> [args...]")
+	}
+	if *relayURL != "" {
+		if err := configureRelay(rt, *relayURL); err != nil {
+			fatal("%v", err)
 		}
 	}
 
@@ -504,7 +505,7 @@ Usage:
   mintrun secret set <provider> [secret]                      Store master secret in OS Keychain vault
   mintrun secret check <provider>                             Verify secret exists without exposing value
   mintrun secret delete <provider>                            Delete master secret from vault
-  mintrun exec -provider <name> -scope <zone> -- <cmd...>     Mint JIT token, run command blindly, scrub & revoke
+  mintrun exec -provider <name> -perms <perms> -- <cmd...>    Mint JIT token, run command blindly, scrub & revoke
   mintrun plugin list                                         List built-in and installed plugins
   mintrun plugin install <name|path|url>                      Install a bundled plugin by name, or one from a directory or URL
   mintrun plugin remove <name>                                Remove an installed external plugin

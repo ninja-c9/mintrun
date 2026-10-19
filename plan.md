@@ -1157,3 +1157,34 @@ All steps edit `internal/core/runner.go` or files that build against it, so none
   ```bash
   scripts/verify.sh
   ```
+
+## 10. Workstream AL — `mintrun exec` Requires `-perms` (`v0.16.0`, 2026-10-19)
+
+> **Breaking, under the same `v0.16.0` note as AK:** `mintrun exec -perms` loses its `dns:write,workers:write` default, which was Cloudflare's but applied to every provider.
+
+**Choice.** Require `-perms`, as AK made `-provider` required, rather than a default per provider. An empty list widens: GitHub then sends no `permissions` body (the token gets every permission the installation holds) and AWS no session `Policy` (every permission of the role), so no default is safe for every provider, and a per-provider table would have to be kept in step with every plugin. `-perms static` stays the static opt-in (rule 24).
+
+**Not changed (on purpose):** `GitHubProvider.Mint` (another session owns the malformed-permission fix), the MCP `mintrun_exec` path, and the shims, which set their own permissions.
+
+### AL-1 — CLI `exec`
+- **Files:** `cmd/mintrun/main.go`, `cmd/mintrun/main_test.go`.
+- **Deliverables:** `[SERIAL]` `-perms` defaults to `""`; the list is split and trimmed first, and an empty list (`-perms ""`, `-perms " , ,"`, or none) is a usage error before `configureRelay` and `ExecBlind`, so nothing is minted or audited; the usage line names `-perms <perm,...|static>`; every test that relied on the default passes `-perms`.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run 'TestCLIExecRequiresPerms|TestCLIExecRequiresProvider|TestCLIRelay|TestCLISubcommandsEndToEnd' ./cmd/mintrun
+  ```
+
+### AL-2 — Mutants
+- **Deliverables:** `[SERIAL]` on a copy of the tree, each mutant compiled first (`go test -run '^$'`) and failing a named test; the count goes in [checks.md](checks.md) and rule 57.
+
+### AL-3 — Docs and Rules
+- **Files:** `README.md`, `examples/plugins/README.md`, `docs/threat-model.md`, `AGENTS.md`.
+- **Deliverables:** `[SERIAL]` the README's `v0.16.0` note and every `mintrun exec` example name `-perms`; the plugin examples pass a placeholder their plugin ignores (`deploy`, `login`); the threat model's lease row; rule 56's usage text and a new rule 57.
+- **Verification:** the rule-52 citation script passes on the tree and fails on each planted fault.
+
+### AL-4 — Acceptance
+- **Deliverables:** `[SERIAL]` `scripts/verify.sh`; bidi, conflict-marker, and leak scans with planted controls; `./mintrun` rebuilt; `./mintrun exec -provider github -- true` in a throwaway `MINTRUN_HOME` with `MINTRUN_FILE_VAULT=1`; one commit on the session branch (no push, tag, or merge).
+- **Verification:**
+  ```bash
+  scripts/verify.sh
+  ```
