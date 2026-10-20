@@ -1,6 +1,6 @@
 # Example Plugins
 
-Three plugins built into the `mintrun` binary: `mintrun plugin install <name>` installs one with no clone or download. Each is one Python script (Python 3.9 or later, standard library only) that speaks the protocol in the main README's [Polyglot Plugin SDK](../../README.md#polyglot-plugin-sdk) section: one JSON request on `stdin`, one JSON reply on `stdout`.
+Three plugins built into the `mintrun` binary: `mintrun plugin install <name>` installs one with no clone or download. Each is one Python script (Python 3.9 or later, standard library only) that speaks the protocol in the main README's [Polyglot Plugin SDK](../../docs/plugins.md) section: one JSON request on `stdin`, one JSON reply on `stdout`.
 
 | Plugin | Kind | Needs | What it does |
 |---|---|---|---|
@@ -30,7 +30,7 @@ mintrun exec -vault bitwarden -provider cloudflare -scope example.com -perms dns
 ```
 
 - `MINTRUN_VAULT=bitwarden` makes it the default vault for `secret` and `exec`; `-vault bitwarden` picks it for one `exec`.
-- `BW_SESSION` unlocks your whole vault, and the command `mintrun` runs inherits it unless you pass `-clean-env` or set `clean_env` in the policy. Even then, a command running as you can read it from `mintrun`'s environment ([What the Vault Protects](../../README.md#5-what-the-vault-protects-and-what-it-does-not)).
+- `BW_SESSION` unlocks your whole vault, and the command `mintrun` runs inherits it unless you pass `-clean-env` or set `clean_env` in the policy. Even then, a command running as you can read it from `mintrun`'s environment ([What the Vault Protects](../../docs/security-model.md#5-what-the-vault-protects-and-what-it-does-not)).
 - Only notes in your personal vault count: a note an organization shares is ignored, since another member could have planted it. Two notes with the same name are an error.
 - `bw` reads its local copy of the vault: run `bw sync` after adding a note on another device.
 - `mintrun secret delete` moves the note to the trash.
