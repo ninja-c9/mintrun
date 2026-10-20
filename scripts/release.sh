@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # release.sh builds the release archives into dist/: per platform, a stripped -trimpath binary in
 # dist/mintrun_<version>_<os>_<arch>/ with LICENSE and README.md, packed as a .tar.gz of that folder,
-# then dist/SHA256SUMS. It signs and notarizes nothing (see the end).
+# then dist/SHA256SUMS. With SIGN_IDENTITY set it signs each darwin binary with that Developer ID,
+# and with NOTARY_PROFILE set too it notarizes each one; otherwise it signs nothing (see the end).
 # Usage: scripts/release.sh vX.Y.Z, or VERSION=vX.Y.Z scripts/release.sh. Run it in the main
 # checkout at the release tag: Go stamps vcs.revision from the enclosing .git directory (rule 49).
 set -euo pipefail
@@ -30,6 +31,18 @@ for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64; do
 		echo "dist/$name/mintrun holds a /Users/ or /home/ path" >&2
 		exit 1
 	fi
+	# Sign before packing, because signing changes the bytes SHA256SUMS covers (--force replaces the
+	# ad-hoc signature Go's linker adds on arm64). notarytool takes a zip, and a bare binary cannot be stapled.
+	if [[ $os == darwin && -n ${SIGN_IDENTITY:-} ]]; then
+		codesign --force --sign "$SIGN_IDENTITY" --options runtime --timestamp "dist/$name/mintrun"
+		codesign --verify --strict "dist/$name/mintrun"
+		if [[ -n ${NOTARY_PROFILE:-} ]]; then
+			(cd "dist/$name" && zip -q "../$name.zip" mintrun)
+			xcrun notarytool submit "dist/$name.zip" --keychain-profile "$NOTARY_PROFILE" --wait | tee "dist/$name.notary"
+			grep -q 'status: Accepted' "dist/$name.notary"
+			rm "dist/$name.zip" "dist/$name.notary"
+		fi
+	fi
 	cp LICENSE README.md "dist/$name/"
 	# macOS tar would otherwise record the owner's user name, xattrs, and a ._ file per entry.
 	COPYFILE_DISABLE=1 tar --owner=0 --group=0 --numeric-owner --no-xattrs -czf "dist/$name.tar.gz" -C dist "$name"
@@ -39,12 +52,5 @@ cd dist
 if command -v sha256sum >/dev/null; then sha256sum mintrun_*.tar.gz; else shasum -a 256 mintrun_*.tar.gz; fi >SHA256SUMS
 cat SHA256SUMS
 
-# Signing and notarizing are left to the maintainer:
-# - Checksums: gpg --armor --detach-sign dist/SHA256SUMS (writes SHA256SUMS.asc), or keyless
-#   cosign sign-blob --bundle dist/SHA256SUMS.sigstore.json dist/SHA256SUMS.
-# - macOS: Gatekeeper wants each darwin binary signed with a Developer ID and notarized. Sign it right
-#   after its go build, before it is packed, because signing changes the bytes SHA256SUMS covers
-#   (--force replaces the ad-hoc signature Go's linker adds on arm64):
-#   codesign --force --sign "Developer ID Application: <name> (<team id>)" --options runtime --timestamp <binary>
-#   notarytool takes a zip, not a .tar.gz: zip the binary, then
-#   xcrun notarytool submit <zip> --keychain-profile <profile> --wait. A bare binary cannot be stapled.
+# Left to the maintainer: signing the checksums, with gpg --armor --detach-sign dist/SHA256SUMS
+# (writes SHA256SUMS.asc) or keyless cosign sign-blob --bundle dist/SHA256SUMS.sigstore.json dist/SHA256SUMS.

@@ -55,7 +55,7 @@ The rule numbers point to `<learned_rules>` in [AGENTS.md](../AGENTS.md), which 
 | A plugin cannot replace a built-in or install unverified. | A plugin cannot take a built-in's name or escape its folder. A remote install needs an `https://` URL and a `#sha256=` digest you supply, and a bare name installs the copy built into `mintrun` (rules 10, 33). | `TestRegistryAndExternalVaultAndRemoteInstall`, `TestPluginInstallCatalog` | Plugins run as you, and a provider plugin receives the master ([Plugins](#plugins)). |
 | A relay keeps the masters on one server. | TLS 1.3 pinned to the SHA-256 of the server's public key; device tokens stored only as SHA-256 hashes; policy, approval, and minting on the server; static mode refused; a per-device rate limit and lease cap (rule 47). | `TestRelayURLAndCertPin`, `TestRelayDevices`, `TestRelayEndToEnd`, `TestRelayRateLimitAndLeaseCap`, `TestRelayClientCutOffReply`, `TestMintLeaseAndRelayClient`, `TestCLIRelay` | Tested in one process only ([Relay](#relay)). |
 | Works with the CLIs you already use. | The lease goes in the variables those CLIs read: `GH_TOKEN` and `GITHUB_TOKEN`; `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`; `CLOUDFLARE_API_TOKEN`; `CLOUDSDK_AUTH_ACCESS_TOKEN`. | `TestCloudflareJITMintBlindExecAndAutoRevoke`, `TestAWSProviderComprehensive`, `TestGCPProviderPhase5` | The command holds a working credential while the lease lasts and can send it anywhere unless `no_network` is on. |
-| No third-party code. | `go.mod` names no dependency (rule 1). `scripts/release.sh` builds with `-trimpath`, refuses a binary that holds a local home path, and writes `SHA256SUMS`. | `go.mod`, `scripts/release.sh` | Releases are not signed or notarized and ship no SBOM ([Releases](#releases)). |
+| No third-party code. | `go.mod` names no dependency (rule 1). `scripts/release.sh` builds with `-trimpath`, refuses a binary that holds a local home path, and writes `SHA256SUMS`. | `go.mod`, `scripts/release.sh` | `SHA256SUMS` is not signed, and releases ship no SBOM ([Releases](#releases)). |
 
 ## Where the promises stop
 
@@ -155,7 +155,7 @@ What still applies: the `paused` file, the env-dump filter, the refusal of stati
 
 ### Releases
 
-- Release archives are not signed or notarized and ship no SBOM.
+- With `SIGN_IDENTITY` set, `scripts/release.sh` signs the macOS binaries with a Developer ID (hardened runtime, secure timestamp), and with `NOTARY_PROFILE` set too, it has Apple notarize each one and stops unless the result is `Accepted`. A bare binary cannot be stapled, so Gatekeeper checks the notarization online. The Linux binaries are not signed, `SHA256SUMS` is not signed, and releases ship no SBOM.
 - `SHA256SUMS` comes from the same place as the archives, so it catches a damaged download, not a replaced release.
 - There is no public CI: the checks run through `scripts/verify.sh` on a maintainer's machine.
 - Builds are not checked to be reproducible across machines.
