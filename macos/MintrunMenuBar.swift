@@ -1283,7 +1283,7 @@ struct ActivityDetail: View {
                 fact("Account", Fmt.svc(e.provider))
                 fact("It could", could + ((e.scope ?? "").isEmpty || could.isEmpty ? "" : " in " + Fmt.show(e.scope)))
                 if e.ran {
-                    fact("Access to your Mac", e.sandbox == true ? "Limited" : "Full")
+                    fact("Access to this computer", e.sandbox == true ? "Limited" : "Full")
                     fact("Internet", e.no_network == true ? "Blocked" : "Allowed")
                 }
                 fact("Key", e.key)
@@ -1365,7 +1365,7 @@ struct SettingsView: View {
             }
             Section {
                 Picker(selection: string(nil, "vault", "keychain")) {
-                    Text("Your Mac's keychain").tag("keychain")
+                    Text("This computer's keychain").tag("keychain")
                     Text("1Password").tag("1password")
                     Text("A file mintrun encrypts").tag("file")
                 } label: {
@@ -1463,6 +1463,14 @@ struct SettingsView: View {
         menu.delegate = self
         statusItem.menu = menu
         updateStatusItem()
+        // An accessory app has no main menu to hold Close, so Command-W closes the front window
+        // here; closing an approval panel denies, as its close button does.
+        _ = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in
+            guard e.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+                  e.charactersIgnoringModifiers == "w", let w = NSApp.keyWindow else { return e }
+            w.performClose(nil)
+            return nil
+        }
 
         if let env = ProcessInfo.processInfo.environment["MINTRUN_WATCH_URL"], !env.isEmpty {
             envURL = env
