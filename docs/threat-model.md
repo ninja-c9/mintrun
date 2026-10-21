@@ -179,7 +179,7 @@ These are tested against stand-ins only so far:
 - the client names that real AI apps send over MCP;
 - `mintrun apps connect`, `mintrun apps disconnect`, and `mintrun init mcp` against real AI apps;
 - `mintrun scan` against the files real `aws` and `gcloud` write, including whether current gcloud still writes `legacy_credentials`, and wrangler's Linux location; `scan -add` against any real file. On macOS 27.0, `TestScanRealHome` and `mintrun scan` found a real gh sign-in and a wrangler login at `~/Library/Preferences/.wrangler/config/default.toml` with no error row (2026-10-21, [checks.md](../checks.md));
-- the macOS app end to end: approve, stop, and pause over `app.sock`, and a click on **Add to mintrun** in its sign-in window (its model ran `scan -add` against a file vault, but no click reached the button and the Keychain was not used);
+- the macOS app end to end: approve, stop, and pause over `app.sock`, **Review…** and **Stop…** from its main window, Command-W on an approval window, and a click on **Add to mintrun** in its sign-in window (its model ran `scan -add` against a file vault, but no click reached the button and the Keychain was not used);
 - the macOS dialog closing at the approval deadline;
 - Telegram and Slack approvals with real bots;
 - the 1Password vault, the `bitwarden` and `vercel` plugins with real accounts, and `postgres-jit` against a real PostgreSQL server;
