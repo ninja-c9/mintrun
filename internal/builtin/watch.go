@@ -444,73 +444,319 @@ const watchDashboardHTML = `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>mintrun watch — Enclave Control Plane</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>mintrun</title>
 <style>
-  :root { color-scheme: dark; --bg: #0b0f17; --card: #131b2e; --border: #24324f; --text: #e6edf3; --muted: #8b949e; --green: #2ea043; --red: #da3633; --amber: #d29922; }
-  body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--bg); color: var(--text); margin: 0; padding: 24px; }
-  header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 16px; margin-bottom: 24px; }
-  h1 { font-size: 18px; margin: 0; }
-  h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 24px 0 12px; }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin-bottom: 12px; }
-  pre { margin: 8px 0; white-space: pre-wrap; word-break: break-word; font-size: 12px; background: #070a10; padding: 10px; border-radius: 6px; border: 1px solid var(--border); }
-  button { font-family: inherit; font-size: 12px; font-weight: 600; padding: 6px 14px; border-radius: 6px; border: 1px solid transparent; cursor: pointer; color: #fff; margin-right: 8px; }
-  .btn-allow { background: var(--green); }
-  .btn-deny, .btn-stop { background: var(--red); }
-  .btn-pause { background: var(--amber); color: #000; }
-  .badge { padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
-  .badge-ok { background: rgba(46,160,67,0.2); color: #3fb950; border: 1px solid var(--green); }
-  .badge-paused { background: rgba(218,54,51,0.2); color: #f85149; border: 1px solid var(--red); }
+:root{--bg:#f5f5f7;--card:#fff;--label:rgba(0,0,0,.85);--label2:rgba(0,0,0,.5);--sep:rgba(60,60,67,.18);--fill:rgba(120,120,128,.12);--bar:rgba(245,245,247,.72);--accent:#007aff;--red:#d70015;--green:#1f7a35;--orange:#c93400}
+@media (prefers-color-scheme:dark){:root{--bg:#1e1e1e;--card:#2c2c2e;--label:rgba(255,255,255,.88);--label2:rgba(235,235,245,.6);--sep:rgba(84,84,88,.6);--fill:rgba(120,120,128,.24);--bar:rgba(30,30,30,.72);--accent:#0a84ff;--red:#ff8078;--green:#30d158;--orange:#ff9f0a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--label);font:14px/1.45 -apple-system,BlinkMacSystemFont,system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+header{position:sticky;top:0;z-index:1;display:flex;align-items:center;gap:10px;padding:10px max(16px,calc(50% - 364px));background:var(--bar);-webkit-backdrop-filter:saturate(180%) blur(20px);backdrop-filter:saturate(180%) blur(20px);border-bottom:.5px solid var(--sep)}
+h1{font-size:15px;font-weight:600;margin:0;flex:1}
+main{max-width:760px;margin:0 auto;padding:4px 16px 48px}
+h2{font-size:13px;font-weight:600;color:var(--label2);margin:22px 4px 6px}
+.pill{font-size:12px;font-weight:500;padding:2px 10px;border-radius:999px;background:var(--fill);color:var(--label2)}
+.pill.ok{color:var(--green)}.pill.paused{color:var(--orange)}
+button{font:inherit;font-size:13px;font-weight:500;line-height:20px;border:0;border-radius:7px;padding:3px 14px;cursor:pointer;background:var(--fill);color:var(--label)}
+button.default{background:var(--accent);color:#fff}
+button.danger{background:none;color:var(--red);padding:3px 8px}
+button:disabled{opacity:.4;cursor:default}
+button:focus-visible,summary:focus-visible{outline:3px solid var(--accent);outline-offset:1px}
+.banner{margin:14px 0 0;padding:10px 14px;border-radius:10px;background:var(--card);border-left:4px solid var(--orange)}
+.group{background:var(--card);border-radius:10px;box-shadow:0 0 0 .5px var(--sep)}
+.group:empty{display:none}
+.empty{margin:0;padding:11px 14px;color:var(--label2)}
+.row{padding:9px 14px}.row+.row{border-top:.5px solid var(--sep)}
+.line{display:flex;align-items:center;gap:10px}
+.grow{flex:1;min-width:0}
+.mono{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
+.clip{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sub{font-size:12px;color:var(--label2)}
+.req{background:var(--card);border-radius:12px;padding:14px 16px;margin-bottom:12px;box-shadow:0 0 0 .5px var(--sep),0 4px 16px rgba(0,0,0,.06)}
+.req h3{font-size:15px;font-weight:600;margin:0}
+.cmd{background:var(--fill);border-radius:7px;padding:8px 10px;margin:10px 0;white-space:pre-wrap;word-break:break-all}
+dl{display:grid;grid-template-columns:max-content 1fr;gap:3px 14px;margin:8px 0}
+dt{color:var(--label2)}dd{margin:0;min-width:0;overflow-wrap:anywhere}
+.tags{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 0}
+.tag{font-size:12px;padding:1px 8px;border-radius:6px;background:var(--fill)}
+.good{color:var(--green)}.warn{color:var(--orange)}.bad{color:var(--red)}
+.actions{display:flex;justify-content:flex-end;gap:8px;margin-top:14px}
+.err{color:var(--red);font-size:13px;margin:8px 0 0}
+details summary{cursor:pointer;list-style:none}details summary::-webkit-details-marker{display:none}
+.more{margin-top:10px}.more>summary{color:var(--accent);font-size:13px;display:inline}
+pre{white-space:pre-wrap;word-break:break-all;margin:8px 0 0;color:var(--label2)}
+.row>summary::after{content:"";width:6px;height:6px;border:solid var(--label2);border-width:0 1.5px 1.5px 0;transform:rotate(-45deg);margin:0 2px 0 4px;flex:none}
+.row[open]>summary::after{transform:rotate(45deg)}
 </style>
 </head>
 <body>
 <header>
-  <div><h1>mintrun watch</h1></div>
-  <div id="pause-box"></div>
+<h1>mintrun</h1>
+<span class="pill" id="pill">Connecting</span>
+<button id="pause" disabled>Pause</button>
 </header>
-<h2>Pending Approvals (<span id="app-count">0</span>)</h2>
-<div id="approvals"></div>
-<h2>Running Tasks (<span id="act-count">0</span>)</h2>
-<div id="active"></div>
-<h2>Recent Audit Log</h2>
-<div id="audit"></div>
+<main>
+<p class="banner" id="status" hidden></p>
+<p class="banner" id="paused" hidden>Paused. mintrun refuses every new request until you resume. Commands already running keep running.</p>
+<h2>Waiting for you</h2>
+<div id="approvals" aria-live="polite"></div>
+<p class="group empty" id="approvals-empty">No requests waiting.</p>
+<h2>Running</h2>
+<div class="group" id="active"></div>
+<p class="group empty" id="active-empty">Nothing running.</p>
+<h2>Recent activity</h2>
+<div class="group" id="audit"></div>
+<p class="group empty" id="audit-empty">No activity yet.</p>
+</main>
 <script>
-const token = location.hash.slice(1);
+'use strict';
+var token = location.hash.slice(1);
+var paused = false;
+var HINTS = {'delete':'Deletes something','force':'Forces or skips a safety check','network-tool':'Uses a network tool','encode':'Encodes data','shell':'Runs a shell or redirects output','external-url':'Calls a site outside the service'};
+var LABELS = {exfil:'May send data out',destructive:'May destroy data',mismatch:'Does not match its reason',injected:'Looks injected',vague:'Reason is vague',scope_creep:'Asks for more than it needs'};
+var VIA = {mcp:'MCP',cli:'Command line',relay:'Team relay'};
+var NAMES = {github:'GitHub',aws:'AWS',gcp:'Google Cloud',cloudflare:'Cloudflare'};
+var OUTCOMES = {done:['Finished','good'],failed:['Failed','bad'],blocked:['Blocked by policy','warn'],denied:['Denied','warn'],no_answer:['No answer in time','warn'],stopped:['Stopped','warn'],interrupted:['Interrupted','warn'],timed_out:['Timed out','bad'],minted:['Credential issued',''],unreported:['No report from device','bad']};
+
+// show makes control and bidi characters visible, so agent text cannot hide or reorder what you read.
+function show(s, keepNL) {
+  return String(s == null ? '' : s).replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, function (c) {
+    return keepNL && c === '\n' ? c : '\\u' + ('000' + c.charCodeAt(0).toString(16)).slice(-4);
+  });
+}
+function el(tag, cls, text) {
+  var e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+function argv(a) {
+  return (a || []).map(function (x) { return x === '' || /[\s"'\\]/.test(x) ? JSON.stringify(x) : x; }).map(function (x) { return show(x); }).join(' ');
+}
+function list(dl, pairs) {
+  pairs.forEach(function (p) { if (p[1]) dl.append(el('dt', null, p[0]), el('dd', null, p[1])); });
+  return dl;
+}
+function tag(box, text, cls, title) {
+  var t = el('span', 'tag ' + (cls || ''), text);
+  if (title) t.title = title;
+  box.append(t);
+}
+function ago(ts) {
+  var d = (Date.now() - Date.parse(ts)) / 1000;
+  if (!(d >= 0)) return ts || '';
+  if (d < 45) return 'just now';
+  if (d < 3600) return Math.max(1, Math.round(d / 60)) + ' min ago';
+  if (d < 86400) return Math.round(d / 3600) + ' h ago';
+  return new Date(ts).toLocaleString();
+}
+function when(ts) {
+  var s = el('span', null, ago(ts));
+  s.dataset.ts = ts || '';
+  s.title = ts ? new Date(ts).toLocaleString() : '';
+  return s;
+}
+function dur(sec) {
+  return sec < 60 ? sec + ' seconds' : sec < 3600 ? Math.round(sec / 60) + ' min' : Math.round(sec / 360) / 10 + ' hours';
+}
+// svc names a provider alias type@account as "Type (account)".
+function svc(p, scope) {
+  var s = String(p || ''), i = s.indexOf('@'), t = i < 0 ? s : s.slice(0, i);
+  return show((NAMES[t] || t) + (i < 0 ? '' : ' (' + s.slice(i + 1) + ')') + (scope ? ', ' + scope : ''));
+}
+function from(client, via) {
+  return [show(client), VIA[via] || show(via)].filter(Boolean).join(' via ');
+}
+function line(text, key) {
+  var ls = String(text || '').split('\n');
+  for (var i = 0; i < ls.length; i++) if (ls[i].indexOf(key) === 0) return ls[i].slice(key.length);
+  return '';
+}
+function unquote(q) {
+  try { return JSON.parse(q); } catch (e) { return q; }
+}
+function isStatic(perms, params) {
+  return (perms || []).indexOf('static') >= 0 || (params && params.mode === 'static');
+}
+
 async function post(path, body) {
-  await fetch(path, {method:'POST', headers:{'Content-Type':'application/json','X-Mintrun-Watch':'1','X-Mintrun-Token':token}, body:JSON.stringify(body)});
-  await refresh();
+  var r = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Mintrun-Watch': '1', 'X-Mintrun-Token': token}, body: JSON.stringify(body)});
+  var j = await r.json().catch(function () { return {}; });
+  if (!r.ok) throw new Error(j.error || 'mintrun watch answered ' + r.status);
+  return j;
 }
-function esc(s) {
-  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-async function refresh() {
-  const r = await fetch('/api/state', {headers:{'X-Mintrun-Token':token}});
-  if (!r.ok) {
-    document.getElementById('pause-box').textContent = 'Refused: open the whole URL mintrun watch printed, #token included.';
-    return;
+async function act(btns, errBox, path, body) {
+  btns.forEach(function (b) { b.disabled = true; });
+  if (errBox) errBox.hidden = true;
+  try {
+    await post(path, body);
+    await refresh();
+  } catch (e) {
+    if (errBox) { errBox.textContent = 'Could not send: ' + e.message; errBox.hidden = false; } else alert('Could not send: ' + e.message);
   }
-  const s = await r.json();
-  document.getElementById('pause-box').innerHTML = s.paused
-    ? '<span class="badge badge-paused">PAUSED</span> <button class="btn-allow" onclick="post(\'/api/pause\',{paused:false})">Resume</button>'
-    : '<span class="badge badge-ok">ACTIVE</span> <button class="btn-pause" onclick="post(\'/api/pause\',{paused:true})">Pause All</button>';
-  document.getElementById('app-count').textContent = (s.approvals||[]).length;
-  document.getElementById('approvals').innerHTML = (s.approvals||[]).map(a =>
-    '<div class="card"><pre>'+esc(a.text)+'</pre>' +
-    '<button class="btn-allow" onclick="post(\'/api/decide\',{task:\''+esc(a.task)+'\',decision:\'allow\'})">Allow</button>' +
-    '<button class="btn-deny" onclick="post(\'/api/decide\',{task:\''+esc(a.task)+'\',decision:\'deny\'})">Deny</button></div>'
-  ).join('') || '<div class="card">No pending approval requests.</div>';
-  document.getElementById('act-count').textContent = (s.active||[]).length;
-  document.getElementById('active').innerHTML = (s.active||[]).map(t =>
-    '<div class="card"><div><b>'+esc(t.entry.provider)+'</b> · task '+esc(t.task)+' · sandbox='+esc(t.entry.sandbox)+' · no_network='+esc(t.entry.no_network)+'</div>' +
-    '<pre>'+esc((t.entry.command||[]).join(' '))+'</pre>' +
-    '<button class="btn-stop" onclick="post(\'/api/stop\',{task:\''+esc(t.task)+'\'})">Stop (SIGKILL)</button></div>'
-  ).join('') || '<div class="card">No running tasks.</div>';
-  document.getElementById('audit').innerHTML = (s.audit||[]).map(e =>
-    '<div class="card"><b>'+esc(e.outcome||'started')+'</b> · '+esc(e.provider)+' · exit='+esc(e.exit_code)+' · '+esc(e.timestamp)+
-    '<pre>'+esc((e.command||[]).join(' '))+(e.error ? '\nerror: '+esc(e.error) : '')+'</pre></div>'
-  ).join('') || '<div class="card">No audit entries yet.</div>';
+  btns.forEach(function (b) { b.disabled = false; });
 }
-refresh();
-setInterval(refresh, 750);
+
+function approvalCard(a) {
+  var r = a.request || {}, c = el('section', 'req');
+  var head = el('div', 'line');
+  head.append(el('h3', 'grow', 'Allow this command?'));
+  var asked = el('span', 'sub', 'Asked ');
+  asked.append(when(a.received_at));
+  head.append(asked);
+  c.append(head, el('div', 'cmd mono', argv(r.command)));
+  var dev = line(a.text, 'Device: ');
+  var params = Object.keys(r.params || {}).sort().map(function (k) { return show(k) + '=' + show(r.params[k]); }).join(', ');
+  c.append(list(el('dl'), [
+    ['Service', svc(r.provider, r.scope)],
+    ['Access', (r.permissions || []).map(function (p) { return show(p); }).join(', ')],
+    ['Options', params],
+    ['Folder', r.cwd ? show(r.cwd) : "Not set (mintrun's own folder)"],
+    ['Reason', r.purpose ? '"' + show(r.purpose) + '"' : ''],
+    ['From', from(r.client, r.via)],
+    ['Device', dev ? show(unquote(dev)) : ''],
+    ['Credential', r.ttl_seconds ? 'Asked to last ' + dur(r.ttl_seconds) : '']
+  ]));
+  var tags = el('div', 'tags');
+  tag(tags, r.sandbox ? 'Sandboxed' : 'Not sandboxed', r.sandbox ? 'good' : '', r.sandbox ? "Runs in the OS sandbox: it cannot read mintrun's folder or the keychain by path." : 'Runs as you, with your files and keychain.');
+  tag(tags, r.no_network ? 'Network blocked' : 'Network open', r.no_network ? 'good' : '');
+  if (isStatic(r.permissions, r.params)) tag(tags, 'Static mode: uses the stored secret itself', 'warn');
+  line(a.text, 'Hints: ').split(', ').forEach(function (h) { if (HINTS.hasOwnProperty(h)) tag(tags, HINTS[h], 'warn'); });
+  if (r.jev && r.jev.risk) {
+    var risk = {low: 'good', medium: 'warn', high: 'bad'}[r.jev.risk] || '';
+    tag(tags, 'Risk: ' + show(r.jev.risk), risk, 'From the optional semantic screen. It can only ask or deny, never allow.');
+    (r.jev.labels || []).forEach(function (l) { if (LABELS.hasOwnProperty(l)) tag(tags, LABELS[l], risk || 'warn'); });
+  }
+  c.append(tags);
+  var more = el('details', 'more');
+  more.append(el('summary', null, 'Show full request'), el('pre', 'mono', show(a.text, true)));
+  c.append(more);
+  var err = el('p', 'err');
+  err.hidden = true;
+  err.setAttribute('role', 'alert');
+  var acts = el('div', 'actions'), allow = el('button', null, 'Allow'), deny = el('button', 'default', 'Deny');
+  allow.addEventListener('click', function () { act([allow, deny], err, '/api/decide', {task: a.task, decision: 'allow'}); });
+  deny.addEventListener('click', function () { act([allow, deny], err, '/api/decide', {task: a.task, decision: 'deny'}); });
+  acts.append(allow, deny);
+  c.append(err, acts);
+  return c;
+}
+
+function activeRow(t) {
+  var e = t.entry || {}, row = el('div', 'row line'), left = el('div', 'grow');
+  left.append(el('div', 'mono clip', argv(e.command)));
+  var sub = el('div', 'sub', svc(e.provider) + (e.sandbox ? ', sandboxed' : '') + ', started ');
+  sub.append(when(e.ts));
+  left.append(sub);
+  var stop = el('button', 'danger', 'Stop');
+  stop.addEventListener('click', function () {
+    if (confirm('Stop this command? mintrun ends it and everything it started.')) act([stop], null, '/api/stop', {task: t.task});
+  });
+  row.append(left, stop);
+  return row;
+}
+
+function credential(e) {
+  if (!e.lease_id || e.outcome === 'minted') return '';
+  if (!e.ephemeral) return 'Static mode: the stored secret itself was used';
+  if (e.revoked) return 'Revoked early';
+  return 'Not revoked early: it expires on its own' + (e.expires_at ? ' at ' + new Date(e.expires_at).toLocaleString() : '');
+}
+function auditRow(e) {
+  var row = el('details', 'row'), sum = el('summary', 'line'), left = el('div', 'grow');
+  left.append(el('div', 'mono clip', argv(e.command) || '(no command)'));
+  var sub = el('div', 'sub', svc(e.provider) + ', ');
+  sub.append(when(e.ts));
+  left.append(sub);
+  var o = OUTCOMES[e.outcome] || [show(e.outcome) || 'Unknown', ''];
+  sum.append(left, el('span', o[1], o[0]));
+  row.append(sum, list(el('dl'), [
+    ['Command', argv(e.command)],
+    ['Service', svc(e.provider, e.scope)],
+    ['Access', (e.permissions || []).map(function (p) { return show(p); }).join(', ')],
+    ['Reason', e.purpose ? '"' + show(e.purpose) + '"' : ''],
+    ['From', from(e.client, e.via)],
+    ['Device', show(e.device)],
+    ['Blocked by', show(e.blocked_by)],
+    ['Exit code', e.outcome && e.outcome !== 'blocked' && e.outcome !== 'minted' ? String(e.exit_code) : ''],
+    ['Took', e.duration_ms ? (e.duration_ms / 1000).toFixed(1) + ' s' : ''],
+    ['Sandbox', e.sandbox ? 'On' + (e.no_network ? ', network blocked' : ', network open') : ''],
+    ['Credential', credential(e)],
+    ['Risk', e.jev_risk ? show(e.jev_risk) : ''],
+    ['Error', show(e.error)],
+    ['Lease ID', show(e.lease_id)],
+    ['Task', show(e.task)]
+  ]));
+  return row;
+}
+
+// sync keeps one element per key, so an open disclosure or a focused button survives each poll.
+function sync(id, items, keyOf, make) {
+  var box = document.getElementById(id), old = box._m || new Map(), m = new Map(), prev = null;
+  items.forEach(function (it, i) {
+    var k = keyOf(it);
+    if (m.has(k)) k += '#' + i;
+    var node = old.get(k) || make(it);
+    m.set(k, node);
+    var want = prev ? prev.nextSibling : box.firstChild;
+    if (want !== node) box.insertBefore(node, want);
+    prev = node;
+  });
+  old.forEach(function (node, k) { if (!m.has(k)) node.remove(); });
+  box._m = m;
+  document.getElementById(id + '-empty').hidden = items.length > 0;
+}
+
+function render(s) {
+  paused = !!s.paused;
+  var pill = document.getElementById('pill'), btn = document.getElementById('pause');
+  pill.textContent = paused ? 'Paused' : 'Watching';
+  pill.className = 'pill ' + (paused ? 'paused' : 'ok');
+  btn.textContent = paused ? 'Resume' : 'Pause';
+  btn.title = paused ? 'Let mintrun take requests again' : 'Refuse every new request until you resume';
+  btn.disabled = false;
+  document.getElementById('paused').hidden = !paused;
+  var n = (s.approvals || []).length;
+  document.title = n ? '(' + n + ') mintrun' : 'mintrun';
+  sync('approvals', s.approvals || [], function (a) { return a.task; }, approvalCard);
+  sync('active', s.active || [], function (t) { return t.task; }, activeRow);
+  sync('audit', s.audit || [], function (e) { return [e.ts, e.task, e.outcome].join('|'); }, auditRow);
+  document.querySelectorAll('[data-ts]').forEach(function (t) { t.textContent = ago(t.dataset.ts); });
+}
+
+function status(msg) {
+  var b = document.getElementById('status');
+  b.textContent = msg;
+  b.hidden = !msg;
+  if (msg) {
+    document.getElementById('pill').textContent = 'Not connected';
+    document.getElementById('pill').className = 'pill';
+    document.getElementById('pause').disabled = true;
+  }
+}
+
+async function refresh() {
+  var r;
+  try {
+    r = await fetch('/api/state', {headers: {'X-Mintrun-Token': token}, cache: 'no-store'});
+  } catch (e) {
+    return status("Can't reach mintrun watch. Is it still running?");
+  }
+  if (r.status === 403) return status('Refused: open the whole URL mintrun watch printed, #token included.');
+  var s = r.ok && await r.json().catch(function () { return null; });
+  if (!s) return status('mintrun watch answered ' + r.status + '.');
+  status('');
+  render(s);
+}
+
+document.getElementById('pause').addEventListener('click', function () {
+  act([this], null, '/api/pause', {paused: !paused});
+});
+(async function loop() {
+  await refresh();
+  setTimeout(loop, 750);
+})();
 </script>
 </body>
 </html>
