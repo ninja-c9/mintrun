@@ -134,6 +134,7 @@ Or download an archive for macOS or Linux (arm64 or amd64) from [Releases](https
 ./mintrun init              # every step, each after a yes
 ./mintrun init github       # one step: github, aws, gcp, cloudflare, telegram, slack, policy, or mcp
 ./mintrun doctor            # check the setup; exits 1 if any check fails
+./mintrun scan              # list keys gh, aws, gcloud, and wrangler already keep (reads only); scan -add <id> copies one
 ```
 
 - **Checked before it is stored.** A GitHub App ID and installation ID must be digits, and the App's private key must parse; leave the installation ID empty and each request picks one, which `init` tells you to limit with `allowed_installations`. An AWS access key ID must look like `AKIA…` or `ASIA…`, and an `ASIA` key needs its session token. A Google Cloud key file needs a `client_email` and a `private_key` that parses. Tokens and secret keys are typed with echo off, private keys and key files are read from their path, and a stored secret is replaced only after a yes.

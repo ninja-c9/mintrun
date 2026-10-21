@@ -235,6 +235,8 @@ func main() {
 		cmdShim(ctx, rt, os.Getenv("PATH"), os.Args[2:])
 	case "apps":
 		cmdApps(ctx, os.Args[2:])
+	case "scan":
+		cmdScan(ctx, rt, os.Args[2:])
 	case "relay":
 		cmdRelay(ctx, rt, os.Args[2:])
 	case "watch":
@@ -500,6 +502,7 @@ Usage:
   mintrun doctor                                              Check the setup without changing anything
   mintrun shim [list|install|remove] [tool...]                Intercept bare CLI calls (gh, aws, gcloud, wrangler, vercel, psql)
   mintrun apps status|connect|disconnect [-app <list>]        Add mintrun to Claude Code, Claude Desktop or Cursor (JSON output)
+  mintrun scan [-add <id> [-account <name>]]                  Find sign-ins gh, aws, gcloud and wrangler keep (JSON output)
   mintrun watch [-http 127.0.0.1:0]                           Listen on app.sock for approvals, running tasks, Stop and Pause
   mintrun relay serve|device ...                              Serve the team relay over TLS 1.3 or manage enrolled devices
   mintrun secret set <provider> [secret]                      Store master secret in OS Keychain vault

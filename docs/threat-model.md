@@ -55,6 +55,7 @@ The rule numbers point to `<learned_rules>` in [AGENTS.md](../AGENTS.md) and the
 | A plugin cannot replace a built-in or install unverified. | A plugin cannot take a built-in's name or escape its folder. A remote install needs an `https://` URL and a `#sha256=` digest you supply, and a bare name installs the copy built into `mintrun` (rules 10, 33). | `TestRegistryAndExternalVaultAndRemoteInstall`, `TestPluginInstallCatalog` | Plugins run as you, and a provider plugin receives the master ([Plugins](#plugins)). |
 | A relay keeps the masters on one server. | TLS 1.3 pinned to the SHA-256 of the server's public key; device tokens stored only as SHA-256 hashes; policy, approval, and minting on the server; static mode refused; a per-device rate limit and lease cap (rule 47). | `TestRelayURLAndCertPin`, `TestRelayDevices`, `TestRelayEndToEnd`, `TestRelayRateLimitAndLeaseCap`, `TestRelayClientCutOffReply`, `TestMintLeaseAndRelayClient`, `TestCLIRelay` | Tested in one process only ([Relay](#relay)). |
 | Works with the CLIs you already use. | The lease goes in the variables those CLIs read: `GH_TOKEN` and `GITHUB_TOKEN`; `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`; `CLOUDFLARE_API_TOKEN`; `CLOUDSDK_AUTH_ACCESS_TOKEN`. | `TestCloudflareJITMintBlindExecAndAutoRevoke`, `TestAWSProviderComprehensive`, `TestGCPProviderPhase5` | The command holds a working credential while the lease lasts and can send it anywhere unless `no_network` is on. |
+| `mintrun scan` only reads, and `scan -add` copies only what it found. | `scan` reads fixed files: gh's `hosts.yml`, AWS `credentials` and `config`, gcloud's application default credentials and `legacy_credentials`, and wrangler's `default.toml`, each where the tool's own location variable puts it. It follows a link only to a regular file of at most 1 MiB, runs no program, opens no connection, prints fixed error texts, and prints only names: an id, the file's place under `~/`, an AWS profile name, or a service account's address, never a value or anything derived from one (rule 38). `scan -add <id>` runs the same scan and accepts only the id of a `key` row, so a caller never names a path. It checks the key with `mintrun init`'s checks (rule 35) and refuses a relay, a file vault without `MINTRUN_VAULT_KEY`, a key the vault holds, and a vault it cannot read (rule 61). | `TestScanEmptyHome`, `TestScanFindsEachSource`, `TestScanFileErrors`, `TestScanFIFO`, `TestScanAWS`, `TestScanGCP`, `TestScanGitHub`, `TestScanWrangler`, `TestScanImports`, `TestScanAddAWS`, `TestScanAddGCP`, `TestScanAddRefusals` | Every byte of those files, secrets included, passes through `mintrun`'s memory, and `-add` leaves the original where it was ([Scan](#scan)). |
 | No third-party code. | `go.mod` names no dependency (rule 1). `scripts/release.sh` builds with `-trimpath`, refuses a binary that holds a local home path, and writes `SHA256SUMS`. | `go.mod`, `scripts/release.sh` | `SHA256SUMS` is not signed, and releases ship no SBOM ([Releases](#releases)). |
 
 ## Where the promises stop
@@ -153,6 +154,15 @@ What still applies: the `paused` file, the env-dump filter, the refusal of stati
 - The server keeps active leases in memory. If it crashes, it cannot revoke them, and each lives until it expires.
 - The relay is tested only within one process, never between two machines.
 
+### Scan
+
+- `scan` reads each file whole to find its names, so the file's secrets pass through `mintrun`'s memory, as they would through any program running as you that reads the file. Only `-add` keeps a value, and only to store it.
+- `-add` copies a key and never moves or edits the original. An agent with a shell, or any program running as you, can still read it there. For `mintrun` to hold the only copy, remove the original yourself.
+- A sign-in (`gh auth login`, `gcloud auth login`, AWS SSO, `wrangler login`) is a personal login `mintrun` cannot mint a short-lived credential from, so `-add` refuses it and points to `mintrun init`.
+- It reads only the files above. It skips keys held in environment variables (`GH_TOKEN`, `AWS_ACCESS_KEY_ID`, `CLOUDFLARE_API_TOKEN`, `GOOGLE_APPLICATION_CREDENTIALS`), gh's token in the Keychain, and every other tool.
+- The macOS app, started from the Dock, does not see variables your shell profile sets, so a `GH_CONFIG_DIR`, `AWS_SHARED_CREDENTIALS_FILE`, or `CLOUDSDK_CONFIG` set there moves what a shell's `mintrun scan` reads but not what the app's does.
+- A label is an AWS profile name or a service account's address, which can name a person, a client, or a project. Any program running as you can run `mintrun scan` and read them.
+
 ### Releases
 
 - With `SIGN_IDENTITY` set, `scripts/release.sh` signs the macOS binaries with a Developer ID (hardened runtime, secure timestamp), and with `NOTARY_PROFILE` set too, it has Apple notarize each one and stops unless the result is `Accepted`. A bare binary cannot be stapled, so Gatekeeper checks the notarization online. The Linux binaries are not signed, `SHA256SUMS` is not signed, and releases ship no SBOM.
@@ -168,6 +178,7 @@ These are tested against stand-ins only so far:
 - the GitHub provider with an unpinned `<app_id>::<pem>` or bare JWT master, and a token narrowed below what its App holds. The one live App run, recorded in [checks.md](../checks.md), minted and revoked installation tokens for one repository through an account alias over the CLI and MCP, with a master pinned to its installation and an App holding only Contents read on that repository;
 - the client names that real AI apps send over MCP;
 - `mintrun apps connect`, `mintrun apps disconnect`, and `mintrun init mcp` against real AI apps;
+- `mintrun scan` and `scan -add` against the files real `gh`, `aws`, `gcloud`, and `wrangler` write, including where current wrangler keeps its config on macOS and Linux and whether current gcloud still writes `legacy_credentials`;
 - the macOS app end to end: approve, stop, and pause over `app.sock`;
 - the macOS dialog closing at the approval deadline;
 - Telegram and Slack approvals with real bots;
