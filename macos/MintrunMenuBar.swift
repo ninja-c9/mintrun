@@ -425,15 +425,7 @@ struct ScanView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             content
-            DisclosureGroup("Technical Details") {
-                Text(details)
-                    .font(.caption.monospaced())
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
-                    .background(.quinary, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            TechDetails(text: details)
             HStack(spacing: 10) {
                 Button { Task { await model.scan() } } label: { Text("Look Again").frame(maxWidth: .infinity) }
                     .buttonStyle(.glass)
@@ -503,12 +495,7 @@ struct ScanView: View {
                 + (r.temporary == true ? " Temporary: it stops working when it expires." : ""))
             : ("person.fill", .gray, "Your own sign-in in \(tool). mintrun does not lend sign-ins, so \(Fmt.svc(r.provider)) needs its own setup.")
         return HStack(alignment: .center, spacing: 12) {
-            Image(systemName: symbol)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: 28, height: 28)
-                .background(color.gradient, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-                .accessibilityHidden(true)
+            Tile(symbol: symbol, color: color)
             VStack(alignment: .leading, spacing: 3) {
                 Text(title).fontWeight(.medium)
                 Text(detail).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -733,7 +720,7 @@ extension Fmt {
         "gcp": ("cloud.fill", .blue), "cloudflare": ("globe", .orange),
     ]
 
-    static func tile(_ provider: String?, size: CGFloat = 24) -> Tile {
+    static func tile(_ provider: String?, size: CGFloat = 28) -> Tile {
         let t = (provider ?? "").split(separator: "@").first.map(String.init) ?? ""
         let (symbol, color) = tiles[t] ?? ("key.fill", .gray)
         return Tile(symbol: symbol, color: color, size: size)
@@ -771,7 +758,7 @@ extension Fmt {
 struct Tile: View {
     var symbol: String
     var color: Color
-    var size: CGFloat = 24
+    var size: CGFloat = 28
 
     var body: some View {
         Image(systemName: symbol)
@@ -798,6 +785,23 @@ struct Info: View {
         } icon: {
             tile
         }
+    }
+}
+
+// TechDetails keeps the raw text behind a window's plain words, closed until someone opens it.
+struct TechDetails: View {
+    var text: String
+
+    var body: some View {
+        DisclosureGroup("Technical Details") {
+            Text(text)
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(10)
+                .background(.quinary, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -1047,12 +1051,7 @@ struct OverviewView: View {
             recent
             accounts
             Section {
-                DisclosureGroup("Technical Details") {
-                    Text(details)
-                        .font(.caption.monospaced())
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
+                TechDetails(text: details)
             }
         }
         .formStyle(.grouped)
@@ -1069,21 +1068,30 @@ struct OverviewView: View {
             case .connected where n > 0: ("exclamationmark.shield.fill", .orange,
                                           n == 1 ? "1 request is waiting for you" : "\(n) requests are waiting for you",
                                           "Nothing runs until you answer.")
-            case .connected where model.paused: ("pause.fill", .gray, "Requests are paused",
+            case .connected where model.paused: ("pause.circle.fill", .gray, "Requests are paused",
                                                  "mintrun says no to new requests until you resume.")
             case .connected: ("lock.shield.fill", .green, "mintrun is watching", "AI apps ask here before they use your accounts.")
             }
-        HStack(spacing: 12) {
-            Tile(symbol: symbol, color: color, size: 40)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.title3.weight(.semibold))
-                Text(sub).foregroundStyle(.secondary)
+        // The same header as the approval and sign-in windows, centered as System Settings centers a pane's.
+        VStack(spacing: 4) {
+            Image(systemName: symbol)
+                .font(.system(size: 40))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(color)
+                .padding(.bottom, 6)
+                .accessibilityHidden(true)
+            Text(title).font(.title2.weight(.semibold))
+            Text(sub).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            if model.link == .failed {
+                Button("Try Again") { model.retry() }
+                    .buttonStyle(.glassProminent)
+                    .controlSize(.large)
+                    .padding(.top, 10)
             }
-            Spacer(minLength: 8)
-            if model.link == .failed { Button("Try Again") { model.retry() }.buttonStyle(.glassProminent) }
-            if model.link == .starting { ProgressView().controlSize(.small) }
+            if model.link == .starting { ProgressView().controlSize(.small).padding(.top, 10) }
         }
-        .padding(.vertical, 4)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
     }
 
     @ViewBuilder private var today: some View {
@@ -1116,7 +1124,7 @@ struct OverviewView: View {
             .padding(.horizontal, 4)
         }
         .buttonStyle(.glass)
-        .buttonBorderShape(.roundedRectangle(radius: 12))
+        .buttonBorderShape(.roundedRectangle(radius: 14))
         .accessibilityLabel("\(n) \(label)")
         .accessibilityHint("Shows them in Activity")
     }
@@ -1205,7 +1213,7 @@ struct ActivityView: View {
                     } description: {
                         Text("mintrun could not read its activity log.")
                     } actions: {
-                        DisclosureGroup("Technical Details") { Text("mintrun audit: " + e).font(.caption.monospaced()).textSelection(.enabled) }
+                        TechDetails(text: "mintrun audit: " + e)
                     }
                 } else {
                     ContentUnavailableView("No Activity Yet", systemImage: "list.bullet.rectangle",
@@ -1284,12 +1292,7 @@ struct ActivityDetail: View {
                 Section { Label("mintrun hid the key from everything the AI app got back.", systemImage: "eye.slash") }
             }
             Section {
-                DisclosureGroup("Technical Details") {
-                    Text(e.tech)
-                        .font(.caption.monospaced())
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
+                TechDetails(text: e.tech)
             }
         }
         .formStyle(.grouped)
@@ -1380,12 +1383,7 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
             }
             Section {
-                DisclosureGroup("Technical Details") {
-                    Text(details)
-                        .font(.caption.monospaced())
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
+                TechDetails(text: details)
             }
         }
         .formStyle(.grouped)
