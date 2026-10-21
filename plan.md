@@ -190,3 +190,62 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
   ```bash
   scripts/verify.sh
   ```
+
+## 12. Workstream AN — `mintrun scan` (Read-Only) and `scan -add` (2026-10-21)
+
+> Gives the macOS app's onboarding scan real data: for each provider, whether a sign-in the user already has is a **key** mintrun can copy, or a **signin** (a personal login mintrun cannot mint short-lived credentials from). Out of scope: the Swift side of the app and the design board (follow-ups).
+
+**Command.** `mintrun scan` prints only a JSON array, one row per finding or error, like `mintrun apps status` (rule 44), and exits 1 when a row carries `error` (the JSON is still printed). A row is `{"id","provider","kind","where","label","temporary","error"}`: `kind` is `key` or `signin`, `where` is `~/…` inside the home, `label` holds only a user-chosen AWS profile name or a service account's `client_email` and must match `^[A-Za-z0-9._@+-]{1,128}$`, and `temporary` means an `aws_session_token` field is present (a field's presence, never a value; rule 38). Rows sort github, aws, gcp, cloudflare, then by `id`. No MCP tool: an agent has no need to know where sign-ins live and must not trigger `-add`.
+
+**Sources** (an empty variable counts as unset; a variable is honored only when it moves the tool's own config):
+- **gh:** `GH_CONFIG_DIR`, else `$XDG_CONFIG_HOME/gh`, else `~/.config/gh`; `hosts.yml`'s top-level key names only (`^[A-Za-z0-9.-]+:\s*$`); `github.com:` gives `github:gh`, `signin`. No `security` lookup, no token.
+- **AWS:** `AWS_SHARED_CREDENTIALS_FILE` or `~/.aws/credentials`, and `AWS_CONFIG_FILE` or `~/.aws/config`, read by an INI parser that keeps key names only (`[x]`, `[default]`, `[profile x]`; `[sso-session …]` and `[services …]` ignored), merged by profile. `aws_access_key_id` gives `aws:<profile>`, `key`; `sso_session` or `sso_start_url` gives `signin`; `role_arn`, `credential_process`, or `web_identity_token_file` alone gives no row; a profile name the label charset refuses gives an error row without the name.
+- **gcp:** `CLOUDSDK_CONFIG` or `~/.config/gcloud`: `application_default_credentials.json` and `legacy_credentials/*/adc.json` (at most 20 directories), reading `type` and `client_email`. `service_account` gives `gcp:adc` or `gcp:gcloud:<client_email>`, `key`; `authorized_user` gives `gcp:gcloud-login`, `signin`; other types are skipped. Never `credentials.db` or `GOOGLE_APPLICATION_CREDENTIALS` (it can point into Documents).
+- **wrangler:** `~/.wrangler/config/default.toml`, then on darwin `~/Library/Preferences/.wrangler/config/default.toml`, on linux `${XDG_CONFIG_HOME:-~/.config}/.wrangler/config/default.toml`; an `oauth_token =` line gives `cloudflare:wrangler`, `signin`. The candidates are a function of (home, GOOS, env) so both lists are tested on any host.
+
+**Invariants (rule 61).** `scan.go` imports no `os/exec` and no `net…`. A file is found through `os.Lstat` (only not-exist means none, rule 36), followed through a link only to a regular file, and read through `io.LimitReader` up to 1 MiB; a dangling link, directory, FIFO, socket, unreadable file, or larger file is an error row. Error texts are fixed (`not valid JSON`, `line 7 is not key = value`): a parser error is never wrapped, because `json.SyntaxError` can quote a byte. No value, nor anything derived from one, is printed (rule 38); values are read only by `-add`. No static-mode hint for a personal sign-in (rule 24).
+
+**`scan -add <id> [-account <name>]`.** Re-runs the same discovery and looks the id up, so a caller never names a path; a `signin` id is refused with `mintrun init <type>`, an unknown id with `unknown id`. It reads the profile's `aws_access_key_id`, `aws_secret_access_key`, and `aws_session_token`, or the whole GCP file, validates with the checks `mintrun init` uses (split out in AN-1, same messages), and stores under `<type>` or `<type>@<account>` (`core.ValidProvider`, rule 56). It refuses a key the vault already holds (hint: `-account <name>` or `mintrun init <type>`), a file vault without `MINTRUN_VAULT_KEY` (the `init` message), and a configured relay. Then `SetSecret` and one JSON row `{"id","key","vault"}`. It copies and never moves or edits the original.
+
+### AN-1 — Shared AWS and GCP Checks
+- **Files:** `cmd/mintrun/setup.go`.
+- **Deliverables:** `[PARALLEL]` with AN-2. The AWS master builder and GCP key-file check move out of `wizard.aws` and `wizard.gcp` into functions `-add` can call, with the same error texts.
+- **Verification:** the same `--- PASS` set as before the split.
+  ```bash
+  go test -count=1 -v -run '^TestCLIInit' ./cmd/mintrun
+  ```
+
+### AN-2 — `mintrun scan`
+- **Files:** `cmd/mintrun/scan.go`, `cmd/mintrun/scan_test.go`, `cmd/mintrun/main.go` (dispatch, usage).
+- **Deliverables:** `[PARALLEL]` with AN-1. The four sources, the row order, and the fixed errors. Hermetic tests (rule 22) with `t.TempDir()` homes and the location variables cleared: per source missing, data, link to a file, dangling link, directory, FIFO (`unix`), over 1 MiB with a canary, `chmod 000` (skipped as root), and malformed with the canary as the bad byte; AWS merge, SSO, `role_arn` only, temporary, bad name, and variable override; gcp's three types and two sorted legacy directories; gh's precedence and a GHE-only file; wrangler's darwin and linux candidates. A canary scan of stdout and stderr (raw, base64 Std and Raw, hex, URL) with a positive control; stubs `gh`, `aws`, `gcloud`, `wrangler`, `security`, `sqlite3` first on `PATH` leave no marker (with a positive control); a `go/parser` test that `scan.go` imports no `os/exec` and no `net…`.
+- **Verification:** every new test shows `--- PASS` (rule 15).
+  ```bash
+  go test -count=1 -v -run '^TestScan' ./cmd/mintrun
+  ```
+
+### AN-3 — `scan -add`
+- **Files:** `cmd/mintrun/scan.go`, `cmd/mintrun/scan_test.go`.
+- **Deliverables:** `[SERIAL]` after AN-1 and AN-2. File-vault tests through `runMainWithArgs`: the stored AWS (`id:secret[:token]`) and GCP (whole file) masters, `-account`, refusals of an existing key, a `signin` id, an unknown id, and a relay; a 39-character AWS secret gets `init`'s message without the value; the original keeps its SHA-256 and mtime.
+- **Verification:**
+  ```bash
+  go test -count=1 -v -run '^TestScanAdd' ./cmd/mintrun
+  ```
+
+### AN-4 — Docs and Rule 61
+- **Files:** `docs/threat-model.md`, `README.md`, `AGENTS.md`, `docs/learned-rules.md`.
+- **Deliverables:** `[PARALLEL]` with AN-3. A Scan section in the threat model (promises with their tests; limits: file bytes, secrets included, pass through mintrun's memory; `-add` copies, so AI apps can still read the original; the app does not see the shell's variables; wrangler and gcloud stay under "Not yet run against real systems"); one README command line; rule 61 (≤ 3 sentences) with its mechanism in `docs/learned-rules.md`.
+- **Verification:** a path and host leak scan (rule 3) with a planted control; every test name the docs cite exists.
+
+### AN-5 — Acceptance
+- **Deliverables:** `[SERIAL]` `scripts/verify.sh`, `go test -race`, `GOOS=linux` and `GOOS=windows go build ./...`, `./mintrun` rebuilt, and `HOME=<fixture> ./mintrun scan` on a fixture home. No commit, push, or tag without the user.
+- **Verification:**
+  ```bash
+  scripts/verify.sh
+  ```
+
+### AN-6 — Real Machine (Ask First)
+- **Deliverables:** `[SERIAL]`, only with the user's yes. `scan_integration_test.go` (`//go:build integration`, `TestScanRealHome`) checks the real home gives valid JSON with no error row and logs only counts per provider and kind; confirm the wrangler location on macOS and whether current gcloud still writes `legacy_credentials`, then move what ran out of "Not yet run against real systems".
+- **Verification:**
+  ```bash
+  go test -tags integration -count=1 -v -run '^TestScanRealHome$' ./cmd/mintrun
+  ```

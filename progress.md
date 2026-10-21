@@ -122,3 +122,13 @@
   - Chưa chạy thật: master `<app_id>::<pem>` không ghim và JWT trần, App có quyền rộng hơn (để thu hẹp quyền thật sự), relay, PAT qua static mode ở `v0.16.0`, Cloudflare, AWS và GCP.
   - GitHub App và file khoá trên máy kia do người dùng tự xoá.
   - Commit chỉ nằm trên `main` local: chưa push.
+
+## Checkpoint — `mintrun scan` (chỉ đọc) và `scan -add` (Workstream AN, 2026-10-21)
+
+- **Hoàn thành (AN-1..AN-5, worktree `worktree-mintrun-scan`):** `mintrun scan` liệt kê đăng nhập mà `gh`, `aws`, `gcloud`, `wrangler` đang giữ, mỗi dòng là `key` (mintrun chép được) hoặc `signin` (đăng nhập cá nhân, phải chạy `mintrun init`), chỉ in tên, không in giá trị. `scan -add <id> [-account <name>]` chép một dòng `key` vào vault qua cùng các kiểm tra của `init` (`awsMaster`, `checkGCPKey` tách ra từ wizard), chỉ khi vault báo chưa có; file gốc giữ nguyên.
+- **Lỗi tìm được khi viết mutant:** bản đầu chỉ từ chối khi `GetSecret` thành công, nên một lần đọc vault lỗi (sai `MINTRUN_VAULT_KEY`, keystore khoá) vẫn đi tới `SetSecret` và có thể ghi đè khoá đang giữ. Giờ chỉ `builtin.ErrSecretNotFound` mới cho ghi; case "a vault it cannot read" ghim lại.
+- **Kiểm chứng:** 112 `--- PASS`, 0 FAIL/SKIP cho `^TestScan|^TestCLIInit`; 13/13 mutant của `scan` và 10/10 của `-add` bị giết; `scripts/verify.sh` 5/5 pass, coverage 95.3%; `-race` ok; build Linux và Windows ok; chạy binary trên home giả đúng như tài liệu; quét rò rỉ có mẫu cài trước: 0 hit (sau khi đổi tên một biến test trùng tên máy).
+- **Đã ghi:** dòng README, một promise và mục Scan trong `docs/threat-model.md`, learned rule 61 trong `AGENTS.md` và `docs/learned-rules.md`, mục AN-1..AN-6 trong `checks.md`.
+- **Còn lại:**
+  - AN-6 (máy thật, `TestScanRealHome`) chờ người dùng đồng ý; tới lúc đó `scan` vẫn nằm trong "Not yet run against real systems".
+  - Ba commit chỉ nằm trên nhánh `worktree-mintrun-scan` (gốc là `7964486` của `main` local): chưa merge, chưa push.
