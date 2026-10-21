@@ -264,3 +264,8 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
 - **Files:** `macos/README.md`, `docs/threat-model.md`.
 - **Deliverables:** `[SERIAL]` the menu item and window in the README; the untested click added to the threat model's "Not yet run against real systems" (rule 52).
 - **Verification:** a path and host leak scan of the diff with a planted control (rule 3).
+
+### AO-3 — Liquid Glass Restyle
+- **Files:** `macos/MintrunMenuBar.swift`, then `macos/README.md`, `AGENTS.md`, `docs/learned-rules.md`.
+- **Deliverables:** `[SERIAL]` `onGlass(width:)` and `glassWindow(_:)`, which put a window's view on regular Liquid Glass from edge to edge, title bar included, as macOS 26 draws a menu bar app's windows; both windows restyled to the HIG: a centered symbol and title, content in grouped boxes on `.quinary`, Settings-style icon tiles with inset dividers, and large `.glass` / `.glassProminent` buttons. Rule 62 records why AO-1's renders missed the plain look.
+- **Verification:** `./macos/build.sh`; live window captures by window id in light and dark of **Find Sign-ins** and of the approval panel (from a driver whose `decide` and `onDeny` are no-ops); the AO-1 driver re-run.
