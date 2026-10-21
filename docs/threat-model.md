@@ -38,7 +38,7 @@ Trust boundaries:
 
 ## What it promises
 
-The rule numbers point to `<learned_rules>` in [AGENTS.md](../AGENTS.md), which records each mechanism and the mutants its tests catch.
+The rule numbers point to `<learned_rules>` in [AGENTS.md](../AGENTS.md) and the full unabridged specification in [docs/learned-rules.md](learned-rules.md), which records each mechanism and the mutants its tests catch.
 
 | Promise | Mechanism | Evidence | Limits |
 | :--- | :--- | :--- | :--- |
