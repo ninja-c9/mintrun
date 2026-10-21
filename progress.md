@@ -131,3 +131,9 @@
 - **Đã ghi:** dòng README, một promise và mục Scan trong `docs/threat-model.md`, learned rule 61 trong `AGENTS.md` và `docs/learned-rules.md`, mục AN-1..AN-6 trong `checks.md`.
 - **Còn lại:**
   - AN-6 đã chạy trên macOS 27.0 (2026-10-21): `TestScanRealHome` pass, `scan` thấy đăng nhập gh và wrangler thật, không có dòng lỗi, xác nhận chỗ wrangler lưu trên macOS. Máy này không có file của AWS và gcloud, nên `aws`, `gcloud` (`legacy_credentials`), chỗ wrangler lưu trên Linux, và `scan -add` với file thật vẫn nằm trong "Not yet run against real systems".
+
+## Checkpoint — Cửa sổ quét đăng nhập trong app menu bar (Workstream AO, 2026-10-21)
+
+- **Hoàn thành:** app menu bar có mục **Find Sign-ins on This Computer…** và tự mở cửa sổ này ở lần chạy đầu (`scanShown`). Cửa sổ chạy `mintrun scan`, mỗi dòng là khoá (nút **Add to mintrun**, chạy `scan -add <id>`), đăng nhập cá nhân (cần cài riêng), hoặc file không đọc được; khoá mà vault đã giữ hiện là "đã giữ", không phải lỗi; chi tiết kỹ thuật nằm trong **Technical Details**.
+- **Kiểm chứng:** `./macos/build.sh` ok; driver ngoài repo 8/8 PASS trên home giả với file vault, file gốc không đổi; ảnh render sáng/tối và ảnh cửa sổ thật lúc mở lần đầu.
+- **Còn lại:** chưa có click thật vào **Add to mintrun** và chưa thêm vào Keychain (click giả không tới được nút SwiftUI); đặt tên tài khoản thứ hai (`-account`) từ app chưa làm.

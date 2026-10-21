@@ -250,3 +250,17 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
   ```bash
   go test -tags integration -count=1 -v -run '^TestScanRealHome$' ./cmd/mintrun
   ```
+
+## 13. Workstream AO — The Menu Bar App's Sign-in Window (2026-10-21)
+
+> Shows `mintrun scan` (Workstream AN) in the macOS menu bar app, so a person who installs it sees the sign-ins their tools already keep and can copy a key with one click. Out of scope: naming a second account (`-account`) from the app, added when two keys for one service is common.
+
+### AO-1 — Scan Window
+- **Files:** `macos/MintrunMenuBar.swift`.
+- **Deliverables:** `[SERIAL]` `mintrunProcess` (the binary lookup `watch` already used, now shared), `runMintrun`, `ScanModel` (`scan`, `add`), and `ScanView`: one row per scan row (key with **Add to mintrun**, sign-in that needs its own setup, or a file mintrun could not read), a held key shown as kept rather than failed, and **Technical Details** with ids, files, errors, and `mintrun init` commands. The first launch opens it once (`scanShown`), and the menu opens it again. Every string is plain for non-technical people, with technical terms only in Technical Details or parentheses.
+- **Verification:** `./macos/build.sh`, then a driver outside the repository that compiles the app file without its top-level block, runs `ScanModel` against a throwaway home with a file vault (rule 22: no real home, Keychain, or click), checks each row kind, an add, a held key, and a refused sign-in, renders `ScanView` offscreen in light and dark, and confirms the fixture credentials file is unchanged.
+
+### AO-2 — Docs
+- **Files:** `macos/README.md`, `docs/threat-model.md`.
+- **Deliverables:** `[SERIAL]` the menu item and window in the README; the untested click added to the threat model's "Not yet run against real systems" (rule 52).
+- **Verification:** a path and host leak scan of the diff with a planted control (rule 3).
