@@ -297,6 +297,246 @@ struct ApprovalView: View {
     }
 }
 
+// mintrunProcess runs the binary from MINTRUN_BIN, else mintrun in the folder above the app's, else
+// mintrun on PATH.
+func mintrunProcess(_ args: [String]) -> Process {
+    let proc = Process()
+    var bin = "mintrun"
+    if let env = ProcessInfo.processInfo.environment["MINTRUN_BIN"], !env.isEmpty {
+        bin = env
+    } else {
+        let selfDir = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
+        let repoBin = selfDir.deletingLastPathComponent().appendingPathComponent("mintrun").path
+        if FileManager.default.isExecutableFile(atPath: repoBin) { bin = repoBin }
+    }
+    if bin.contains("/") {
+        proc.executableURL = URL(fileURLWithPath: bin)
+        proc.arguments = args
+    } else {
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        proc.arguments = [bin] + args
+    }
+    return proc
+}
+
+// runMintrun waits for one short mintrun command. Its output is a few KiB and its error one line,
+// so reading stdout to the end before stderr cannot fill a pipe.
+func runMintrun(_ args: [String]) async -> (status: Int32, out: Data, err: Data) {
+    await Task.detached {
+        let p = mintrunProcess(args)
+        let out = Pipe(), err = Pipe()
+        p.standardInput = FileHandle.nullDevice
+        p.standardOutput = out
+        p.standardError = err
+        do { try p.run() } catch { return (-1, Data(), Data(error.localizedDescription.utf8)) }
+        let o = out.fileHandleForReading.readDataToEndOfFile()
+        let e = err.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return (p.terminationStatus, o, e)
+    }.value
+}
+
+// mintrunError is the {"error": …} line mintrun's fatal writes, or the raw stderr.
+func mintrunError(_ r: (status: Int32, out: Data, err: Data)) -> String {
+    if let j = try? JSONSerialization.jsonObject(with: r.err) as? [String: Any], let e = j["error"] as? String {
+        return Fmt.show(e)
+    }
+    let s = String(decoding: r.err, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    return Fmt.show(s.isEmpty ? "mintrun exited with status \(r.status)" : s)
+}
+
+// ScanRow is one row of mintrun scan (cmd/mintrun/scan.go): a sign-in another tool keeps, or a file
+// it could not read. It never holds a secret.
+struct ScanRow: Decodable {
+    var id: String?
+    var provider: String
+    var kind: String?
+    var `where`: String
+    var label: String?
+    var temporary: Bool?
+    var error: String?
+}
+
+@MainActor final class ScanModel: ObservableObject {
+    enum Add: Equatable { case adding, added, held(String), failed(String) }
+    @Published var rows: [ScanRow]?
+    @Published var failure: String?
+    @Published var adds: [String: Add] = [:]
+
+    // scan keeps the rows even when mintrun exits 1, which it does when a row is an error.
+    func scan() async {
+        rows = nil
+        failure = nil
+        let r = await runMintrun(["scan"])
+        if let rows = try? JSONDecoder().decode([ScanRow].self, from: r.out) {
+            self.rows = rows
+        } else {
+            failure = mintrunError(r)
+            rows = []
+        }
+    }
+
+    // add copies a key row's secret into mintrun's vault. mintrun refuses a key it already holds
+    // (cmd/mintrun/scan.go's "is already stored"), which is no failure: the held key still works.
+    func add(_ id: String) async {
+        adds[id] = .adding
+        let r = await runMintrun(["scan", "-add", id])
+        if r.status == 0 {
+            adds[id] = .added
+        } else {
+            let e = mintrunError(r)
+            adds[id] = e.contains(" is already stored") ? .held(e) : .failed(e)
+        }
+    }
+}
+
+struct ScanView: View {
+    @ObservedObject var model: ScanModel
+    var close: () -> Void = {}
+
+    static let tools = [
+        "github": "GitHub's command-line tool (gh)", "aws": "the AWS command-line tool (aws)",
+        "gcp": "the Google Cloud command-line tool (gcloud)", "cloudflare": "Cloudflare's Wrangler tool",
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .center, spacing: 10) {
+                Image(systemName: "person.badge.key")
+                    .font(.title)
+                    .foregroundStyle(.tint)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Sign-ins already on this computer").font(.title3.weight(.semibold))
+                    Text("mintrun looked in the files that GitHub, AWS, Google Cloud, and Cloudflare tools keep. It only reads them and changes nothing.")
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            content
+            DisclosureGroup("Technical Details") {
+                Text(details)
+                    .font(.caption.monospaced())
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            HStack(spacing: 8) {
+                Spacer()
+                Button("Look Again") { Task { await model.scan() } }
+                    .disabled(model.rows == nil || model.adds.values.contains(.adding))
+                Button("Done") { close() }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 480)
+        .task { await model.scan() }
+        .onExitCommand { close() }
+    }
+
+    @ViewBuilder private var content: some View {
+        if let rows = model.rows {
+            if let f = model.failure {
+                Label("mintrun could not look for sign-ins. Technical Details says why.", systemImage: "xmark.octagon.fill")
+                    .foregroundStyle(.red)
+                    .accessibilityLabel("mintrun could not look for sign-ins: " + f)
+            } else if rows.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("No sign-ins found").fontWeight(.medium)
+                    Text("None of these tools is signed in on this computer: GitHub, AWS, Google Cloud, or Cloudflare's command-line tools.")
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } else {
+                let list = VStack(alignment: .leading, spacing: 0) {
+                    ForEach(rows.indices, id: \.self) { i in
+                        if i > 0 { Divider() }
+                        row(rows[i])
+                    }
+                }
+                Group {
+                    // ponytail: a fixed 300 pt box past five rows, like the approval window's command box.
+                    if rows.count > 5 {
+                        ScrollView { list }.frame(height: 300)
+                    } else {
+                        list
+                    }
+                }
+                .background(.quaternary.opacity(0.6), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+        } else {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Looking for sign-ins\u{2026}").foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func row(_ r: ScanRow) -> some View {
+        let tool = Self.tools[r.provider] ?? Fmt.show(r.provider)
+        let title = Fmt.svc(r.provider) + ((r.label ?? "").isEmpty ? "" : " (" + Fmt.show(r.label) + ")")
+        let (symbol, color, detail): (String, Color, String) =
+            r.error != nil ? ("exclamationmark.triangle.fill", .orange, "mintrun could not read a file from \(tool). Technical Details says why.")
+            : r.kind == "key" ? ("key.fill", .accentColor, "A key in \(tool). Add a copy, and AI apps can use it without seeing it."
+                + (r.temporary == true ? " Temporary: it stops working when it expires." : ""))
+            : ("person.crop.circle", .secondary, "Your own sign-in in \(tool). mintrun does not lend sign-ins, so \(Fmt.svc(r.provider)) needs its own setup.")
+        return HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Image(systemName: symbol).foregroundStyle(color).frame(width: 18).accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).fontWeight(.medium)
+                Text(detail).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                if let id = r.id, case .held = model.adds[id] {
+                    Label("mintrun already has a key for \(Fmt.svc(r.provider)), so it kept that one.", systemImage: "info.circle")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let id = r.id, case .failed = model.adds[id] {
+                    Label("Could not add it. Technical Details says why.", systemImage: "xmark.octagon.fill")
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 8)
+            if r.kind == "key", r.error == nil, let id = r.id {
+                switch model.adds[id] {
+                case .adding:
+                    ProgressView().controlSize(.small)
+                case .added:
+                    Label("Added", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                case .held:
+                    EmptyView()
+                default:
+                    Button(model.adds[id] == nil ? "Add to mintrun" : "Try Again") { Task { await model.add(id) } }
+                        .disabled(model.rows == nil)
+                }
+            }
+        }
+        .padding(10)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var details: String {
+        guard let rows = model.rows else { return "Running mintrun scan\u{2026}" }
+        if let f = model.failure { return "mintrun scan: " + f }
+        var lines = rows.map { r in
+            [r.id ?? r.provider, Fmt.show(r.where), r.error.map { Fmt.show($0) } ?? ""].filter { !$0.isEmpty }.joined(separator: "  ")
+        }
+        for (id, a) in model.adds.sorted(by: { $0.key < $1.key }) {
+            switch a {
+            case .held(let e), .failed(let e): lines.append("mintrun scan -add \(Fmt.show(id)): " + e)
+            default: break
+            }
+        }
+        let setups = Set(rows.filter { $0.kind == "signin" }.map(\.provider))
+        for p in ["github", "aws", "gcp", "cloudflare"] where setups.contains(p) {
+            lines.append("Set up \(Fmt.svc(p)): mintrun init \(p)")
+        }
+        return lines.isEmpty ? "mintrun scan found nothing." : lines.joined(separator: "\n")
+    }
+}
+
 // ApprovalPanel shows one request. Closing it, by its button or Esc, denies the request.
 @MainActor final class ApprovalPanel: NSPanel, NSWindowDelegate {
     let task: String
@@ -358,6 +598,7 @@ struct ApprovalView: View {
     private var promptedTasks = Set<String>()
     private var panels: [String: ApprovalPanel] = [:]
     private var cascade = NSPoint.zero
+    private var scanWindow: NSWindow?
     // An ephemeral session keeps request text out of the on-disk URL cache.
     private let session: URLSession = {
         let c = URLSessionConfiguration.ephemeral
@@ -383,6 +624,11 @@ struct ApprovalView: View {
         } else {
             startWatchSubprocess()
         }
+        // The first launch looks for sign-ins other tools keep, so setup starts from what is there.
+        if !UserDefaults.standard.bool(forKey: "scanShown") {
+            UserDefaults.standard.set(true, forKey: "scanShown")
+            showScan()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -393,28 +639,8 @@ struct ApprovalView: View {
         }
     }
 
-    private func resolveMintrunBinary() -> String {
-        if let envBin = ProcessInfo.processInfo.environment["MINTRUN_BIN"], !envBin.isEmpty {
-            return envBin
-        }
-        let selfDir = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
-        let repoBin = selfDir.deletingLastPathComponent().appendingPathComponent("mintrun").path
-        if FileManager.default.isExecutableFile(atPath: repoBin) {
-            return repoBin
-        }
-        return "mintrun"
-    }
-
     private func startWatchSubprocess() {
-        let proc = Process()
-        let bin = resolveMintrunBinary()
-        if bin.contains("/") {
-            proc.executableURL = URL(fileURLWithPath: bin)
-            proc.arguments = ["watch", "-http", "127.0.0.1:0"]
-        } else {
-            proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            proc.arguments = [bin, "watch", "-http", "127.0.0.1:0"]
-        }
+        let proc = mintrunProcess(["watch", "-http", "127.0.0.1:0"])
         let outPipe = Pipe()
         proc.standardOutput = outPipe
         proc.standardError = FileHandle.standardError
@@ -620,6 +846,7 @@ struct ApprovalView: View {
         }
 
         menu.addItem(.separator())
+        menu.addItem(item("Find Sign-ins on This Computer\u{2026}", #selector(showScan)))
         if dashboardURL != nil { menu.addItem(item("Open Dashboard", #selector(openDashboard), "d")) }
         menu.addItem(item("Quit mintrun", #selector(quitApp), "q"))
     }
@@ -712,6 +939,26 @@ struct ApprovalView: View {
         postAPI("api/stop", body: ["task": task]) { [weak self] err in
             if let err { self?.alert("Could not stop the command", err) }
         }
+    }
+
+    // showScan brings an open scan window forward, or opens a new one, which scans again.
+    @objc private func showScan() {
+        NSApp.activate()
+        if let w = scanWindow, w.isVisible {
+            w.makeKeyAndOrderFront(nil)
+            return
+        }
+        let w = NSWindow(contentRect: .zero, styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        w.title = "Find Sign-ins"
+        w.isReleasedWhenClosed = false
+        let host = NSHostingController(rootView: ScanView(model: ScanModel()) { [weak w] in w?.close() })
+        host.sizingOptions = .preferredContentSize
+        w.contentViewController = host
+        w.setContentSize(host.view.fittingSize)
+        w.center()
+        scanWindow = w
+        w.makeKeyAndOrderFront(nil)
+        w.orderFrontRegardless()
     }
 
     @objc private func openDashboard() {

@@ -10,11 +10,12 @@
   - `pause.circle`: requests are paused, and new ones are refused.
   - `bolt.shield`: commands are running.
   - `lock.shield`: watching for requests (dimmed while it starts).
-- **Menu:** a status line, then **Pause Requests** or **Resume Requests**, then a **Waiting for You** section (one **Review** item per request) and a **Running** section (one **Stop** item per command), then **Open Dashboard** (Command-D) and **Quit mintrun** (Command-Q).
+- **Menu:** a status line, then **Pause Requests** or **Resume Requests**, then a **Waiting for You** section (one **Review** item per request) and a **Running** section (one **Stop** item per command), then **Find Sign-ins on This Computer…**, **Open Dashboard** (Command-D) and **Quit mintrun** (Command-Q).
 - **Approval window:** one window per request, opened when the request arrives and closed quietly when it is answered elsewhere or expires. It shows the command, warnings for static mode and the `Hints:` labels, the semantic screen's risk when it is on, and the service, access, options, folder, reason, sender, device, sandbox, network, and credential lifetime. The sender's name is marked as not verified, because an MCP client reports its own. **Show full request** shows the whole `core.ApprovalText`.
 - **Deny is the default:** Return and Esc deny, and closing the window denies. **Allow** stays disabled for a moment after the window opens, so a click or key meant for another window cannot land on it.
 - **Stop:** asks first, then sends `POST /api/stop`, and `mintrun` ends the command's process group (a process that left the group keeps running).
 - **Pause:** `POST /api/pause` creates or removes `<home>/paused`.
+- **Find Sign-ins:** the app's first launch opens this window once (the `scanShown` default records it), and the menu opens it again. It runs `mintrun scan` and shows one row per result: a key the AWS or Google Cloud tool keeps, with **Add to mintrun**, a person's own sign-in, which needs its own setup, or a file `mintrun` could not read. **Add to mintrun** runs `mintrun scan -add <id>`, which copies the key into `mintrun`'s vault and leaves the tool's file as it is; when the vault already holds that key, the row says `mintrun` kept the one it has. **Technical Details** shows each row's id and file, the full text of any error, and the `mintrun init` command for each sign-in. The window never shows a secret, because `mintrun scan` never prints one.
 
 ## How It Connects
 
