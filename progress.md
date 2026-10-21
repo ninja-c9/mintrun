@@ -130,5 +130,4 @@
 - **Kiểm chứng:** 112 `--- PASS`, 0 FAIL/SKIP cho `^TestScan|^TestCLIInit`; 13/13 mutant của `scan` và 10/10 của `-add` bị giết; `scripts/verify.sh` 5/5 pass, coverage 95.3%; `-race` ok; build Linux và Windows ok; chạy binary trên home giả đúng như tài liệu; quét rò rỉ có mẫu cài trước: 0 hit (sau khi đổi tên một biến test trùng tên máy).
 - **Đã ghi:** dòng README, một promise và mục Scan trong `docs/threat-model.md`, learned rule 61 trong `AGENTS.md` và `docs/learned-rules.md`, mục AN-1..AN-6 trong `checks.md`.
 - **Còn lại:**
-  - AN-6 (máy thật, `TestScanRealHome`) chờ người dùng đồng ý; tới lúc đó `scan` vẫn nằm trong "Not yet run against real systems".
-  - Ba commit chỉ nằm trên nhánh `worktree-mintrun-scan` (gốc là `7964486` của `main` local): chưa merge, chưa push.
+  - AN-6 đã chạy trên macOS 27.0 (2026-10-21): `TestScanRealHome` pass, `scan` thấy đăng nhập gh và wrangler thật, không có dòng lỗi, xác nhận chỗ wrangler lưu trên macOS. Máy này không có file của AWS và gcloud, nên `aws`, `gcloud` (`legacy_credentials`), chỗ wrangler lưu trên Linux, và `scan -add` với file thật vẫn nằm trong "Not yet run against real systems".

@@ -28,6 +28,7 @@ Every change to `cmd/`, `internal/`, or `examples/` must pass the following veri
    ```bash
    go test -tags integration -count=1 -v -run TestKeychainVaultRealKeychain ./internal/builtin   # real login Keychain
    go test -tags integration -count=1 -v -run '^TestSandboxHidesHome$' ./internal/core        # real sandbox-exec, throwaway folders
+   go test -tags integration -count=1 -v -run '^TestScanRealHome$' ./cmd/mintrun               # real home, read-only, logs counts only
    ```
 
 ---
