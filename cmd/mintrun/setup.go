@@ -639,6 +639,44 @@ func (w *wizard) github() {
 	}
 }
 
+var (
+	errAWSKeyID  = errors.New("an access key ID is AKIA or ASIA followed by 16 capital letters or digits")
+	errAWSSecret = errors.New("a secret access key is 40 letters, digits, / or +")
+	errAWSToken  = errors.New("a session token is letters, digits, /, + or =")
+)
+
+// awsMaster checks an AWS key the way mintrun init and scan -add both do (rule 35) and returns the
+// master they store: <id>:<secret>, plus :<token> for a temporary ASIA key. It reports the first bad
+// field, and no error quotes a value.
+func awsMaster(id, secret, token string) (string, error) {
+	switch {
+	case !awsKeyIDRe.MatchString(id):
+		return "", errAWSKeyID
+	case !awsSecretRe.MatchString(secret):
+		return "", errAWSSecret
+	case !strings.HasPrefix(id, "ASIA"):
+		return id + ":" + secret, nil
+	case !awsTokenRe.MatchString(token):
+		return "", errAWSToken
+	}
+	return id + ":" + secret + ":" + token, nil
+}
+
+// checkGCPKey checks a service-account key file the way mintrun init and scan -add both do.
+func checkGCPKey(raw string) error {
+	var sa struct {
+		ClientEmail string `json:"client_email"`
+		PrivateKey  string `json:"private_key"`
+	}
+	if json.Unmarshal([]byte(raw), &sa) != nil || sa.ClientEmail == "" || sa.PrivateKey == "" {
+		return errors.New("not a service-account key file: it needs client_email and private_key")
+	}
+	if _, err := builtin.ParseRSAPrivateKey(sa.PrivateKey); err != nil {
+		return fmt.Errorf("private_key: %v", err)
+	}
+	return nil
+}
+
 func (w *wizard) aws() {
 	key := w.begin("aws")
 	if key == "" {
@@ -646,20 +684,19 @@ func (w *wizard) aws() {
 	}
 	fmt.Println("mintrun signs an STS AssumeRole request with this key, so each command gets a short-lived role session.")
 	id := w.ask("Access key ID (AKIA… or ASIA…)")
-	if !awsKeyIDRe.MatchString(id) {
-		fatal("an access key ID is AKIA or ASIA followed by 16 capital letters or digits")
+	if _, err := awsMaster(id, "", ""); errors.Is(err, errAWSKeyID) {
+		fatal("%v", err)
 	}
 	secret := w.askHidden("Secret access key")
-	if !awsSecretRe.MatchString(secret) {
-		fatal("a secret access key is 40 letters, digits, / or +")
+	var token string
+	if _, err := awsMaster(id, secret, ""); errors.Is(err, errAWSSecret) {
+		fatal("%v", err)
+	} else if err != nil {
+		token = w.askHidden("Session token (an ASIA key is temporary and needs one)")
 	}
-	master := id + ":" + secret
-	if strings.HasPrefix(id, "ASIA") {
-		token := w.askHidden("Session token (an ASIA key is temporary and needs one)")
-		if !awsTokenRe.MatchString(token) {
-			fatal("a session token is letters, digits, /, + or =")
-		}
-		master += ":" + token
+	master, err := awsMaster(id, secret, token)
+	if err != nil {
+		fatal("%v", err)
 	}
 	w.store(key, master)
 	fmt.Println("Run commands with -provider " + key + " -scope arn:aws:iam::<account>:role/<name> -perms <IAM actions, e.g. s3:ListBucket>.")
@@ -671,15 +708,8 @@ func (w *wizard) gcp() {
 		return
 	}
 	raw := w.readFile("Path to the service account's JSON key file")
-	var sa struct {
-		ClientEmail string `json:"client_email"`
-		PrivateKey  string `json:"private_key"`
-	}
-	if json.Unmarshal([]byte(raw), &sa) != nil || sa.ClientEmail == "" || sa.PrivateKey == "" {
-		fatal("not a service-account key file: it needs client_email and private_key")
-	}
-	if _, err := builtin.ParseRSAPrivateKey(sa.PrivateKey); err != nil {
-		fatal("private_key: %v", err)
+	if err := checkGCPKey(raw); err != nil {
+		fatal("%v", err)
 	}
 	w.store(key, raw)
 	fmt.Println("Run commands with -provider " + key + " -perms cloud-platform.read-only (or another OAuth scope).")
