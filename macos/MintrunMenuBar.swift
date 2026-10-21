@@ -165,18 +165,18 @@ struct ApprovalView: View {
     var body: some View {
         let a = model.approval
         let r = a.request ?? WatchRequest()
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .center, spacing: 10) {
-                Image(systemName: "lock.shield")
-                    .font(.title)
+        VStack(spacing: 14) {
+            VStack(spacing: 4) {
+                Image(systemName: "lock.shield.fill")
+                    .font(.system(size: 40))
+                    .symbolRenderingMode(.hierarchical)
                     .foregroundStyle(.tint)
+                    .padding(.bottom, 6)
                     .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Allow this command?").font(.title3.weight(.semibold))
-                    if let asked = Fmt.date(a.received_at) {
-                        TimelineView(.everyMinute) { ctx in
-                            Text("Asked " + Fmt.ago(asked, now: ctx.date)).foregroundStyle(.secondary)
-                        }
+                Text("Allow this command?").font(.title2.weight(.semibold))
+                if let asked = Fmt.date(a.received_at) {
+                    TimelineView(.everyMinute) { ctx in
+                        Text("Asked " + Fmt.ago(asked, now: ctx.date)).foregroundStyle(.secondary)
                     }
                 }
             }
@@ -191,6 +191,9 @@ struct ApprovalView: View {
                     }
                 }
             }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.quinary, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             DisclosureGroup("Show full request") {
                 ScrollView {
                     Text(Fmt.show(a.text, keepNL: true))
@@ -200,22 +203,28 @@ struct ApprovalView: View {
                 }
                 .frame(height: 160)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             if let e = model.error {
                 Label(e, systemImage: "xmark.octagon.fill").foregroundStyle(.red)
             }
-            HStack(spacing: 8) {
-                Text("Closing this window denies the request.").foregroundStyle(.secondary)
-                Spacer()
-                if model.sending { ProgressView().controlSize(.small) }
-                Button("Allow") { model.decide(true) }
-                    .disabled(!armed || model.sending)
-                Button("Deny") { model.decide(false) }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(model.sending)
+            VStack(spacing: 10) {
+                HStack(spacing: 10) {
+                    Button { model.decide(true) } label: { Text("Allow").frame(maxWidth: .infinity) }
+                        .buttonStyle(.glass)
+                        .disabled(!armed || model.sending)
+                    Button { model.decide(false) } label: { Text("Deny").frame(maxWidth: .infinity) }
+                        .buttonStyle(.glassProminent)
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(model.sending)
+                }
+                .controlSize(.large)
+                HStack(spacing: 6) {
+                    if model.sending { ProgressView().controlSize(.small) }
+                    Text("Closing this window denies the request.").font(.callout).foregroundStyle(.secondary)
+                }
             }
         }
-        .padding(20)
-        .frame(width: 460)
+        .onGlass(width: 460)
         // Allow waits a moment, so a click or key meant for another window cannot land on it.
         .task {
             try? await Task.sleep(for: .milliseconds(800))
@@ -239,8 +248,8 @@ struct ApprovalView: View {
                 text
             }
         }
-        .padding(10)
-        .background(.quaternary.opacity(0.6), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .padding(12)
+        .background(.quaternary.opacity(0.6), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
     @ViewBuilder private func warnings(_ a: WatchApproval, _ r: WatchRequest) -> some View {
@@ -273,6 +282,7 @@ struct ApprovalView: View {
                     }
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -400,18 +410,19 @@ struct ScanView: View {
     ]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .center, spacing: 10) {
-                Image(systemName: "person.badge.key")
-                    .font(.title)
+        VStack(spacing: 16) {
+            VStack(spacing: 4) {
+                Image(systemName: "person.badge.key.fill")
+                    .font(.system(size: 40))
+                    .symbolRenderingMode(.hierarchical)
                     .foregroundStyle(.tint)
+                    .padding(.bottom, 6)
                     .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Sign-ins already on this computer").font(.title3.weight(.semibold))
-                    Text("mintrun looked in the files that GitHub, AWS, Google Cloud, and Cloudflare tools keep. It only reads them and changes nothing.")
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                Text("Sign-ins already on this computer").font(.title2.weight(.semibold))
+                Text("mintrun looked in the files that GitHub, AWS, Google Cloud, and Cloudflare tools keep. It only reads them and changes nothing.")
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             content
             DisclosureGroup("Technical Details") {
@@ -419,57 +430,68 @@ struct ScanView: View {
                     .font(.caption.monospaced())
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+                    .background(.quinary, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             }
-            HStack(spacing: 8) {
-                Spacer()
-                Button("Look Again") { Task { await model.scan() } }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 10) {
+                Button { Task { await model.scan() } } label: { Text("Look Again").frame(maxWidth: .infinity) }
+                    .buttonStyle(.glass)
                     .disabled(model.rows == nil || model.adds.values.contains(.adding))
-                Button("Done") { close() }
+                Button { close() } label: { Text("Done").frame(maxWidth: .infinity) }
+                    .buttonStyle(.glassProminent)
                     .keyboardShortcut(.defaultAction)
             }
+            .controlSize(.large)
         }
-        .padding(20)
-        .frame(width: 480)
+        .onGlass(width: 560)
         .task { await model.scan() }
         .onExitCommand { close() }
     }
 
     @ViewBuilder private var content: some View {
-        if let rows = model.rows {
-            if let f = model.failure {
-                Label("mintrun could not look for sign-ins. Technical Details says why.", systemImage: "xmark.octagon.fill")
-                    .foregroundStyle(.red)
-                    .accessibilityLabel("mintrun could not look for sign-ins: " + f)
-            } else if rows.isEmpty {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("No sign-ins found").fontWeight(.medium)
-                    Text("None of these tools is signed in on this computer: GitHub, AWS, Google Cloud, or Cloudflare's command-line tools.")
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            } else {
-                let list = VStack(alignment: .leading, spacing: 0) {
-                    ForEach(rows.indices, id: \.self) { i in
-                        if i > 0 { Divider() }
-                        row(rows[i])
+        Group {
+            if let rows = model.rows {
+                if let f = model.failure {
+                    Label("mintrun could not look for sign-ins. Technical Details says why.", systemImage: "xmark.octagon.fill")
+                        .foregroundStyle(.red)
+                        .padding(14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityLabel("mintrun could not look for sign-ins: " + f)
+                } else if rows.isEmpty {
+                    VStack(spacing: 4) {
+                        Text("No sign-ins found").fontWeight(.medium)
+                        Text("None of these tools is signed in on this computer: GitHub, AWS, Google Cloud, or Cloudflare's command-line tools.")
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                }
-                Group {
+                    .padding(18)
+                    .frame(maxWidth: .infinity)
+                } else {
+                    let list = VStack(alignment: .leading, spacing: 0) {
+                        ForEach(rows.indices, id: \.self) { i in
+                            // The line starts after the icon, as in System Settings.
+                            if i > 0 { Divider().padding(.leading, 52) }
+                            row(rows[i])
+                        }
+                    }
                     // ponytail: a fixed 300 pt box past five rows, like the approval window's command box.
                     if rows.count > 5 {
-                        ScrollView { list }.frame(height: 300)
+                        ScrollView { list }.defaultScrollAnchor(.top).frame(height: 300)
                     } else {
                         list
                     }
                 }
-                .background(.quaternary.opacity(0.6), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            }
-        } else {
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text("Looking for sign-ins\u{2026}").foregroundStyle(.secondary)
+            } else {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Looking for sign-ins\u{2026}").foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, minHeight: 72)
             }
         }
+        .background(.quinary, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
     private func row(_ r: ScanRow) -> some View {
@@ -479,10 +501,15 @@ struct ScanView: View {
             r.error != nil ? ("exclamationmark.triangle.fill", .orange, "mintrun could not read a file from \(tool). Technical Details says why.")
             : r.kind == "key" ? ("key.fill", .accentColor, "A key in \(tool). Add a copy, and AI apps can use it without seeing it."
                 + (r.temporary == true ? " Temporary: it stops working when it expires." : ""))
-            : ("person.crop.circle", .secondary, "Your own sign-in in \(tool). mintrun does not lend sign-ins, so \(Fmt.svc(r.provider)) needs its own setup.")
-        return HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Image(systemName: symbol).foregroundStyle(color).frame(width: 18).accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 4) {
+            : ("person.fill", .gray, "Your own sign-in in \(tool). mintrun does not lend sign-ins, so \(Fmt.svc(r.provider)) needs its own setup.")
+        return HStack(alignment: .center, spacing: 12) {
+            Image(systemName: symbol)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 28, height: 28)
+                .background(color.gradient, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
                 Text(title).fontWeight(.medium)
                 Text(detail).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 if let id = r.id, case .held = model.adds[id] {
@@ -509,11 +536,14 @@ struct ScanView: View {
                     EmptyView()
                 default:
                     Button(model.adds[id] == nil ? "Add to mintrun" : "Try Again") { Task { await model.add(id) } }
+                        .buttonBorderShape(.capsule)
                         .disabled(model.rows == nil)
                 }
             }
         }
-        .padding(10)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(minHeight: 44)
         .accessibilityElement(children: .combine)
     }
 
@@ -537,6 +567,28 @@ struct ScanView: View {
     }
 }
 
+extension View {
+    // onGlass lays a window's view on Liquid Glass from edge to edge, title bar included, as macOS 26 draws a
+    // menu bar app's windows. The view itself stays below the title bar. Its window needs glassWindow.
+    func onGlass(width: CGFloat) -> some View {
+        padding(.horizontal, 24)
+            .padding(.top, 4)
+            .padding(.bottom, 24)
+            .frame(width: width)
+            .background { Color.clear.glassEffect(.regular, in: ConcentricRectangle()).ignoresSafeArea() }
+    }
+}
+
+// glassWindow clears a titled window's background and title bar so the glass of its onGlass view shows through.
+// The title stays set for the Window menu and VoiceOver.
+@MainActor func glassWindow(_ w: NSWindow) {
+    w.styleMask.insert(.fullSizeContentView)
+    w.titlebarAppearsTransparent = true
+    w.titleVisibility = .hidden
+    w.isOpaque = false
+    w.backgroundColor = .clear
+}
+
 // ApprovalPanel shows one request. Closing it, by its button or Esc, denies the request.
 @MainActor final class ApprovalPanel: NSPanel, NSWindowDelegate {
     let task: String
@@ -550,6 +602,7 @@ struct ScanView: View {
         task = model.approval.task
         super.init(contentRect: .zero, styleMask: [.titled, .closable], backing: .buffered, defer: false)
         title = "mintrun"
+        glassWindow(self)
         isReleasedWhenClosed = false
         hidesOnDeactivate = false
         level = .floating
@@ -950,6 +1003,7 @@ struct ScanView: View {
         }
         let w = NSWindow(contentRect: .zero, styleMask: [.titled, .closable], backing: .buffered, defer: false)
         w.title = "Find Sign-ins"
+        glassWindow(w)
         w.isReleasedWhenClosed = false
         let host = NSHostingController(rootView: ScanView(model: ScanModel()) { [weak w] in w?.close() })
         host.sizingOptions = .preferredContentSize
