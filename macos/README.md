@@ -24,6 +24,7 @@
 
 ## How It Connects
 
+- **One copy per home:** the app holds a lock on `<home>/menubar.lock` while it runs. Launching it again for the same home opens the running copy's main window and exits, because a second copy could not start its watcher on `<home>/app.sock` and would add a broken icon. The lock ends with the process, so a copy that crashed leaves none behind, and a copy with another `MINTRUN_HOME` runs on its own.
 - With `MINTRUN_WATCH_URL` set, the app uses that URL. Otherwise it starts `mintrun watch -http 127.0.0.1:0` itself (the binary from `MINTRUN_BIN`, else `mintrun` in the folder above the app's, else `mintrun` on `PATH`), reads the URL from the line it prints, and stops it on quit.
 - The URL must be the whole `http://127.0.0.1:<port>/#<token>` line; the app refuses a URL without the `#token` fragment. The token goes in `X-Mintrun-Token` on every `/api/` request and never in a request URL, and every POST also sends `X-Mintrun-Watch: 1`.
 - **Open Dashboard** opens that URL in your browser. The app never fetches the dashboard page itself.

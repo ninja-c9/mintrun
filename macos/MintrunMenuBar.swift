@@ -1471,6 +1471,12 @@ struct SettingsView: View {
             w.performClose(nil)
             return nil
         }
+        // A second launch for the same home posts this and exits (see the end of the file).
+        DistributedNotificationCenter.default().addObserver(
+            forName: showMainNote, object: MainModel.home.resolvingSymlinksInPath().path, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.showMain() }
+        }
 
         if let env = ProcessInfo.processInfo.environment["MINTRUN_WATCH_URL"], !env.isEmpty {
             envURL = env
@@ -1866,7 +1872,24 @@ struct SettingsView: View {
     }
 }
 
+let showMainNote = Notification.Name("mintrun.menubar.showMain")
+
 MainActor.assumeIsolated {
+    // One copy runs per mintrun home, because a second could not start its watcher on
+    // <home>/app.sock and would add a broken icon. It asks the running copy to show its main window
+    // and exits. The lock lasts as long as the process, so a copy that crashed leaves none behind;
+    // when the lock file cannot be opened, the app runs as before.
+    let home = MainModel.home
+    try? FileManager.default.createDirectory(at: home, withIntermediateDirectories: true,
+                                             attributes: [.posixPermissions: 0o700])
+    let lock = open(home.appendingPathComponent("menubar.lock").path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+    if lock >= 0, flock(lock, LOCK_EX | LOCK_NB) != 0, errno == EWOULDBLOCK {
+        FileHandle.standardError.write(Data("mintrun is already running, so its window opens instead.\n".utf8))
+        DistributedNotificationCenter.default().postNotificationName(
+            showMainNote, object: home.resolvingSymlinksInPath().path, userInfo: nil, deliverImmediately: true)
+        exit(0)
+    }
+
     let app = NSApplication.shared
     let delegate = MintrunMenuBarDelegate()
     app.delegate = delegate
