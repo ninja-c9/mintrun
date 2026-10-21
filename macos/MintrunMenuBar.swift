@@ -633,8 +633,801 @@ extension View {
     }
 }
 
+enum Page: Hashable { case overview, activity, settings }
+
+// AuditRow is one line of mintrun audit (core.AuditEntry in internal/core/runner.go). The runner
+// scrubbed it, so it holds no secret.
+struct AuditRow: Decodable {
+    var ts: String?
+    var task: String?
+    var via: String?
+    var client: String?
+    var provider: String?
+    var scope: String?
+    var permissions: [String]?
+    var command: [String]?
+    var purpose: String?
+    var outcome: String?
+    var blocked_by: String?
+    var lease_id: String?
+    var ephemeral: Bool?
+    var revoked: Bool?
+    var exit_code: Int?
+    var duration_ms: Int?
+    var sandbox: Bool?
+    var no_network: Bool?
+    var error: String?
+    var jev_risk: String?
+
+    // A relay server writes two lines per task, "minted" and the outcome, so the outcome is part of the id.
+    var id: String { (ts ?? "") + "|" + (task ?? "") + "|" + (outcome ?? "") }
+    // Entries written before outcome existed have only their exit code.
+    var result: String { outcome ?? ((exit_code ?? 0) == 0 ? "done" : "failed") }
+    // refused means mintrun said no, so nothing ran.
+    var refused: Bool { ["denied", "blocked", "no_answer"].contains(result) }
+    var ran: Bool { !(lease_id ?? "").isEmpty }
+    var title: String { Fmt.what(purpose, command) }
+    var app: String { Fmt.app(client, via) }
+
+    var badge: (text: String, symbol: String, color: Color) {
+        switch result {
+        case "done": ("Done", "checkmark.circle.fill", .green)
+        case "denied": ("Denied", "xmark.circle.fill", .red)
+        case "blocked": (blocked_by == "paused" ? "Refused while paused"
+            : blocked_by == "jev" ? "Refused by the safety check" : "Refused by your rules", "hand.raised.fill", .red)
+        case "no_answer": ("No answer", "clock.fill", .secondary)
+        case "stopped": ("Stopped", "stop.circle.fill", .secondary)
+        case "interrupted": ("Ended early", "stop.circle.fill", .secondary)
+        case "timed_out": ("Took too long", "hourglass", .orange)
+        case "minted": ("Key handed out", "key.fill", .blue)
+        case "unreported": ("No report", "questionmark.circle.fill", .secondary)
+        default: ("Failed", "exclamationmark.triangle.fill", .orange)
+        }
+    }
+
+    var sentence: String {
+        switch result {
+        case "done": "\(app) ran this command using \(Fmt.svc(provider))."
+        case "denied": "You denied this request. Nothing ran."
+        case "blocked": blocked_by == "paused" ? "Requests were paused, so mintrun refused it. Nothing ran."
+            : blocked_by == "jev" ? "The safety check found it risky, so mintrun refused it. Nothing ran."
+            : "Your rules don't allow this, so mintrun refused it. Nothing ran."
+        case "no_answer": "Nobody answered in time, so mintrun said no. Nothing ran."
+        case "stopped": "You stopped this command before it finished."
+        case "interrupted": "It ended early because the AI app or mintrun closed."
+        case "timed_out": "It ran too long, so mintrun ended it."
+        case "minted": "mintrun handed a key to a computer on your team for this command."
+        case "unreported": "The key ran out before the computer on your team said how it went."
+        default: ran ? "The command ran but ended with an error." : "Something went wrong before it could run. Nothing ran."
+        }
+    }
+
+    var key: String {
+        if !ran { return "No key was made" }
+        if ephemeral != true { return "Your saved key was used as is" }
+        if revoked != true { return "Stops working on its own" }
+        return result == "stopped" ? "Deleted when it stopped" : "Deleted when it finished"
+    }
+
+    var tech: String {
+        let rows: [(String, String)] = [
+            ("Exact command", Fmt.argv(command)),
+            ("Account ID", Fmt.show(provider)),
+            ("Scope", Fmt.show(scope)),
+            ("Permissions", (permissions ?? []).map { Fmt.show($0) }.joined(separator: ", ")),
+            ("Outcome", Fmt.show(result) + (blocked_by.map { " (" + Fmt.show($0) + ")" } ?? "")),
+            ("Key reference", Fmt.show(lease_id)),
+            ("Result code", ran ? "\(exit_code ?? 0)" : ""),
+            ("Time taken", "\(duration_ms ?? 0) ms"),
+            ("Safety check", Fmt.show(jev_risk)),
+            ("Error", Fmt.show(error)),
+            ("Task", Fmt.show(task)),
+        ]
+        return rows.filter { !$0.1.isEmpty }.map { $0.0 + ": " + $0.1 }.joined(separator: "\n")
+    }
+}
+
+extension Fmt {
+    static let tiles: [String: (String, Color)] = [
+        "github": ("chevron.left.forwardslash.chevron.right", .gray), "aws": ("shippingbox.fill", .brown),
+        "gcp": ("cloud.fill", .blue), "cloudflare": ("globe", .orange),
+    ]
+
+    static func tile(_ provider: String?, size: CGFloat = 24) -> Tile {
+        let t = (provider ?? "").split(separator: "@").first.map(String.init) ?? ""
+        let (symbol, color) = tiles[t] ?? ("key.fill", .gray)
+        return Tile(symbol: symbol, color: color, size: size)
+    }
+
+    // what names a request by the reason it gave, else by its command.
+    static func what(_ purpose: String?, _ command: [String]?) -> String {
+        if let p = purpose, !p.isEmpty { return "\u{201C}" + show(p) + "\u{201D}" }
+        let c = argv(command)
+        return c.isEmpty ? "A request with no command" : c
+    }
+
+    static func app(_ client: String?, _ via: String?) -> String {
+        if let c = client, !c.isEmpty { return show(c) }
+        return via == "cli" ? "Someone at the command line" : "An AI app"
+    }
+
+    // can says in words what a permission such as contents:read allows.
+    static func can(_ perm: String) -> String {
+        if perm == "static" { return "Use your saved key as is" }
+        let p = perm.split(separator: ":", maxSplits: 1).map(String.init)
+        guard p.count == 2, let verb = ["read": "Read", "write": "Change", "admin": "Manage"][p[1]] else { return show(perm) }
+        return verb + " " + show(p[0].replacingOccurrences(of: "_", with: " "))
+    }
+
+    static func when(_ d: Date?) -> String {
+        guard let d else { return "" }
+        if Calendar.current.isDateInToday(d) { return d.formatted(date: .omitted, time: .shortened) }
+        if Calendar.current.isDateInYesterday(d) { return "Yesterday" }
+        return d.formatted(.dateTime.month().day())
+    }
+}
+
+// Tile is a System Settings icon: a white symbol on a rounded square of color.
+struct Tile: View {
+    var symbol: String
+    var color: Color
+    var size: CGFloat = 24
+
+    var body: some View {
+        Image(systemName: symbol)
+            .font(.system(size: size * 0.5, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: size, height: size)
+            .background(color.gradient, in: RoundedRectangle(cornerRadius: size * 0.25, style: .continuous))
+            .accessibilityHidden(true)
+    }
+}
+
+// Info labels a grouped-form row the way System Settings does: a tile, a title, and a line under it.
+struct Info: View {
+    var tile: Tile
+    var title: String
+    var sub = ""
+
+    var body: some View {
+        Label {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).lineLimit(2)
+                if !sub.isEmpty { Text(sub).font(.callout).foregroundStyle(.secondary) }
+            }
+        } icon: {
+            tile
+        }
+    }
+}
+
+struct Account { var name: String; var ready: Bool? }
+
+// MainModel feeds the main window from what mintrun already shows: mintrun watch's state, mintrun
+// audit, mintrun doctor, and settings.json.
+@MainActor final class MainModel: ObservableObject {
+    enum Link { case starting, connected, failed }
+    enum Filter: Hashable { case all, allowed, denied }
+
+    @Published var state = WatchState()
+    @Published var link = Link.starting
+    @Published var page: Page? = .overview
+    @Published var filter = Filter.all
+    @Published var query = ""
+    @Published var selection: String?
+    @Published var audit: [AuditRow]?
+    @Published var auditError: String?
+    @Published var doctor: String?
+    @Published var settings: [String: Any] = [:]
+    @Published var settingsError: String?
+    var review: @MainActor (String) -> Void = { _ in }
+    var stop: @MainActor (String) -> Void = { _ in }
+    var togglePause: @MainActor () -> Void = {}
+    var retry: @MainActor () -> Void = {}
+    var findSignins: @MainActor () -> Void = {}
+
+    var approvals: [WatchApproval] { state.approvals ?? [] }
+    var active: [WatchActiveTask] { state.active ?? [] }
+    var paused: Bool { state.paused ?? false }
+
+    // mintrun reads <home>/settings.json, where home is MINTRUN_HOME or ~/.mintrun (defaultHomeDir
+    // in cmd/mintrun/main.go, which takes ~ from HOME).
+    static var home: URL {
+        let env = ProcessInfo.processInfo.environment
+        if let h = env["MINTRUN_HOME"], !h.isEmpty { return URL(fileURLWithPath: h) }
+        let user = env["HOME"].flatMap { $0.isEmpty ? nil : $0 } ?? NSHomeDirectory()
+        return URL(fileURLWithPath: user).appendingPathComponent(".mintrun")
+    }
+    static var settingsURL: URL { home.appendingPathComponent("settings.json") }
+
+    // sync takes each poll of mintrun watch. When a request arrives or ends it reads the activity
+    // log again, so a finished command shows up.
+    func sync(_ s: WatchState, _ l: Link) {
+        func key(_ s: WatchState) -> [String] {
+            [s.paused == true ? "paused" : ""] + (s.approvals ?? []).map(\.task) + ["|"] + (s.active ?? []).map(\.task)
+        }
+        guard key(s) != key(state) || l != link else { return }
+        state = s
+        link = l
+        Task { await loadAudit() }
+    }
+
+    func reload() {
+        Task { await loadAudit() }
+        Task { await loadDoctor() }
+        loadSettings()
+    }
+
+    func show(_ f: Filter, select: String? = nil) {
+        filter = f
+        query = ""
+        selection = select
+        page = .activity
+    }
+
+    var shown: [AuditRow] {
+        (audit ?? []).filter { e in
+            (filter == .all || (filter == .denied) == e.refused)
+                && (query.isEmpty || [e.title, Fmt.svc(e.provider), e.app, Fmt.argv(e.command), e.badge.text]
+                    .contains { $0.localizedCaseInsensitiveContains(query) })
+        }
+    }
+
+    // loadAudit reads the newest 200 entries, newest first. A line that is no entry, such as
+    // "No audit entries yet.", is skipped.
+    func loadAudit() async {
+        let r = await runMintrun(["audit", "-limit", "200"])
+        guard r.status == 0 else {
+            auditError = mintrunError(r)
+            if audit == nil { audit = [] }
+            return
+        }
+        auditError = nil
+        audit = String(decoding: r.out, as: UTF8.self).split(separator: "\n").reversed()
+            .compactMap { try? JSONDecoder().decode(AuditRow.self, from: Data($0.utf8)) }
+    }
+
+    // loadDoctor keeps the report when mintrun doctor exits 1, which it does on any FAIL row.
+    func loadDoctor() async {
+        let r = await runMintrun(["doctor"])
+        let out = String(decoding: r.out, as: UTF8.self)
+        doctor = out.isEmpty ? "mintrun doctor: " + mintrunError(r) : out
+    }
+
+    // accounts reads doctor's "secret <name>" rows (cmd/mintrun/setup.go's doctorVault). The four
+    // built-in services always show, and another account once it is set or policy.json names it.
+    var accounts: [Account]? {
+        guard let doctor else { return nil }
+        var out: [Account] = []
+        for line in doctor.split(separator: "\n") {
+            let f = line.split(separator: " ", maxSplits: 1)
+            guard f.count == 2 else { continue }
+            let rest = f[1].trimmingCharacters(in: .whitespaces)
+            guard rest.hasPrefix("secret ") else { continue }
+            let name = rest.dropFirst(7).prefix { $0 != ":" && $0 != " " }.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            guard !name.isEmpty, !out.contains(where: { $0.name == name }) else { continue }
+            let ready: Bool? = f[0] == "ok" ? true : f[0] == "FAIL" ? nil : false
+            if Fmt.tiles[name] != nil || name.contains("@") || ready != false { out.append(Account(name: name, ready: ready)) }
+        }
+        return out
+    }
+
+    func loadSettings() {
+        do {
+            settings = try Self.readSettings()
+            settingsError = nil
+        } catch {
+            settings = [:]
+            settingsError = error.localizedDescription
+        }
+    }
+
+    // readSettings reads settings.json as mintrun does: only nothing at that path means no settings.
+    static func readSettings() throws -> [String: Any] {
+        guard (try? FileManager.default.attributesOfItem(atPath: settingsURL.path)) != nil else { return [:] }
+        guard let obj = try JSONSerialization.jsonObject(with: Data(contentsOf: settingsURL)) as? [String: Any] else {
+            throw NSError(domain: "mintrun", code: 1, userInfo: [NSLocalizedDescriptionKey: "settings.json does not hold a JSON object"])
+        }
+        return obj
+    }
+
+    // save changes settings.json. It reads the file again first, so it keeps keys it does not know,
+    // and writes nothing when the file cannot be read: mintrun refuses such a file, and replacing it
+    // here would hide that.
+    func save(_ change: (inout [String: Any]) -> Void) {
+        do {
+            var obj = try Self.readSettings()
+            change(&obj)
+            try FileManager.default.createDirectory(at: Self.home, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
+                .write(to: Self.settingsURL.resolvingSymlinksInPath(), options: .atomic)
+            settings = obj
+            settingsError = nil
+        } catch {
+            settingsError = error.localizedDescription
+        }
+    }
+}
+
+struct MainView: View {
+    @ObservedObject var model: MainModel
+
+    var body: some View {
+        NavigationSplitView {
+            List(selection: $model.page) {
+                Label("Overview", systemImage: "house").badge(model.approvals.count).tag(Page.overview)
+                Label("Activity", systemImage: "list.bullet.rectangle").tag(Page.activity)
+                Label("Settings", systemImage: "gearshape").tag(Page.settings)
+            }
+            .navigationSplitViewColumnWidth(min: 170, ideal: 190, max: 260)
+        } detail: {
+            Group {
+                switch model.page ?? .overview {
+                case .overview: OverviewView(model: model)
+                case .activity: ActivityView(model: model)
+                case .settings: SettingsView(model: model)
+                }
+            }
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button { model.togglePause() } label: {
+                        Label(model.paused ? "Resume Requests" : "Pause Requests", systemImage: model.paused ? "play.fill" : "pause.fill")
+                    }
+                    .labelStyle(.titleAndIcon)
+                    .help(model.paused ? "Let AI apps ask again" : "Say no to every new request until you resume")
+                    .disabled(model.link != .connected)
+                }
+            }
+        }
+        .frame(minWidth: 760, minHeight: 480)
+    }
+}
+
+struct ActivityRow: View {
+    var e: AuditRow
+    var wide = false
+
+    var body: some View {
+        let b = e.badge
+        HStack(spacing: 10) {
+            Fmt.tile(e.provider)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(e.title).lineLimit(1)
+                Text([Fmt.svc(e.provider), Fmt.when(Fmt.date(e.ts))].filter { !$0.isEmpty }.joined(separator: " \u{00B7} "))
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            if wide {
+                Label { Text(b.text).foregroundStyle(.secondary) } icon: { Image(systemName: b.symbol).foregroundStyle(b.color) }
+            } else {
+                Image(systemName: b.symbol).foregroundStyle(b.color).help(b.text).accessibilityLabel(b.text)
+            }
+        }
+        .padding(.vertical, 2)
+        .contentShape(Rectangle())
+    }
+}
+
+struct OverviewView: View {
+    @ObservedObject var model: MainModel
+
+    var body: some View {
+        Form {
+            Section { hero }
+            if !model.approvals.isEmpty {
+                Section("Waiting for You") {
+                    ForEach(model.approvals, id: \.task) { a in
+                        let r = a.request ?? WatchRequest()
+                        LabeledContent {
+                            Button("Review\u{2026}") { model.review(a.task) }.buttonStyle(.glassProminent)
+                        } label: {
+                            Info(tile: Tile(symbol: "hand.raised.fill", color: .orange), title: Fmt.what(r.purpose, r.command),
+                                 sub: Fmt.app(r.client, r.via) + " wants to use " + Fmt.svc(r.provider))
+                        }
+                    }
+                }
+            }
+            if !model.active.isEmpty {
+                Section("Running Now") {
+                    ForEach(model.active, id: \.task) { t in
+                        let e = t.entry ?? WatchAuditEntry()
+                        let ago = Fmt.ago(Fmt.date(e.ts))
+                        LabeledContent {
+                            Button("Stop\u{2026}") { model.stop(t.task) }.buttonStyle(.glass)
+                        } label: {
+                            Info(tile: Tile(symbol: "bolt.fill", color: .blue), title: Fmt.what(nil, e.command),
+                                 sub: "Using " + Fmt.svc(e.provider) + (ago.isEmpty ? "" : ", started " + ago))
+                        }
+                    }
+                }
+            }
+            today
+            recent
+            accounts
+            Section {
+                DisclosureGroup("Technical Details") {
+                    Text(details)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("Overview")
+    }
+
+    @ViewBuilder private var hero: some View {
+        let n = model.approvals.count
+        let (symbol, color, title, sub): (String, Color, String, String) =
+            switch model.link {
+            case .failed: ("exclamationmark.triangle.fill", .orange, "mintrun stopped watching",
+                           "Requests can't show up here until it starts again.")
+            case .starting: ("lock.shield.fill", .gray, "Starting\u{2026}", "AI apps ask here before they use your accounts.")
+            case .connected where n > 0: ("exclamationmark.shield.fill", .orange,
+                                          n == 1 ? "1 request is waiting for you" : "\(n) requests are waiting for you",
+                                          "Nothing runs until you answer.")
+            case .connected where model.paused: ("pause.fill", .gray, "Requests are paused",
+                                                 "mintrun says no to new requests until you resume.")
+            case .connected: ("lock.shield.fill", .green, "mintrun is watching", "AI apps ask here before they use your accounts.")
+            }
+        HStack(spacing: 12) {
+            Tile(symbol: symbol, color: color, size: 40)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.title3.weight(.semibold))
+                Text(sub).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            if model.link == .failed { Button("Try Again") { model.retry() }.buttonStyle(.glassProminent) }
+            if model.link == .starting { ProgressView().controlSize(.small) }
+        }
+        .padding(.vertical, 4)
+    }
+
+    @ViewBuilder private var today: some View {
+        if let audit = model.audit {
+            let today = audit.filter { Fmt.date($0.ts).map { Calendar.current.isDateInToday($0) } ?? false }
+            let denied = today.filter(\.refused).count
+            let failed = today.filter { $0.result == "failed" }.count
+            Section("Today") {
+                HStack(spacing: 12) {
+                    stat(today.count - denied, "Allowed", .allowed)
+                    stat(denied, "Denied", .denied)
+                }
+                if failed > 0 {
+                    Text(failed == 1 ? "1 of the allowed commands ended with an error."
+                         : "\(failed) of the allowed commands ended with an error.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func stat(_ n: Int, _ label: String, _ f: MainModel.Filter) -> some View {
+        Button { model.show(f) } label: {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(n)").font(.title.weight(.semibold)).monospacedDigit()
+                Text(label).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 6)
+            .padding(.horizontal, 4)
+        }
+        .buttonStyle(.glass)
+        .buttonBorderShape(.roundedRectangle(radius: 12))
+        .accessibilityLabel("\(n) \(label)")
+        .accessibilityHint("Shows them in Activity")
+    }
+
+    private var recent: some View {
+        Section {
+            if let audit = model.audit {
+                if audit.isEmpty {
+                    Text(model.auditError == nil ? "Nothing yet. When an AI app asks to use one of your accounts, it shows up here."
+                         : "mintrun could not read its activity. Technical Details says why.")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(audit.prefix(5), id: \.id) { e in
+                    Button { model.show(.all, select: e.id) } label: { ActivityRow(e: e, wide: true) }
+                        .buttonStyle(.plain)
+                }
+            } else {
+                ProgressView().controlSize(.small)
+            }
+        } header: {
+            HStack {
+                Text("Recent")
+                Spacer()
+                Button("Show All") { model.show(.all) }.buttonStyle(.glass).controlSize(.small)
+            }
+        }
+    }
+
+    private var accounts: some View {
+        Section {
+            if let list = model.accounts {
+                if list.isEmpty {
+                    Text("mintrun can't check your accounts right now. Technical Details says why.").foregroundStyle(.secondary)
+                }
+                ForEach(list, id: \.name) { a in
+                    LabeledContent {
+                        switch a.ready {
+                        case true?: Label("Ready", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                        case false?: Text("Not set up").foregroundStyle(.secondary)
+                        case nil: Label("Can't check", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                        }
+                    } label: {
+                        Info(tile: Fmt.tile(a.name), title: Fmt.svc(a.name))
+                    }
+                }
+            } else {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Checking your accounts\u{2026}").foregroundStyle(.secondary)
+                }
+            }
+        } header: {
+            Text("Your Accounts")
+        } footer: {
+            HStack {
+                Spacer()
+                Button("Find Sign-ins on This Computer\u{2026}") { model.findSignins() }.buttonStyle(.glass)
+            }
+        }
+    }
+
+    private var details: String {
+        var lines: [String] = []
+        if let e = model.auditError { lines.append("mintrun audit: " + e) }
+        lines.append(Fmt.show(model.doctor ?? "Running mintrun doctor\u{2026}", keepNL: true))
+        for a in model.accounts ?? [] where a.ready == false {
+            let p = a.name.split(separator: "@", maxSplits: 1).map(String.init)
+            let cmd = Fmt.tiles[p[0]] == nil ? "mintrun secret set " + a.name
+                : "mintrun init " + p[0] + (p.count > 1 ? " -account " + p[1] : "")
+            lines.append("Set up " + Fmt.svc(a.name) + ": " + Fmt.show(cmd))
+        }
+        return lines.joined(separator: "\n")
+    }
+}
+
+struct ActivityView: View {
+    @ObservedObject var model: MainModel
+
+    var body: some View {
+        let rows = model.shown
+        Group {
+            if let audit = model.audit, audit.isEmpty {
+                if let e = model.auditError {
+                    ContentUnavailableView {
+                        Label("Can't Show Activity", systemImage: "exclamationmark.triangle")
+                    } description: {
+                        Text("mintrun could not read its activity log.")
+                    } actions: {
+                        DisclosureGroup("Technical Details") { Text("mintrun audit: " + e).font(.caption.monospaced()).textSelection(.enabled) }
+                    }
+                } else {
+                    ContentUnavailableView("No Activity Yet", systemImage: "list.bullet.rectangle",
+                                           description: Text("When an AI app asks to use one of your accounts, it shows up here."))
+                }
+            } else if model.audit == nil {
+                ProgressView()
+            } else {
+                HStack(spacing: 0) {
+                    List(rows, id: \.id, selection: $model.selection) { ActivityRow(e: $0) }
+                        .frame(width: 300)
+                        .overlay {
+                            if rows.isEmpty {
+                                if model.query.isEmpty {
+                                    ContentUnavailableView("No Matching Activity", systemImage: "line.3.horizontal.decrease.circle")
+                                } else {
+                                    ContentUnavailableView.search(text: model.query)
+                                }
+                            }
+                        }
+                    Divider()
+                    if let e = rows.first(where: { $0.id == model.selection }) {
+                        ActivityDetail(e: e)
+                    } else {
+                        ContentUnavailableView("Nothing Selected", systemImage: "list.bullet.rectangle",
+                                               description: Text("Choose an item to see what happened."))
+                    }
+                }
+            }
+        }
+        .navigationTitle("Activity")
+        .searchable(text: $model.query, placement: .toolbar, prompt: "Search activity")
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                Picker("Show", selection: $model.filter) {
+                    Text("All").tag(MainModel.Filter.all)
+                    Text("Allowed").tag(MainModel.Filter.allowed)
+                    Text("Denied").tag(MainModel.Filter.denied)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
+        }
+    }
+}
+
+struct ActivityDetail: View {
+    var e: AuditRow
+
+    var body: some View {
+        let b = e.badge
+        let could = (e.permissions ?? []).map(Fmt.can).joined(separator: ", ")
+        Form {
+            Section {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label { Text(b.text) } icon: { Image(systemName: b.symbol).foregroundStyle(b.color) }
+                        .font(.callout.weight(.medium))
+                    Text(e.title).font(.title2.weight(.semibold)).textSelection(.enabled)
+                    Text(e.sentence).foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 4)
+            }
+            Section {
+                fact("When", Fmt.date(e.ts)?.formatted(date: .long, time: .shortened) ?? "")
+                fact("Asked by", (e.client ?? "").isEmpty ? e.app : e.app + " (as the app named itself)")
+                fact("What it said it was for", (e.purpose ?? "").isEmpty ? "It didn't say" : "\u{201C}" + Fmt.show(e.purpose) + "\u{201D}")
+                fact("Account", Fmt.svc(e.provider))
+                fact("It could", could + ((e.scope ?? "").isEmpty || could.isEmpty ? "" : " in " + Fmt.show(e.scope)))
+                if e.ran {
+                    fact("Access to your Mac", e.sandbox == true ? "Limited" : "Full")
+                    fact("Internet", e.no_network == true ? "Blocked" : "Allowed")
+                }
+                fact("Key", e.key)
+            }
+            if e.ran {
+                Section { Label("mintrun hid the key from everything the AI app got back.", systemImage: "eye.slash") }
+            }
+            Section {
+                DisclosureGroup("Technical Details") {
+                    Text(e.tech)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    @ViewBuilder private func fact(_ k: String, _ v: String) -> some View {
+        if !v.isEmpty {
+            LabeledContent(k) { Text(v).textSelection(.enabled).multilineTextAlignment(.trailing) }
+        }
+    }
+}
+
+// SettingsView writes settings.json. mintrun stops every command on a value it does not know, so
+// each control offers only values cmd/mintrun/main.go's loadSettings accepts.
+struct SettingsView: View {
+    @ObservedObject var model: MainModel
+
+    var body: some View {
+        let mode = string("jev", "mode", "off")
+        Form {
+            if model.settingsError != nil {
+                Section {
+                    Label {
+                        Text("mintrun couldn't read or save its settings. Technical Details says why.")
+                    } icon: {
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                    }
+                }
+            }
+            Section("Approvals") {
+                Picker(selection: int("approval_timeout_seconds", 600)) {
+                    let now = model.settings["approval_timeout_seconds"] as? Int ?? 600
+                    ForEach(Set([60, 120, 300, 600, now]).sorted(), id: \.self) { Text(Fmt.dur($0)).tag($0) }
+                } label: {
+                    Info(tile: Tile(symbol: "clock.fill", color: .blue), title: "Wait for my answer",
+                         sub: "If you don't answer in time, mintrun says no.")
+                }
+            }
+            Section {
+                Picker(selection: mode) {
+                    Text("Off").tag("off")
+                    Text("Ask me when risky").tag("escalate")
+                    Text("Refuse when risky").tag("deny")
+                } label: {
+                    Info(tile: Tile(symbol: "checkmark.shield.fill", color: .green), title: "Check requests for risk",
+                         sub: "An online checking service reads each request before it reaches you.")
+                }
+                Picker(selection: string("jev", "on_error", "escalate")) {
+                    Text("Ask me").tag("escalate")
+                    Text("Refuse").tag("deny")
+                    Text("Let it through").tag("pass")
+                } label: {
+                    Info(tile: Tile(symbol: "questionmark.circle.fill", color: .orange), title: "If the check can't answer",
+                         sub: "\u{201C}Let it through\u{201D} means your other settings decide.")
+                }
+                .disabled(mode.wrappedValue == "off")
+                if mode.wrappedValue != "off" && model.doctor?.contains("screen: jev not set") == true {
+                    Label {
+                        Text("The safety check needs its key before it can work. Technical Details says how to add it.")
+                    } icon: {
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                    }
+                }
+            } header: {
+                Text("Safety Check")
+            } footer: {
+                Text("The safety check can ask you or refuse a request, but it never approves one on its own. What the AI app asked for, including the exact command, is sent to the checking service.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            Section {
+                Picker(selection: string(nil, "vault", "keychain")) {
+                    Text("Your Mac's keychain").tag("keychain")
+                    Text("1Password").tag("1password")
+                    Text("A file mintrun encrypts").tag("file")
+                } label: {
+                    Info(tile: Tile(symbol: "key.fill", color: .gray), title: "Where keys are kept",
+                         sub: "Changing this doesn't move keys you already saved.")
+                }
+            } header: {
+                Text("Keys")
+            } footer: {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("AI apps that are already open keep the old settings until you restart them.")
+                    Text("mintrun keeps its files in a hidden folder named .mintrun in your home folder.")
+                }
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            }
+            Section {
+                DisclosureGroup("Technical Details") {
+                    Text(details)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("Settings")
+        .onAppear { model.loadSettings() }
+    }
+
+    // string binds a string setting, or one inside the object named by parent; empty reads as empty.
+    private func string(_ parent: String?, _ key: String, _ empty: String) -> Binding<String> {
+        Binding(get: {
+            let obj = parent.map { model.settings[$0] as? [String: Any] ?? [:] } ?? model.settings
+            let v = obj[key] as? String ?? ""
+            return v.isEmpty ? empty : v
+        }, set: { v in
+            model.save { s in
+                guard let parent else { s[key] = v; return }
+                var obj = s[parent] as? [String: Any] ?? [:]
+                obj[key] = v
+                s[parent] = obj
+            }
+        })
+    }
+
+    private func int(_ key: String, _ empty: Int) -> Binding<Int> {
+        Binding(get: { model.settings[key] as? Int ?? empty }, set: { v in model.save { $0[key] = v } })
+    }
+
+    private var details: String {
+        var lines = ["File: " + MainModel.settingsURL.path]
+        if let e = model.settingsError { lines.append("Error: " + Fmt.show(e)) }
+        if model.settings.isEmpty {
+            lines.append("No settings yet, so mintrun uses its defaults.")
+        } else if let d = try? JSONSerialization.data(withJSONObject: model.settings, options: [.prettyPrinted, .sortedKeys]) {
+            lines.append(Fmt.show(String(decoding: d, as: UTF8.self), keepNL: true))
+        }
+        lines.append("Add the safety check's key: mintrun init jev")
+        return lines.joined(separator: "\n")
+    }
+}
+
 @MainActor final class MintrunMenuBarDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    private enum Phase { case starting, connected, failed }
+    private typealias Phase = MainModel.Link
 
     private var statusItem: NSStatusItem!
     private var watchProcess: Process?
@@ -652,6 +1445,8 @@ extension View {
     private var panels: [String: ApprovalPanel] = [:]
     private var cascade = NSPoint.zero
     private var scanWindow: NSWindow?
+    private let main = MainModel()
+    private var mainWindow: NSWindow?
     // An ephemeral session keeps request text out of the on-disk URL cache.
     private let session: URLSession = {
         let c = URLSessionConfiguration.ephemeral
@@ -858,6 +1653,8 @@ extension View {
         button.title = title
         button.toolTip = tip
         button.appearsDisabled = phase == .starting
+        // The main window shows what the icon shows, once it has been opened.
+        if mainWindow != nil { main.sync(state, phase) }
     }
 
     // The menu is built when it opens, so it never changes under the pointer.
@@ -899,6 +1696,7 @@ extension View {
         }
 
         menu.addItem(.separator())
+        menu.addItem(item("Open mintrun\u{2026}", #selector(showMain), "o"))
         menu.addItem(item("Find Sign-ins on This Computer\u{2026}", #selector(showScan)))
         if dashboardURL != nil { menu.addItem(item("Open Dashboard", #selector(openDashboard), "d")) }
         menu.addItem(item("Quit mintrun", #selector(quitApp), "q"))
@@ -982,6 +1780,10 @@ extension View {
     // style for the action a person deliberately chose).
     @objc private func stop(_ sender: NSMenuItem) {
         guard let task = sender.representedObject as? String else { return }
+        confirmStop(task)
+    }
+
+    private func confirmStop(_ task: String) {
         NSApp.activate()
         let a = NSAlert()
         a.messageText = "Stop this command?"
@@ -1013,6 +1815,39 @@ extension View {
         scanWindow = w
         w.makeKeyAndOrderFront(nil)
         w.orderFrontRegardless()
+    }
+
+    // showMain brings the main window forward, creating it the first time, and reads the activity
+    // log, accounts, and settings again.
+    @objc private func showMain() {
+        NSApp.activate()
+        if mainWindow == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 640),
+                             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                             backing: .buffered, defer: false)
+            w.title = "mintrun"
+            w.isReleasedWhenClosed = false
+            let host = NSHostingController(rootView: MainView(model: main))
+            // The SwiftUI toolbar, search field, and page title reach the window only through this.
+            host.sceneBridgingOptions = .all
+            host.sizingOptions = .minSize
+            w.contentViewController = host
+            w.setContentSize(NSSize(width: 960, height: 640))
+            w.center()
+            main.review = { [weak self] task in
+                guard let self, let a = self.approvals.first(where: { $0.task == task }) else { return }
+                self.showPanel(a)
+            }
+            main.stop = { [weak self] task in self?.confirmStop(task) }
+            main.togglePause = { [weak self] in self?.togglePause() }
+            main.retry = { [weak self] in self?.retry() }
+            main.findSignins = { [weak self] in self?.showScan() }
+            mainWindow = w
+        }
+        main.sync(state, phase)
+        main.reload()
+        mainWindow?.makeKeyAndOrderFront(nil)
+        mainWindow?.orderFrontRegardless()
     }
 
     @objc private func openDashboard() {
