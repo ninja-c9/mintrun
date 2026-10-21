@@ -1466,7 +1466,7 @@ struct SettingsView: View {
         // An accessory app has no main menu to hold Close, so Command-W closes the front window
         // here; closing an approval panel denies, as its close button does.
         _ = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in
-            guard e.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+            guard e.modifierFlags.intersection([.command, .shift, .option, .control]) == .command,
                   e.charactersIgnoringModifiers == "w", let w = NSApp.keyWindow else { return e }
             w.performClose(nil)
             return nil
